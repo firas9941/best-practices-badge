@@ -117,6 +117,8 @@ en:
     already_logged_in: You are already logged in.
     login_disabled: All logins temporarily disabled
     incorrect_login_info: Incorrect login information
+    login_failed: >-
+      Sorry, that login attempt could not be completed. Please try again.
     invalid_combo: Invalid email/password combination
     signed_in: "Logged in! Last login: %{last_login_at}"
     not_activated: >-

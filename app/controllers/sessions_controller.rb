@@ -13,8 +13,17 @@ class SessionsController < ApplicationController
   include SessionsHelper
 
   # Do *NOT* redirect session creation, that will cause complicated failures
-  # because we don't really want the locale.
-  skip_before_action :redir_missing_locale, only: :create
+  # because we don't really want the locale. The same applies to :failure:
+  # OmniAuth redirects to the path '/auth/failure' with no locale prefix, so
+  # skipping this before_action just avoids a needless extra redirect to add
+  # one. This does NOT make the response English-only -- the later
+  # set_locale_to_best_available before_action still runs, so I18n.locale
+  # (hence the flash message and the login_path we redirect to) reflects the
+  # browser's Accept-Language. We use Accept-Language rather than the locale
+  # of the originating page on purpose: these failures are often caused by a
+  # missing/stale session cookie, so relying on session state to localize
+  # would be unreliable exactly when it matters.
+  skip_before_action :redir_missing_locale, only: %i[create failure]
 
   # Display login form or redirect if already logged in.
   # Supports `GET /login`.
@@ -65,6 +74,30 @@ class SessionsController < ApplicationController
     log_out if logged_in?
     flash[:success] = t('sessions.signed_out')
     redirect_to root_url
+  end
+
+  # Handle an OmniAuth login failure. OmniAuth redirects here (302) whenever a
+  # login attempt fails; the most common cause in production is a missing or
+  # stale request-phase CSRF token (e.g. a stale or CDN-cached login page
+  # whose token no longer matches the browser's session). Previously there was
+  # no route for '/auth/failure', so the user just saw a bare 404 ("not
+  # found"). We log the rejection (so its frequency is visible on
+  # staging/production) and send the user back to the login page with a
+  # "please try again" message, which is what a manual reload accomplished.
+  # Supports `GET /auth/failure`.
+  # @return [void]
+  def failure
+    # `message` and `strategy` come from OmniAuth, but this endpoint is
+    # public, so treat them as untrusted: truncate and use `inspect` (which
+    # escapes newlines) to prevent log forging and log bloat.
+    message = params[:message].to_s[0, 200]
+    strategy = params[:strategy].to_s[0, 50]
+    Rails.logger.warn(
+      "OmniAuth login failed: strategy=#{strategy.inspect} " \
+      "message=#{message.inspect} ip=#{request.remote_ip}"
+    )
+    flash[:danger] = t('sessions.login_failed')
+    redirect_to login_path
   end
 
   private

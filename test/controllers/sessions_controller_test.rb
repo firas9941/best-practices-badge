@@ -173,6 +173,48 @@ class SessionsControllerTest < ActionDispatch::IntegrationTest
     OmniAuth.config.logger = old_omniauth_logger
   end
 
+  # OmniAuth redirects failed logins (e.g. the CSRF rejection above) to
+  # '/auth/failure'. Confirm that path no longer 404s but instead sends the
+  # user back to login with a friendly message, and that it logs the failure.
+  test 'auth failure redirects to login with a message and logs it' do
+    old_logger = Rails.logger
+    log_output = StringIO.new
+    Rails.logger = Logger.new(log_output)
+
+    get '/auth/failure',
+        params: { message: 'invalid_authenticity_token', strategy: 'github' }
+
+    assert_redirected_to login_path
+    assert_equal I18n.t('sessions.login_failed'), flash[:danger]
+    assert_match(/OmniAuth login failed/, log_output.string)
+    assert_match(/invalid_authenticity_token/, log_output.string)
+    assert_match(/github/, log_output.string)
+
+    # The friendly login page actually renders (no 404).
+    follow_redirect!
+    assert_response :success
+  ensure
+    Rails.logger = old_logger
+  end
+
+  # A public endpoint must not let attacker-supplied params forge log lines;
+  # embedded newlines must be escaped (via inspect), not written literally.
+  test 'auth failure escapes newlines in logged params' do
+    old_logger = Rails.logger
+    log_output = StringIO.new
+    Rails.logger = Logger.new(log_output)
+
+    get '/auth/failure',
+        params: { message: "evil\nFORGED LOG LINE", strategy: 'x' }
+
+    assert_redirected_to login_path
+    # The literal newline+text must not appear as its own log line.
+    assert_no_match(/^FORGED LOG LINE/, log_output.string)
+    assert_match(/evil\\nFORGED LOG LINE/, log_output.string)
+  ensure
+    Rails.logger = old_logger
+  end
+
   test 'local login fails if deny_login' do
     # WARNING: This test manipulates a global setting, namely
     # Rails.application.config.deny_login. Parallel testing with *processes*
