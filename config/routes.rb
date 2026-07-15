@@ -252,6 +252,13 @@ Rails.application.routes.draw do
     get 'login' => 'sessions#new'
     post 'login' => 'sessions#create'
     get 'auth/:provider/callback' => 'sessions#create'
+    # OmniAuth redirects here (302) when a login attempt fails, e.g. when the
+    # request-phase CSRF token is missing/stale (a stale or CDN-cached login
+    # page). Without this route that redirect 404s ("not found"); the action
+    # turns it into a friendly "please try again" and logs the rejection.
+    # OmniAuth's default path_prefix is '/auth', so the path is
+    # '/auth/failure'.
+    get 'auth/failure' => 'sessions#failure'
     get '/signout' => 'sessions#destroy', as: :signout
     delete 'logout' => 'sessions#destroy'
 
