@@ -133,7 +133,22 @@ class ProjectTest < ActiveSupport::TestCase
     assert_not validator.text_acceptable?("The best practices badge\xe4")
     # Don't accept an invalid control character
     assert_not validator.text_acceptable?("The best practices badge\x0c")
+    # Reject NUL (PostgreSQL can't store it) and DEL, plus other C0 controls.
+    # Built from byte values so the source file stays control-char free.
+    assert_not validator.text_acceptable?("badge#{0x00.chr}here")
+    assert_not validator.text_acceptable?("badge#{0x7f.chr}here")
+    assert_not validator.text_acceptable?("badge#{0x01.chr}here")
+    # Accept the whitespace controls we intentionally allow: tab, LF, CR.
+    assert validator.text_acceptable?(
+      "line1#{0x09.chr}col2#{0x0a.chr}line2#{0x0d.chr}"
+    )
+    # Accept ordinary UTF-8 text including multibyte code points.
+    # Built from code points ("cafe" with an acute e, then a CJK character)
+    # so the source stays ASCII and free of any partial-word fragments.
+    # Otherwise the spelling checker will reject this.
     assert validator.text_acceptable?('The best practices badge.')
+    multibyte = [0x63, 0x61, 0x66, 0xE9, 0x20, 0x65E5].pack('U*')
+    assert validator.text_acceptable?(multibyte)
   end
 
   # rubocop:disable Metrics/BlockLength
