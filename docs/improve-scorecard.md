@@ -233,10 +233,14 @@ SBOM with **cosign keyless (Sigstore)** signing, fully automatically in CI:
   the bundle path empty and fails the signing step (the mistake in the first
   cut of this workflow).
 
-This moves Signed-Releases from 0 to **8** once the last five releases
-carry signatures. Reaching **10** additionally requires SLSA provenance
-(`*.intoto.jsonl`), e.g. via the SLSA GitHub generator — deferred as a
-follow-up.
+This moves Signed-Releases from 0 to **8** once the last five releases carry
+signatures, and to **10** with SLSA provenance. Provenance is now generated
+too: a second `sbom.yml` job runs the OpenSSF SLSA GitHub generator
+(`slsa-framework/slsa-github-generator`, pinned to the tag `v2.1.0` because
+the generator refuses to run from a raw commit SHA). It produces a signed
+`<sbom>.intoto.jsonl` attestation over the SBOM's digest and uploads it to the
+same release; Scorecard's `releasesHaveProvenance` probe recognizes the
+`.intoto.jsonl` suffix and awards the full 10.
 
 **Verifying a released signature** (any consumer, no secrets needed):
 
@@ -249,8 +253,45 @@ cosign verify-blob \
   <sbom>
 ```
 
+**Verifying the provenance** (that the SBOM was built by this workflow):
+
+```sh
+slsa-verifier verify-artifact <sbom> \
+  --provenance-path <sbom>.intoto.jsonl \
+  --source-uri github.com/ossf/best-practices-badge
+```
+
+`slsa-verifier` (from `github.com/slsa-framework/slsa-verifier`) checks that
+the SBOM's digest matches the provenance subject, that the provenance was
+signed by the SLSA generator running in this repository, and that its
+Sigstore certificate identity is the expected builder. Add
+`--source-branch staging` (or `production`) to also pin the branch the
+release was built from.
+
+**Reproducibility.** The SBOM is made reproducible from the source commit, so
+anyone can regenerate it and check it against what we signed. Syft's output is
+fully determined by the source and the pinned Syft version except for two
+per-run fields, which `sbom.yml` overwrites (via `jq`, before
+hashing/signing/provenance) with values derived only from the commit:
+
+- `creationInfo.created` becomes the commit's committer date
+- `documentNamespace` becomes `https://bestpractices.dev/sbom/<commit-sha>`
+
+The same commit therefore yields byte-identical SBOM bytes and the same
+SHA-256. To check it, regenerate the SBOM from that commit with the same
+pinned `anchore/sbom-action` (Syft) version, apply the same two
+normalizations, and confirm the digest matches the released SBOM (and the
+subject recorded in the provenance).
+
+The signature and provenance themselves are intentionally NOT reproducible:
+Sigstore keyless signing uses an ephemeral key, a fresh certificate, and a
+timestamped Rekor entry. That is by design; you verify them against a
+reproduced SBOM rather than reproduce them. Reproducibility is relative to the
+pinned Syft version, so bumping that action is a deliberate change that may
+change the SBOM.
+
 **Caveat (recorded).** These releases are SBOM-archival snapshots, not
-distributed product artifacts — the app is deployed to Heroku, not shipped
+distributed product artifacts; the app is deployed to Heroku, not shipped
 as a package. Signing the SBOM is still worthwhile: it proves the SBOM's
 provenance and satisfies the check. We accept the SBOM as the artifact we
 sign.

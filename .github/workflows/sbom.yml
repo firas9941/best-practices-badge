@@ -9,7 +9,10 @@ name: Generate SBOM
 # supply chain attacks by enabling cryptographic signature verification.
 # Signing is fully automatic in CI (OIDC-based: no
 # stored keys, no human action) and also lets OpenSSF Scorecard's
-# Signed-Releases check see that our releases are signed.
+# Signed-Releases check see that our releases are signed. A second job then
+# generates SLSA build provenance for the SBOM (a signed *.intoto.jsonl
+# attestation) and attaches it to the same release, which raises the
+# Signed-Releases score from signature-only (8) toward 10.
 # These improve our OpenSSF Scorecard score.
 
 on:
@@ -27,6 +30,11 @@ permissions:
 jobs:
   sbom:
     runs-on: ubuntu-latest
+    # Exposed so the 'provenance' job below can attest the SBOM and upload
+    # the provenance to this same release.
+    outputs:
+      release_tag: ${{ steps.vars.outputs.release_tag }}
+      subjects: ${{ steps.hash.outputs.subjects }}
     permissions:
       contents: write  # Required to create GitHub Releases and upload assets
       id-token: write  # Mint the short-lived GitHub OIDC token that cosign
@@ -88,6 +96,40 @@ jobs:
           output-file: ${{ steps.vars.outputs.sbom_filename }}
           upload-artifact: false
           upload-release-assets: false
+
+      # Make the SBOM reproducible from the source commit. Syft's output is
+      # already fully determined by the source and the pinned Syft version,
+      # except for two fields that vary every run: the "created" timestamp and
+      # a random "documentNamespace" UUID. Overwrite both with values derived
+      # only from the commit, so the same commit always yields byte-identical
+      # SBOM bytes (and therefore the same digest). Anyone can then regenerate
+      # the SBOM from source and confirm it matches what we signed and
+      # attested. Normalize BEFORE hashing, signing, and provenance so all
+      # three cover the reproducible SBOM. jq re-serializes with stable
+      # formatting, so its byte output is deterministic too.
+      - name: Normalize SBOM for reproducibility
+        env:
+          SBOM: ${{ steps.vars.outputs.sbom_filename }}
+        run: |
+          commit_epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
+          created="$(date -u -d "@${commit_epoch}" +%Y-%m-%dT%H:%M:%SZ)"
+          namespace="https://bestpractices.dev/sbom/${GITHUB_SHA}"
+          jq --arg created "$created" --arg ns "$namespace" \
+             '.creationInfo.created = $created | .documentNamespace = $ns' \
+             "$SBOM" > "$SBOM.tmp"
+          mv "$SBOM.tmp" "$SBOM"
+
+      # Record the SBOM's SHA-256 digest (base64-encoded, in sha256sum's
+      # output format) as the subject the provenance job attests to. Binding
+      # the digest, rather than shipping the file between jobs, keeps the
+      # provenance tied to this exact SBOM, workflow run, and commit.
+      - name: Compute SBOM digest for provenance
+        id: hash
+        env:
+          SBOM: ${{ steps.vars.outputs.sbom_filename }}
+        run: |
+          digest="$(sha256sum "$SBOM" | base64 -w0)"
+          echo "subjects=${digest}" >> "$GITHUB_OUTPUT"
 
       # Install cosign. Pinned to a specific commit (v4.1.2); this is
       # Sigstore's own first-party installer action. cosign fetches its
@@ -157,3 +199,29 @@ jobs:
             --notes "Auto-generated SBOM for commit ${{ github.sha }} on branch ${{ github.ref_name }}" \
             "${{ steps.vars.outputs.sbom_filename }}" \
             "${{ steps.vars.outputs.sbom_filename }}.sigstore.json"
+
+  # Generate SLSA build provenance for the SBOM and attach it to the release
+  # as a signed <sbom>.intoto.jsonl attestation. This is the OpenSSF SLSA
+  # GitHub generator, the standard way to produce verifiable provenance; it
+  # runs as an isolated reusable workflow and signs keylessly via Sigstore
+  # (no stored key, no human action), consistent with the signing job above.
+  # Its <sbom>.intoto.jsonl asset is what raises OpenSSF Scorecard's
+  # Signed-Releases score from 8 (signature only) to 10.
+  #
+  # Pinned to the version TAG v2.1.0, not a commit SHA, deliberately: the
+  # generator verifies that it was invoked from an official released tag as
+  # part of its own security model, and refuses to run from a raw SHA. This
+  # is the one sanctioned exception to our pin-to-SHA convention. To upgrade,
+  # pick a newer release from
+  # https://github.com/slsa-framework/slsa-github-generator/releases.
+  provenance:
+    needs: [sbom]
+    permissions:
+      actions: read    # read this run's metadata to build the provenance
+      id-token: write  # keyless Sigstore signing of the provenance
+      contents: write  # upload the .intoto.jsonl asset to the release
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: ${{ needs.sbom.outputs.subjects }}
+      upload-assets: true
+      upload-tag-name: ${{ needs.sbom.outputs.release_tag }}
