@@ -268,6 +268,28 @@ Sigstore certificate identity is the expected builder. Add
 `--source-branch staging` (or `production`) to also pin the branch the
 release was built from.
 
+**Reproducibility.** The SBOM is made reproducible from the source commit, so
+anyone can regenerate it and check it against what we signed. Syft's output is
+fully determined by the source and the pinned Syft version except for two
+per-run fields, which `sbom.yml` overwrites (via `jq`, before
+hashing/signing/provenance) with values derived only from the commit:
+
+- `creationInfo.created` becomes the commit's committer date
+- `documentNamespace` becomes `https://bestpractices.dev/sbom/<commit-sha>`
+
+The same commit therefore yields byte-identical SBOM bytes and the same
+SHA-256. To check it, regenerate the SBOM from that commit with the same
+pinned `anchore/sbom-action` (Syft) version, apply the same two
+normalizations, and confirm the digest matches the released SBOM (and the
+subject recorded in the provenance).
+
+The signature and provenance themselves are intentionally NOT reproducible:
+Sigstore keyless signing uses an ephemeral key, a fresh certificate, and a
+timestamped Rekor entry. That is by design; you verify them against a
+reproduced SBOM rather than reproduce them. Reproducibility is relative to the
+pinned Syft version, so bumping that action is a deliberate change that may
+change the SBOM.
+
 **Caveat (recorded).** These releases are SBOM-archival snapshots, not
 distributed product artifacts; the app is deployed to Heroku, not shipped
 as a package. Signing the SBOM is still worthwhile: it proves the SBOM's
