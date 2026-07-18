@@ -253,8 +253,23 @@ cosign verify-blob \
   <sbom>
 ```
 
+**Verifying the provenance** (that the SBOM was built by this workflow):
+
+```sh
+slsa-verifier verify-artifact <sbom> \
+  --provenance-path <sbom>.intoto.jsonl \
+  --source-uri github.com/ossf/best-practices-badge
+```
+
+`slsa-verifier` (from `github.com/slsa-framework/slsa-verifier`) checks that
+the SBOM's digest matches the provenance subject, that the provenance was
+signed by the SLSA generator running in this repository, and that its
+Sigstore certificate identity is the expected builder. Add
+`--source-branch staging` (or `production`) to also pin the branch the
+release was built from.
+
 **Caveat (recorded).** These releases are SBOM-archival snapshots, not
-distributed product artifacts — the app is deployed to Heroku, not shipped
+distributed product artifacts; the app is deployed to Heroku, not shipped
 as a package. Signing the SBOM is still worthwhile: it proves the SBOM's
 provenance and satisfies the check. We accept the SBOM as the artifact we
 sign.
