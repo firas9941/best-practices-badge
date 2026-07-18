@@ -97,6 +97,28 @@ jobs:
           upload-artifact: false
           upload-release-assets: false
 
+      # Make the SBOM reproducible from the source commit. Syft's output is
+      # already fully determined by the source and the pinned Syft version,
+      # except for two fields that vary every run: the "created" timestamp and
+      # a random "documentNamespace" UUID. Overwrite both with values derived
+      # only from the commit, so the same commit always yields byte-identical
+      # SBOM bytes (and therefore the same digest). Anyone can then regenerate
+      # the SBOM from source and confirm it matches what we signed and
+      # attested. Normalize BEFORE hashing, signing, and provenance so all
+      # three cover the reproducible SBOM. jq re-serializes with stable
+      # formatting, so its byte output is deterministic too.
+      - name: Normalize SBOM for reproducibility
+        env:
+          SBOM: ${{ steps.vars.outputs.sbom_filename }}
+        run: |
+          commit_epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
+          created="$(date -u -d "@${commit_epoch}" +%Y-%m-%dT%H:%M:%SZ)"
+          namespace="https://bestpractices.dev/sbom/${GITHUB_SHA}"
+          jq --arg created "$created" --arg ns "$namespace" \
+             '.creationInfo.created = $created | .documentNamespace = $ns' \
+             "$SBOM" > "$SBOM.tmp"
+          mv "$SBOM.tmp" "$SBOM"
+
       # Record the SBOM's SHA-256 digest (base64-encoded, in sha256sum's
       # output format) as the subject the provenance job attests to. Binding
       # the digest, rather than shipping the file between jobs, keeps the
