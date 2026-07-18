@@ -847,6 +847,43 @@ task update_all_higher_level_badge_percentages: :environment do
   Project.update_all_badge_percentages(Criteria.keys - ['0'])
 end
 
+# Recalculate ONLY the baseline badge percentages for all projects, and queue
+# badge-loss notifications for owners who fall below a baseline level.
+# This is the deferred, non-transactional replacement for migration
+# 20260607150000 (see that migration's comment): the OSPS baseline was bumped
+# from v2025.10.10 to v2026.02.19 (#2726), adding criteria, so projects that
+# earned a baseline badge under the old version no longer qualify. Run this
+# only after those owners have been warned and given a grace period.
+# Scoped to the baseline levels so it does not disturb the metal badges.
+desc 'Recalculate baseline badge percentages and notify baseline losses'
+task recalc_baseline_and_notify_losses: :environment do
+  Project.update_all_badge_percentages(Sections::BASELINE_LEVEL_NAMES)
+end
+
+# Set baseline badge-loss warning flags for every project that will fall below
+# a baseline level, effective on EFFECTIVE_DATE, so the reminders task can
+# email the owners in advance. This is the baseline-scoped companion of
+# recalc_baseline_and_notify_losses: warn first, then recalc on or after the
+# effective date. It reads EFFECTIVE_DATE like its whole-badge sibling
+# update_badge_warnings, but requires strict YYYY-MM-DD form. Example:
+#   rake update_baseline_badge_warnings EFFECTIVE_DATE=2026-07-31
+desc 'Set baseline badge-loss warnings; EFFECTIVE_DATE=YYYY-MM-DD required'
+task update_baseline_badge_warnings: :environment do
+  date_str =
+    ENV.fetch('EFFECTIVE_DATE') do
+      raise ArgumentError, 'Set EFFECTIVE_DATE=YYYY-MM-DD, e.g. 2026-07-31'
+    end
+  unless date_str.match?(/\A\d{4}-\d{2}-\d{2}\z/)
+    raise ArgumentError, 'EFFECTIVE_DATE must be YYYY-MM-DD, e.g. 2026-07-31'
+  end
+
+  # strptime also rejects impossible dates such as 2026-13-40.
+  Project.update_all_badge_warnings(
+    Sections::BASELINE_LEVEL_NAMES,
+    effective_date: Date.strptime(date_str, '%Y-%m-%d')
+  )
+end
+
 desc 'Backfill baseline_tiered_percentage for all projects'
 task backfill_baseline_tiered_percentage: :environment do
   puts 'Backfilling baseline_tiered_percentage for all projects...'
