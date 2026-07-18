@@ -233,10 +233,14 @@ SBOM with **cosign keyless (Sigstore)** signing, fully automatically in CI:
   the bundle path empty and fails the signing step (the mistake in the first
   cut of this workflow).
 
-This moves Signed-Releases from 0 to **8** once the last five releases
-carry signatures. Reaching **10** additionally requires SLSA provenance
-(`*.intoto.jsonl`), e.g. via the SLSA GitHub generator — deferred as a
-follow-up.
+This moves Signed-Releases from 0 to **8** once the last five releases carry
+signatures, and to **10** with SLSA provenance. Provenance is now generated
+too: a second `sbom.yml` job runs the OpenSSF SLSA GitHub generator
+(`slsa-framework/slsa-github-generator`, pinned to the tag `v2.1.0` because
+the generator refuses to run from a raw commit SHA). It produces a signed
+`<sbom>.intoto.jsonl` attestation over the SBOM's digest and uploads it to the
+same release; Scorecard's `releasesHaveProvenance` probe recognizes the
+`.intoto.jsonl` suffix and awards the full 10.
 
 **Verifying a released signature** (any consumer, no secrets needed):
 
