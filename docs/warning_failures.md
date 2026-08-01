@@ -12,19 +12,26 @@ reported success and the database recorded nothing at all.
 
 Written 2026-08-01, at the end of the first working session.
 
-### The work exists only on one local branch
+### Where the work lives
 
-Branch `notification_write_fix`, three commits on top of `main`, **not
-pushed and with no upstream**:
+Branch `notification_write_fix`, pushed, with draft pull request
+[#2893](https://github.com/ossf/best-practices-badge/pull/2893) open
+against `main`:
 
 | Commit | Contents |
 | ------ | -------- |
 | `104f4634` | this document |
 | `c66c0f86` | set 1, the defect fix |
 | `0431d26a` | set 2, the unification |
+| `cfd7b86b` | this status section |
 
-If that branch is lost, so is all of it. Pushing it, or opening the pull
-requests, is the first thing to do.
+**Check that pull request's CI first when resuming.** Brakeman gates
+`main` and runs only on GitHub, so it has not yet seen the parameterized
+`UPDATE` that set 1 introduces. If it objects to the interpolated column
+names, the rationale for a `config/brakeman.ignore` entry is in
+[option 1D](#option-1d-a-parameterized-sql-statement-chosen): values are
+bound, column names are checked against the schema, and the statement is
+short enough to verify by inspection.
 
 ### Production state right now
 
