@@ -8,6 +8,88 @@ The defect caused the same notification emails to be re-sent every night,
 in the worst case for 35 consecutive nights, while the daily task
 reported success and the database recorded nothing at all.
 
+## Where this stands, and how to resume
+
+Written 2026-08-01, at the end of the first working session.
+
+### The work exists only on one local branch
+
+Branch `notification_write_fix`, three commits on top of `main`, **not
+pushed and with no upstream**:
+
+| Commit | Contents |
+| ------ | -------- |
+| `104f4634` | this document |
+| `c66c0f86` | set 1, the defect fix |
+| `0431d26a` | set 2, the unification |
+
+If that branch is lost, so is all of it. Pushing it, or opening the pull
+requests, is the first thing to do.
+
+### Production state right now
+
+* Both notification caps are **zero**. That is the only thing preventing
+  duplicate mail, nothing anywhere tracks that they are off, and the
+  planned monitoring will not catch it (a cap of zero exits the loop
+  legitimately). Restore them to 20 once set 1 is deployed.
+* 8 badge-loss flags are pending, deliberately: 8887, 11675, 11718,
+  11957, 11985, 11996, 12038, 12059. Each owner is owed exactly one
+  email when the caps come back.
+* All warning flags and the 5 older loss flags are cleared.
+* The baseline recalculation has been run; badge data and the CDN are
+  correct.
+
+### What is done and what is next
+
+Sets 1 and 2 are implemented and reviewed. Set 3 is not started; the
+separable items are not started. See [The plan](#the-plan).
+
+Set 1 is deployable on its own and is what makes restoring the caps safe.
+
+### Decisions already made
+
+Do not relitigate these; the reasoning is in this document. Option 1D
+(parameterized SQL, not the ORM), 3B and 3C for tests, concern 5 for the
+counter, design 6B with bounded retries and attempt counters, suppression
+defers rather than discards, relevance guards, and concern 7's
+unification.
+
+Two open nits, both deliberate and neither urgent: `NOTIFICATION_SERIES`
+is shallow-frozen, and `send_notifications` sits in the file's loss
+region while serving both series.
+
+### To re-establish the picture
+
+```bash
+heroku config --app production-bestpractices | grep BADGEAPP_MAX
+```
+
+```bash
+heroku pg:psql --app production-bestpractices -c "SELECT count(*) FILTER (WHERE unreported_baseline_badge_warning > 0) AS warn, count(*) FILTER (WHERE unreported_baseline_badge_loss > 0) AS loss, count(*) FILTER (WHERE last_warning_sent_at IS NOT NULL) AS warned FROM projects;"
+```
+
+Expect caps of 0, and `warn 0, loss 8, warned 11`.
+
+### Things that cost time this session
+
+* `heroku logs` retains roughly **four minutes** on this app. Anything
+  older must come from Papertrail. An empty `heroku logs | grep` proves
+  nothing.
+* `heroku run` passes its command through a shell on the dyno, so `$stdout`
+  and friends are expanded before Ruby sees them. Feed scripts to
+  `rails runner -` over a quoted heredoc instead.
+* Multi-line pastes get mangled in this terminal. Put SQL in a file, or
+  use `heroku pg:psql -c "..."` on one line.
+* Implicit ActiveRecord behavior has bitten this code three times:
+  `update_columns` adds the locking column to `WHERE`, `update_all` adds
+  an increment to `SET`, and `order` **appends** to a `default_scope`
+  order rather than replacing it (`reorder` replaces). Read the generated
+  SQL before believing any of it.
+* `FastlyRails.purge_all` logs nothing on success and swallows every
+  failure, so it cannot be confirmed from logs. Fetch a badge body
+  instead. `curl -I` on a badge URL returns `no-store`, which means the
+  request never reached the badge action.
+
 ## Summary
 
 `Project.send_loss_notifications` and `Project.send_warning_notifications`
