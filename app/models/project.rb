@@ -1125,56 +1125,101 @@ class Project < ApplicationRecord
   end
   private_class_method :report_failed_notification_write
 
-  # Send badge-loss notification emails in a rate-limited daily batch.
-  # Each email counts toward MAX_BADGE_LOSS_NOTIFICATIONS; silently-drained
-  # notifications (user opted out) do not.  Stops as soon as the cap is hit.
-  # Returns the number of emails actually sent.
+  # Everything that differs between the four notification kinds: two
+  # series, loss and warning, each with a metal kind and a baseline kind.
+  # send_notifications below is driven entirely by these entries, so
+  # adding a kind is a data change rather than another copy of the loop.
+  # :flag names the column holding the rank of the level involved,
+  # :levels turns that rank back into a level name, and :suffix picks the
+  # badge series for the email.  Kinds are listed in the order they send.
+  NOTIFICATION_SERIES = {
+    loss: {
+      sent_at: :last_loss_sent_at,
+      kinds: [
+        {
+          flag: :unreported_badge_loss,
+          levels: BADGE_LEVELS, suffix: 'badge'
+        },
+        {
+          flag: :unreported_baseline_badge_loss,
+          levels: BASELINE_BADGE_LEVELS, suffix: 'baseline'
+        }
+      ]
+    },
+    warning: {
+      sent_at: :last_warning_sent_at,
+      kinds: [
+        {
+          flag: :unreported_badge_warning,
+          levels: BADGE_LEVELS, suffix: 'badge'
+        },
+        {
+          flag: :unreported_baseline_badge_warning,
+          levels: BASELINE_BADGE_LEVELS, suffix: 'baseline'
+        }
+      ]
+    }
+  }.freeze
+
+  # Send one series of notification emails in a rate-limited batch.
+  # Each email counts toward +cap+; notifications drained without sending
+  # (the owner opted out, or the block declined) do not.  Stops as soon as
+  # the cap is hit.  The flag is cleared either way, so a notification is
+  # not retried; changing that is a separate step, see
+  # docs/warning_failures.md.
+  #
+  # @param pending [ActiveRecord::Relation] projects with a pending flag
+  # @param cap [Integer] most emails to send in this run
+  # @param series [Hash] one entry of NOTIFICATION_SERIES
+  # @yieldparam project [Project] project to notify about
+  # @yieldparam user [User] the project owner, already loaded
+  # @yieldparam old_level [String] level the notification concerns
+  # @yieldparam badge_suffix [String] 'badge' or 'baseline'
+  # @yieldreturn [Boolean] true if mail was enqueued
   # @return [Integer] number of emails sent
   # rubocop:disable Metrics/MethodLength, Metrics/AbcSize
-  def self.send_loss_notifications
+  def self.send_notifications(pending, cap, series)
     emails_sent = 0
-    projects_with_pending_loss_notifications.each do |project|
-      break if emails_sent >= MAX_BADGE_LOSS_NOTIFICATIONS
+    pending.each do |project|
+      break if emails_sent >= cap
 
-      # Tight SELECT — only the fields needed for sending or skipping.
-      # Bounded by MAX_BADGE_LOSS_NOTIFICATIONS so N+1 cost is minimal.
+      # Tight SELECT: only the fields needed for sending or skipping.
+      # Bounded by the cap, so N+1 cost is minimal.
       user = User.select(LOSS_NOTIFY_USER_FIELDS).find(project.user_id)
       can_email = user.important_notifications? &&
                   user.encrypted_email.present?
       now = Time.now.utc
 
-      if project.unreported_badge_loss > 0
-        # Count only mail we actually enqueued: send_loss_email declines
-        # when the badge has since been regained.
-        if can_email &&
-           send_loss_email(project, user,
-                           BADGE_LEVELS[project.unreported_badge_loss], 'badge')
+      series[:kinds].each do |kind|
+        break if emails_sent >= cap
+
+        rank = project[kind[:flag]]
+        next if rank <= 0
+
+        if can_email && yield(project, user, kind[:levels][rank],
+                              kind[:suffix])
           emails_sent += 1
         end
         clear_notification_flag(
-          project, unreported_badge_loss: 0, last_loss_sent_at: now
+          project, kind[:flag] => 0, series[:sent_at] => now
         )
       end
-
-      break if emails_sent >= MAX_BADGE_LOSS_NOTIFICATIONS
-
-      next if project.unreported_baseline_badge_loss <= 0
-
-      if can_email &&
-         send_loss_email(
-           project, user,
-           BASELINE_BADGE_LEVELS[project.unreported_baseline_badge_loss],
-           'baseline'
-         )
-        emails_sent += 1
-      end
-      clear_notification_flag(
-        project, unreported_baseline_badge_loss: 0, last_loss_sent_at: now
-      )
     end
     emails_sent
   end
   # rubocop:enable Metrics/MethodLength, Metrics/AbcSize
+  private_class_method :send_notifications
+
+  # Send badge-loss notification emails in a rate-limited daily batch.
+  # @return [Integer] number of emails sent
+  def self.send_loss_notifications
+    send_notifications(
+      projects_with_pending_loss_notifications,
+      MAX_BADGE_LOSS_NOTIFICATIONS, NOTIFICATION_SERIES[:loss]
+    ) do |project, user, level, suffix|
+      send_loss_email(project, user, level, suffix)
+    end
+  end
 
   # Deliver one loss-notification email if the loss is still current.
   # Skips silently if the project has since regained the lost level.
@@ -1215,56 +1260,15 @@ class Project < ApplicationRecord
   private_class_method :projects_with_pending_warning_notifications
 
   # Send badge-warning notification emails in a rate-limited daily batch.
-  # Each email counts toward MAX_BADGE_WARNING_NOTIFICATIONS; silently-drained
-  # notifications (user opted out) do not.  Stops as soon as the cap is hit.
-  # Returns the number of emails actually sent.
   # @return [Integer] number of emails sent
-  # rubocop:disable Metrics/MethodLength, Metrics/AbcSize
   def self.send_warning_notifications
-    emails_sent = 0
-    projects_with_pending_warning_notifications.each do |project|
-      break if emails_sent >= MAX_BADGE_WARNING_NOTIFICATIONS
-
-      # Tight SELECT — only the fields needed for sending or skipping.
-      # Bounded by MAX_BADGE_WARNING_NOTIFICATIONS so N+1 cost is minimal.
-      user = User.select(LOSS_NOTIFY_USER_FIELDS).find(project.user_id)
-      can_email = user.important_notifications? &&
-                  user.encrypted_email.present?
-      now = Time.now.utc
-
-      if project.unreported_badge_warning > 0
-        if can_email &&
-           send_warning_email(
-             project, user,
-             BADGE_LEVELS[project.unreported_badge_warning], 'badge'
-           )
-          emails_sent += 1
-        end
-        clear_notification_flag(
-          project, unreported_badge_warning: 0, last_warning_sent_at: now
-        )
-      end
-
-      break if emails_sent >= MAX_BADGE_WARNING_NOTIFICATIONS
-
-      next if project.unreported_baseline_badge_warning <= 0
-
-      if can_email &&
-         send_warning_email(
-           project, user,
-           BASELINE_BADGE_LEVELS[project.unreported_baseline_badge_warning],
-           'baseline'
-         )
-        emails_sent += 1
-      end
-      clear_notification_flag(
-        project, unreported_baseline_badge_warning: 0,
-        last_warning_sent_at: now
-      )
+    send_notifications(
+      projects_with_pending_warning_notifications,
+      MAX_BADGE_WARNING_NOTIFICATIONS, NOTIFICATION_SERIES[:warning]
+    ) do |project, user, level, suffix|
+      send_warning_email(project, user, level, suffix)
     end
-    emails_sent
   end
-  # rubocop:enable Metrics/MethodLength, Metrics/AbcSize
 
   # Deliver one warning-notification email.
   # Unlike send_loss_email, there is no "already-regained" check — the badge

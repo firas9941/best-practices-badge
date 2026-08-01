@@ -218,6 +218,23 @@ class RecalcTest < ActionDispatch::IntegrationTest
     assert_equal before, Project.where(id: project.id).pick(:lock_version)
   end
 
+  # Reaching the cap partway through a project must stop immediately: the
+  # kind already handled is cleared, and the next kind of that same project
+  # is left pending for the next run rather than being sent over the cap.
+  test 'send_notifications stops at the cap partway through a project' do
+    project = projects(:one)
+    project.update_column(:unreported_badge_warning, 1)
+    project.update_column(:unreported_baseline_badge_warning, 1)
+    sent = Project.send(
+      :send_notifications, Project.where(id: project.id), 1,
+      Project::NOTIFICATION_SERIES[:warning]
+    ) { |_project, _user, _level, _suffix| true }
+    assert_equal 1, sent
+    fresh = Project.find(project.id)
+    assert_equal 0, fresh.unreported_badge_warning
+    assert_equal 1, fresh.unreported_baseline_badge_warning
+  end
+
   # Column names are interpolated into the UPDATE, so anything that is not
   # a real column must be refused rather than reaching the database.
   test 'clear_notification_flag refuses a name that is not a column' do

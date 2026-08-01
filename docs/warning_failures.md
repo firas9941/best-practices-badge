@@ -1015,24 +1015,29 @@ Unify them into a single routine driven by a per-kind descriptor, so
 that adding a third notification kind later is a data change rather than
 another copy of the loop. A descriptor names everything that varies:
 
+As implemented in set 2, the descriptor groups the four kinds under
+their two series, because the cap, the pending query, and the sent-at
+column belong to the series rather than to the individual kind:
+
 ```ruby
-# One entry per notification kind. Adding a kind means adding an entry
-# here, not another copy of the loop.
-NOTIFICATION_KINDS = {
-  metal_loss: {
-    pending_column:  :unreported_badge_loss,
-    sent_at_column:  :last_loss_sent_at,
-    attempts_column: :loss_send_attempts,
-    level_names:     BADGE_LEVELS,
-    cap:             MAX_BADGE_LOSS_NOTIFICATIONS,
-    mailer:          ->(project, user, old_level) { ... },
-    still_relevant:  ->(project, old_level) { ... }
+NOTIFICATION_SERIES = {
+  loss: {
+    sent_at: :last_loss_sent_at,
+    kinds: [
+      { flag: :unreported_badge_loss,
+        levels: BADGE_LEVELS, suffix: 'badge' },
+      { flag: :unreported_baseline_badge_loss,
+        levels: BASELINE_BADGE_LEVELS, suffix: 'baseline' }
+    ]
   },
-  baseline_loss:    { ... },
-  metal_warning:    { ... },
-  baseline_warning: { ... }
+  warning: { ... }
 }.freeze
 ```
+
+The pending relation, the cap, and the delivery method are passed by the
+two thin entry points, which keeps lambdas and `send` out of the
+constant. Set 3 adds the attempts column, the relevance guard, and the
+failure classification to these same entries.
 
 The generic routine then does the work once: select pending projects,
 respect the cap, skip suppressed owners without clearing, apply the
@@ -1195,7 +1200,7 @@ no longer suppressed, which is the main goal.
 ### Set 2: unification, with no behavior change
 
 Concern 7 only: collapse the loops into one routine driven by
-`NOTIFICATION_KINDS`. Nothing observable changes, which makes review a
+`NOTIFICATION_SERIES`. Nothing observable changes, which makes review a
 question of equivalence alone, the easiest kind to do well. Landing it
 on its own also means set 3 is written once rather than four times.
 
@@ -1240,7 +1245,7 @@ both caps to 20. The system is no longer suppressed from here.
 ### Set 2: unification, no behavior change
 
 1. **Unify the loops (concern 7).** One routine driven by a
-   `NOTIFICATION_KINDS` descriptor covering metal and baseline, loss and
+   `NOTIFICATION_SERIES` descriptor covering metal and baseline, loss and
    warning. Nothing observable changes, so review is a question of
    equivalence alone. Landing this before set 3 means set 3 is written
    once instead of four times.
