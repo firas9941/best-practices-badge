@@ -172,6 +172,95 @@ class RecalcTest < ActionDispatch::IntegrationTest
     assert_not_nil Project.find(project.id).last_loss_sent_at
   end
 
+  # Idempotency. A second run must send nothing, because the first run
+  # cleared the flag.  When clearing silently failed, the same email went
+  # out every night for weeks; see docs/warning_failures.md.
+  test 'send_loss_notifications does not repeat on a second run' do
+    project = projects(:one)
+    project.update_column(:unreported_badge_loss, 1)
+    assert_enqueued_emails(1) do
+      Project.send_loss_notifications
+    end
+    assert_enqueued_emails(0) do
+      Project.send_loss_notifications
+    end
+  end
+
+  test 'send_loss_notifications does not repeat baseline mail on a second run' do
+    project = projects(:one)
+    project.update_column(:unreported_baseline_badge_loss, 1)
+    assert_enqueued_emails(1) do
+      Project.send_loss_notifications
+    end
+    assert_enqueued_emails(0) do
+      Project.send_loss_notifications
+    end
+  end
+
+  # Notification bookkeeping must not disturb the edit flow.  If clearing a
+  # flag bumped lock_version, an owner with the edit form already open would
+  # be told their entry "changed since you started editing" when none of
+  # their content had.
+  test 'clearing a notification flag leaves lock_version alone' do
+    project = projects(:one)
+    project.update_column(:unreported_baseline_badge_warning, 1)
+    before = Project.where(id: project.id).pick(:lock_version)
+    assert_predicate before, :positive?, 'fixture must exercise a real lock'
+    Project.send_warning_notifications
+    assert_equal before, Project.where(id: project.id).pick(:lock_version)
+  end
+
+  test 'clearing a loss flag leaves lock_version alone' do
+    project = projects(:one)
+    project.update_column(:unreported_badge_loss, 1)
+    before = Project.where(id: project.id).pick(:lock_version)
+    Project.send_loss_notifications
+    assert_equal before, Project.where(id: project.id).pick(:lock_version)
+  end
+
+  # Column names are interpolated into the UPDATE, so anything that is not
+  # a real column must be refused rather than reaching the database.
+  test 'clear_notification_flag refuses a name that is not a column' do
+    assert_raises(ArgumentError) do
+      Project.send(
+        :clear_notification_flag, projects(:one),
+        'unreported_badge_loss = 0; DROP TABLE projects; --' => 1
+      )
+    end
+    assert_raises(ArgumentError) do
+      Project.send(:clear_notification_flag, projects(:one), no_such_column: 1)
+    end
+  end
+
+  # The failure path must be noisy.  A bookkeeping write that quietly
+  # changed nothing is exactly what let the same emails go out night after
+  # night; see docs/warning_failures.md.
+  test 'clear_notification_flag reports a write that matches no rows' do
+    missing = Project.new
+    missing.id = -1 # no such row, so the update matches nothing
+    logged = StringIO.new
+    original_logger = Rails.logger
+    Rails.logger = ActiveSupport::Logger.new(logged)
+    begin
+      assert_not Project.send(
+        :clear_notification_flag, missing, unreported_badge_loss: 0
+      )
+    ensure
+      Rails.logger = original_logger
+    end
+    assert_match(/affected 0 rows/, logged.string)
+    assert_match(/project -1/, logged.string)
+  end
+
+  # The counter must report mail actually enqueued.  perfect_passing has
+  # regained the level, so send_loss_email declines and nothing is sent;
+  # the count previously included such projects anyway.
+  test 'send_loss_notifications does not count declined mail' do
+    project = projects(:perfect_passing)
+    project.update_column(:unreported_badge_loss, 1)
+    assert_equal 0, Project.send_loss_notifications
+  end
+
   # --- update_all_badge_warnings tests ---
 
   test 'update_all_badge_warnings sets unreported_badge_warning on metal loss' do
@@ -274,6 +363,28 @@ class RecalcTest < ActionDispatch::IntegrationTest
     assert_nil Project.find(project.id).last_warning_sent_at
     Project.send_warning_notifications
     assert_not_nil Project.find(project.id).last_warning_sent_at
+  end
+
+  test 'send_warning_notifications does not repeat on a second run' do
+    project = projects(:one)
+    project.update_column(:unreported_badge_warning, 1)
+    assert_enqueued_emails(1) do
+      Project.send_warning_notifications
+    end
+    assert_enqueued_emails(0) do
+      Project.send_warning_notifications
+    end
+  end
+
+  test 'send_warning_notifications does not repeat baseline mail on a second run' do
+    project = projects(:one)
+    project.update_column(:unreported_baseline_badge_warning, 1)
+    assert_enqueued_emails(1) do
+      Project.send_warning_notifications
+    end
+    assert_enqueued_emails(0) do
+      Project.send_warning_notifications
+    end
   end
 end
 # rubocop:enable Metrics/ClassLength

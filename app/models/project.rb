@@ -1043,13 +1043,94 @@ class Project < ApplicationRecord
   end
   private_class_method :projects_with_pending_loss_notifications
 
+  # Clear a pending-notification flag and record when we did it.
+  #
+  # This issues plain parameterized SQL rather than going through the ORM,
+  # deliberately.  Both ORM paths carry hidden behavior that has already
+  # broken this exact code once each:
+  #
+  #   update_columns adds lock_version to the WHERE clause, so a record
+  #   loaded through a tight SELECT that omits that column sends
+  #   "AND lock_version = 0", matches no row for any project that has ever
+  #   been edited, and returns false without raising.  That is the defect
+  #   that re-sent the same emails nightly for five weeks.
+  #
+  #   update_all adds "lock_version = lock_version + 1" to the SET clause,
+  #   which would make a project owner's in-flight edit fail with
+  #   StaleObjectError, telling them their entry "changed since you started
+  #   editing" when only our bookkeeping columns had moved.
+  #
+  # A literal UPDATE touches exactly the columns named, leaves lock_version
+  # alone by never mentioning it, ignores default_scope, and stays correct
+  # across ORM upgrades.  See docs/warning_failures.md.
+  #
+  # SECURITY: values are bound parameters.  Column names are interpolated,
+  # so they are first checked against the real schema; callers pass literal
+  # symbols, never user input.
+  #
+  # @param project [Project] project whose flag should be cleared
+  # @param columns [Hash] columns and values to write
+  # @return [Boolean] true if exactly one row was updated
+  # @raise [ArgumentError] if asked to write something that is not a column
+  # This is a command that reports whether it succeeded, not a predicate;
+  # a trailing "?" would wrongly suggest it has no side effects.
+  # rubocop:disable Naming/PredicateMethod
+  def self.clear_notification_flag(project, columns)
+    rows_updated = update_one_project(project.id, columns)
+    return true if rows_updated == 1
+
+    report_failed_notification_write(project, columns, rows_updated)
+    false
+  end
+  # rubocop:enable Naming/PredicateMethod
+  private_class_method :clear_notification_flag
+
+  # Set the given columns on exactly one project, by parameterized SQL.
+  # See clear_notification_flag for why this does not use the ORM.
+  # @param id [Integer] project id
+  # @param columns [Hash] columns and values to write
+  # @return [Integer] number of rows updated
+  # @raise [ArgumentError] if asked to write something that is not a column
+  def self.update_one_project(id, columns)
+    unknown = columns.keys.map(&:to_s) - column_names
+    raise ArgumentError, "Not projects columns: #{unknown}" if unknown.any?
+
+    assignments = columns.keys.map { |column| "#{column} = ?" }.join(', ')
+    sql = sanitize_sql_array(
+      [
+        "UPDATE projects SET #{assignments} WHERE id = ?",
+        *columns.values, id
+      ]
+    )
+    with_connection { |conn| conn.update(sql) }
+  end
+  private_class_method :update_one_project
+
+  # Report a bookkeeping write that did not affect exactly one row.
+  # Silence here is precisely what let duplicate emails go out nightly for
+  # five weeks, so this must be noisy even though it cannot be recovered
+  # from automatically.
+  # @param project [Project] the project we failed to update
+  # @param columns [Hash] the columns we tried to write
+  # @param rows_updated [Integer] how many rows actually changed
+  # @return [void]
+  def self.report_failed_notification_write(project, columns, rows_updated)
+    message =
+      "Notification bookkeeping write affected #{rows_updated} rows " \
+      "(expected 1) for project #{project.id}, columns " \
+      "#{columns.keys.join(', ')}. Notifications may repeat."
+    Rails.logger.error(message)
+    # No-op unless Sentry is configured (SENTRY_DSN set).
+    Sentry.capture_message(message)
+  end
+  private_class_method :report_failed_notification_write
+
   # Send badge-loss notification emails in a rate-limited daily batch.
   # Each email counts toward MAX_BADGE_LOSS_NOTIFICATIONS; silently-drained
   # notifications (user opted out) do not.  Stops as soon as the cap is hit.
   # Returns the number of emails actually sent.
   # @return [Integer] number of emails sent
   # rubocop:disable Metrics/MethodLength, Metrics/AbcSize
-  # rubocop:disable Rails/SkipsModelValidations
   def self.send_loss_notifications
     emails_sent = 0
     projects_with_pending_loss_notifications.each do |project|
@@ -1063,32 +1144,36 @@ class Project < ApplicationRecord
       now = Time.now.utc
 
       if project.unreported_badge_loss > 0
-        if can_email
-          send_loss_email(project, user, BADGE_LEVELS[project.unreported_badge_loss],
-                          'badge')
+        # Count only mail we actually enqueued: send_loss_email declines
+        # when the badge has since been regained.
+        if can_email &&
+           send_loss_email(project, user,
+                           BADGE_LEVELS[project.unreported_badge_loss], 'badge')
           emails_sent += 1
         end
-        # update_columns intentional: only tracking fields, skip validations
-        project.update_columns(unreported_badge_loss: 0, last_loss_sent_at: now)
+        clear_notification_flag(
+          project, unreported_badge_loss: 0, last_loss_sent_at: now
+        )
       end
 
       break if emails_sent >= MAX_BADGE_LOSS_NOTIFICATIONS
 
       next if project.unreported_baseline_badge_loss <= 0
 
-      if can_email
-        send_loss_email(project, user,
-                        BASELINE_BADGE_LEVELS[project.unreported_baseline_badge_loss],
-                        'baseline')
+      if can_email &&
+         send_loss_email(
+           project, user,
+           BASELINE_BADGE_LEVELS[project.unreported_baseline_badge_loss],
+           'baseline'
+         )
         emails_sent += 1
       end
-      # update_columns intentional: only tracking fields, skip validations
-      project.update_columns(unreported_baseline_badge_loss: 0,
-                             last_loss_sent_at: now)
+      clear_notification_flag(
+        project, unreported_baseline_badge_loss: 0, last_loss_sent_at: now
+      )
     end
     emails_sent
   end
-  # rubocop:enable Rails/SkipsModelValidations
   # rubocop:enable Metrics/MethodLength, Metrics/AbcSize
 
   # Deliver one loss-notification email if the loss is still current.
@@ -1097,7 +1182,9 @@ class Project < ApplicationRecord
   # @param user [User] the project owner (pre-fetched, avoids N+1)
   # @param old_level [String] the badge level that was lost
   # @param badge_suffix [String] 'badge' or 'baseline'
-  # @return [void]
+  # @return [Boolean] true if mail was enqueued, false if declined
+  # Sends mail as a side effect, so it is a command, not a predicate.
+  # rubocop:disable Naming/PredicateMethod
   def self.send_loss_email(project, user, old_level, badge_suffix)
     new_level =
       if badge_suffix == 'baseline'
@@ -1105,11 +1192,13 @@ class Project < ApplicationRecord
       else
         project.badge_level
       end
-    return unless Sections.badge_level_lost?(old_level, new_level)
+    return false unless Sections.badge_level_lost?(old_level, new_level)
 
     ReportMailer.email_owner_with_user(project, user, old_level, new_level,
                                        true, badge_suffix).deliver_later
+    true
   end
+  # rubocop:enable Naming/PredicateMethod
   private_class_method :send_loss_email
 
   # Returns projects with a pending badge-warning notification (either series).
@@ -1131,7 +1220,6 @@ class Project < ApplicationRecord
   # Returns the number of emails actually sent.
   # @return [Integer] number of emails sent
   # rubocop:disable Metrics/MethodLength, Metrics/AbcSize
-  # rubocop:disable Rails/SkipsModelValidations
   def self.send_warning_notifications
     emails_sent = 0
     projects_with_pending_warning_notifications.each do |project|
@@ -1145,37 +1233,37 @@ class Project < ApplicationRecord
       now = Time.now.utc
 
       if project.unreported_badge_warning > 0
-        if can_email
-          send_warning_email(
-            project, user,
-            BADGE_LEVELS[project.unreported_badge_warning], 'badge'
-          )
+        if can_email &&
+           send_warning_email(
+             project, user,
+             BADGE_LEVELS[project.unreported_badge_warning], 'badge'
+           )
           emails_sent += 1
         end
-        # update_columns intentional: only tracking fields, skip validations
-        project.update_columns(unreported_badge_warning: 0,
-                               last_warning_sent_at: now)
+        clear_notification_flag(
+          project, unreported_badge_warning: 0, last_warning_sent_at: now
+        )
       end
 
       break if emails_sent >= MAX_BADGE_WARNING_NOTIFICATIONS
 
       next if project.unreported_baseline_badge_warning <= 0
 
-      if can_email
-        send_warning_email(
-          project, user,
-          BASELINE_BADGE_LEVELS[project.unreported_baseline_badge_warning],
-          'baseline'
-        )
+      if can_email &&
+         send_warning_email(
+           project, user,
+           BASELINE_BADGE_LEVELS[project.unreported_baseline_badge_warning],
+           'baseline'
+         )
         emails_sent += 1
       end
-      # update_columns intentional: only tracking fields, skip validations
-      project.update_columns(unreported_baseline_badge_warning: 0,
-                             last_warning_sent_at: now)
+      clear_notification_flag(
+        project, unreported_baseline_badge_warning: 0,
+        last_warning_sent_at: now
+      )
     end
     emails_sent
   end
-  # rubocop:enable Rails/SkipsModelValidations
   # rubocop:enable Metrics/MethodLength, Metrics/AbcSize
 
   # Deliver one warning-notification email.
@@ -1185,11 +1273,17 @@ class Project < ApplicationRecord
   # @param user [User] the project owner (pre-fetched, avoids N+1)
   # @param old_level [String] the badge level that will be lost
   # @param badge_suffix [String] 'badge' or 'baseline'
-  # @return [void]
+  # @return [Boolean] true; a warning is always valid at send time, but the
+  #   Boolean keeps this parallel with send_loss_email so both call sites
+  #   can count mail the same way
+  # Sends mail as a side effect, so it is a command, not a predicate.
+  # rubocop:disable Naming/PredicateMethod
   def self.send_warning_email(project, user, old_level, badge_suffix)
     ReportMailer.warn_owner_with_user(project, user, old_level,
                                       badge_suffix).deliver_later
+    true
   end
+  # rubocop:enable Naming/PredicateMethod
   private_class_method :send_warning_email
 
   # Returns projects that first achieved +level+ during +target_month+.

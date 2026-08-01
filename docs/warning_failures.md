@@ -528,7 +528,7 @@ WARN_NOTIFY_PROJECT_FIELDS =
   the heap. This project has already been bitten by memory exhaustion in
   bulk loops (see `BULK_RECALC_BATCH_SIZE`). Rejected.
 
-#### Option 1C: write with `update_all` scoped by id (chosen)
+#### Option 1C: write with `update_all` scoped by id (superseded)
 
 ```ruby
 updated = Project.where(id: project.id).update_all(
@@ -536,11 +536,72 @@ updated = Project.where(id: project.id).update_all(
 )
 ```
 
-**Decision: this is the option to implement.** These columns are
-bookkeeping, not user-editable state, so optimistic locking is not the
-correct semantics for them in the first place. Bypassing it here is the
-right behavior rather than a workaround, and it happens to make the
-defect unreachable.
+This was chosen first, then abandoned during review of the
+implementation. `update_all` carries hidden behavior of its own: when the
+model has a locking column and the updates hash does not mention it,
+Rails appends `lock_version = lock_version + 1` to the `SET` clause
+(`activerecord/lib/active_record/relation.rb`). The project edit form
+submits `lock_version` as a hidden field and the controller rescues
+`StaleObjectError` with "changed since you started editing"
+(`projects_controller.rb`), so bumping it would make an owner's in-flight
+edit fail because of our bookkeeping, telling them their work collided
+when nothing of theirs had changed. The `default_scope` order also turned
+a simple `WHERE id = ?` into a needless `IN (SELECT ... ORDER BY ...)`
+subquery.
+
+Both were fixable, with `unscoped` and by assigning the locking column to
+itself, but that is compensating machinery: roughly twenty lines of
+workaround and explanation for a two-column write. See option 1D.
+
+* **Pro.** Immune to the original defect by construction. `update_all`
+  builds its own `WHERE` from the relation and never consults the loaded
+  attributes.
+* **Pro.** Returns the number of affected rows, which makes the check in
+  concern 2 natural rather than bolted on.
+* **Con.** Silently bumps `lock_version`, with the user-visible
+  consequence above. This is a second piece of hidden ORM behavior in the
+  same few lines of code, after the one that caused the incident.
+* **Con.** Needs `unscoped` to avoid a pointless subquery.
+* **Con.** Does not refresh the in-memory object. Harmless in these two
+  loops, which never re-read the cleared attribute, but worth noting.
+
+#### Option 1D: a parameterized SQL statement (chosen)
+
+```ruby
+sql = sanitize_sql_array(
+  [
+    "UPDATE projects SET #{assignments} WHERE id = ?",
+    *columns.values, id
+  ]
+)
+with_connection { |conn| conn.update(sql) }
+```
+
+**Decision: this is the option to implement.** The deciding argument is
+empirical. These same twenty lines have now been broken twice by implicit
+ORM behavior, each time invisible in the Ruby and visible only in the
+generated SQL: `update_columns` adding `lock_version` to the `WHERE`
+clause, and `update_all` adding an increment to the `SET` clause. A
+literal statement has no such surface.
+
+* **Pro.** Says exactly what it does. It touches only the columns named,
+  leaves `lock_version` alone by never mentioning it, ignores
+  `default_scope`, and does not touch `updated_at`.
+* **Pro.** Stable across ORM upgrades, which the two failures above show
+  is not a theoretical concern here.
+* **Pro.** Shorter overall: no `unscoped`, no self-assignment constant,
+  and none of the commentary needed to explain either.
+* **Pro.** `connection.update` returns the affected row count directly.
+* **Con.** Departs from this codebase's stated preference for the
+  ActiveRecord query interface, which `projects_to_remind` justifies on
+  portability grounds. The force of that is low here: every environment
+  in `config/database.yml` is PostgreSQL, and a single-table
+  `UPDATE ... WHERE id = ?` is plain ANSI SQL that every engine supports.
+* **Con.** Column names are interpolated rather than bound, so they are
+  validated against `column_names` first. Values remain bound parameters.
+  Static analysis may still object, in which case a
+  `config/brakeman.ignore` entry with this rationale is appropriate: the
+  statement is short enough to verify by inspection.
 
 * **Pro.** Immune to the defect by construction. `update_all` builds its
   own `WHERE` from the relation and never consults the loaded
@@ -1160,10 +1221,9 @@ In execution order, grouped by change set; see
 
 ### Set 1: the defect itself
 
-1. **Fix the write with option 1C.** `update_all` scoped by id, in one
-   small private helper shared by both existing loops, with a comment
-   explaining that optimistic locking is deliberately bypassed for these
-   bookkeeping columns.
+1. **Fix the write with option 1D.** A parameterized `UPDATE` in one
+   small private helper shared by both existing loops, with column names
+   validated against the schema and values bound.
 2. **Check the result (2B).** Report any write affecting other than one
    row to `Rails.logger.error` and Sentry. A silent `false` is what cost
    us five weeks.
@@ -1188,7 +1248,7 @@ both caps to 20. The system is no longer suppressed from here.
 ### Set 3: delivery semantics and resilience
 
 1. **Restructure to design 6B.** Send with `deliver_now`, then clear the
-   flag and stamp the sent-at column in one `update_all`, so the
+   flag and stamp the sent-at column in one statement, so the
    timestamp records a delivery rather than an attempt. Safe only
    because set 1 made the write incapable of silently matching zero
    rows.
@@ -1216,7 +1276,21 @@ both caps to 20. The system is no longer suppressed from here.
 
 1. **Fix the Fastly initializer ordering** and its misleading comment.
 2. **Retire the stub `worker` dyno.**
-3. **Purge individual project data instead of the whole CDN cache.**
+3. **Audit for other writes that optimistic locking can disturb.**
+   `projects` is the only table with a `lock_version` column today, and
+   the survey in
+   [The same trap was already known](#the-same-trap-was-already-known)
+   found no other write through a partially loaded record. That survey
+   asked only whether writes would *fail*. It did not ask the second
+   question this review raised: which writes silently *bump*
+   `lock_version` and can therefore make a project owner's in-flight edit
+   fail with `StaleObjectError` for no reason the owner can see. Any
+   `save`, `update`, `update_column`, or `update_all` on a project from a
+   background task or an administrative path is a candidate. Where such a
+   write is bookkeeping rather than user content, convert it to a
+   parameterized SQL statement as in option 1D; that is both simpler and
+   immune to this class of surprise.
+4. **Purge individual project data instead of the whole CDN cache.**
    Have `update_all_badge_percentages` collect the `record_key` of each
    project it actually changed, detected with `project.changed?` before
    the save, and purge those keys through `PurgeCdnProjectJob`. Purge
