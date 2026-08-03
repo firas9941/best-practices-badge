@@ -24,15 +24,29 @@ against `main`:
 | `104f4634` | this document |
 | `c66c0f86` | set 1, the defect fix |
 | `0431d26a` | set 2, the unification |
-| `cfd7b86b` | this status section |
+| `a9e18a6e` | set 3 subdivided, deployment deferred |
+| `d482f123` | step 3a, the outcome vocabulary |
+| `0ce23368` | step 3b, synchronous delivery |
+| `ae8020ff` | step 3c, the warning relevance guard |
+| `97ac2930` | step 3c follow-up, the no-deadline message |
+| `3001e0b0` | step 3d, suppression defers |
+| `7aca2c1a` | step 3e-1, the attempt counters and their reset |
+| `c308f004` | step 3e-2, classification and bounded retry |
+| `1eb214e8` | step 3f, the end-of-run check |
+| `c6b372ff` | simplifying that loop, and full local `rake` |
 
-Every check on that pull request passed as of 2026-08-03. That includes
-Brakeman, which gates `main`, runs only on GitHub, and had not
-previously seen the parameterized `UPDATE` that set 1 introduces. It
+All three sets are pushed as of 2026-08-03, and `rake default` passes
+locally, coverage included. Every check on GitHub passes: the test
+build, Brakeman, all four CodeQL analyses, DCO, spelling, and Kusari.
+
+Brakeman matters most here. It gates `main`, runs only on GitHub, and
+had never seen the parameterized `UPDATE` that set 1 introduces. It
 raised no objection to the interpolated column names, so no
 `config/brakeman.ignore` entry was needed and the rationale recorded in
 [option 1D](#option-1d-a-parameterized-sql-statement-chosen) has not
 had to be used.
+
+The pull request is still marked draft.
 
 ### Production state right now
 
@@ -55,10 +69,11 @@ was written as the seven steps under [The plan](#the-plan), each with
 its own tests, and passes the full non-system suite locally. The
 separable items are not started.
 
-What remains before this can merge:
+What remains:
 
-1. Push and let CI see set 3. Brakeman in particular has not yet seen
-   any of it.
+1. Take the pull request out of draft and get it reviewed. This is a
+   large change to code that mails people, so a second pair of eyes is
+   worth more here than usual.
 2. Decide the separable items in or out. None of them block.
 3. The operational sequence under [Operational](#operational): deploy,
    restore both caps to 20, then confirm on the following run that the
