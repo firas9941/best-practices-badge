@@ -1410,16 +1410,23 @@ Three of the seven change nothing observable (3a, 3e-1, 3f is purely
 additive), which leaves only four steps that alter what an owner
 receives.
 
-1. **Step 3a: an outcome vocabulary. No behavior change.**
-   Replace the Boolean yield contract with a symbol, `:sent` or
-   `:not_relevant`. These two cases are conflated today:
-   `send_loss_email` returns `false` both when the badge has been
-   regained and when it declines for any other reason, and the caller
-   cannot tell them apart. `send_notifications` maps `:sent` to "count
-   and clear" and `:not_relevant` to "clear without counting", which is
-   exactly what it does now. Review is a question of equivalence, and
-   the existing tests in `test/integration/recalc_test.rb` should pass
-   untouched.
+1. **Step 3a: an outcome vocabulary. No behavior change. Done
+   2026-08-03.**
+   Replace the Boolean yield contract with a symbol from
+   `NOTIFICATION_OUTCOMES`. Three cases are conflated today:
+   `send_loss_email` returns `false` when the badge has been regained,
+   and `send_notifications` treats "we cannot email this owner"
+   identically, so the caller cannot tell a notification that is over
+   from one that is merely undeliverable today. `:sent`,
+   `:not_relevant`, and `:suppressed` name them apart while all three
+   still behave exactly as they do now.
+
+   As landed, an unknown outcome raises rather than being read as "no
+   mail sent", so a block left on the old Boolean contract fails in CI
+   instead of quietly undercounting. Review is a question of
+   equivalence; the existing tests in `test/integration/recalc_test.rb`
+   passed with one mechanical change, a block returning `true` that now
+   returns `:sent`.
 2. **Step 3b: `deliver_now` (design 6B).** One line in each of
    `send_loss_email` and `send_warning_email`, so `last_*_sent_at`
    records a delivery rather than an enqueue. This is safe to land

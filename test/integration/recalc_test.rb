@@ -228,7 +228,7 @@ class RecalcTest < ActionDispatch::IntegrationTest
     sent = Project.send(
       :send_notifications, Project.where(id: project.id), 1,
       Project::NOTIFICATION_SERIES[:warning]
-    ) { |_project, _user, _level, _suffix| true }
+    ) { |_project, _user, _level, _suffix| :sent }
     assert_equal 1, sent
     fresh = Project.find(project.id)
     assert_equal 0, fresh.unreported_badge_warning
@@ -269,9 +269,43 @@ class RecalcTest < ActionDispatch::IntegrationTest
     assert_match(/project -1/, logged.string)
   end
 
+  # A block that answers in the old Boolean vocabulary must fail loudly.
+  # Read as an outcome, "true" is simply unknown, and the quiet reading of
+  # an unknown answer is "no mail was sent", which would undercount
+  # silently and, once outcomes drive clearing, mishandle the flag.
+  test 'send_notifications rejects an unknown outcome' do
+    project = projects(:one)
+    project.update_column(:unreported_badge_warning, 1)
+    error =
+      assert_raises(ArgumentError) do
+        Project.send(
+          :send_notifications, Project.where(id: project.id), 1,
+          Project::NOTIFICATION_SERIES[:warning]
+        ) { |_project, _user, _level, _suffix| true }
+      end
+    assert_match(/Unknown notification outcome/, error.message)
+  end
+
+  # Every outcome the vocabulary defines must be handled, not just the
+  # ones today's two mailers happen to return.
+  test 'send_notifications counts only the sent outcome' do
+    project = projects(:one)
+    Project::NOTIFICATION_OUTCOMES.each do |outcome|
+      project.update_column(:unreported_badge_warning, 1)
+      sent = Project.send(
+        :send_notifications, Project.where(id: project.id), 1,
+        Project::NOTIFICATION_SERIES[:warning]
+      ) { |_project, _user, _level, _suffix| outcome }
+      assert_equal (outcome == :sent ? 1 : 0), sent, "outcome #{outcome}"
+      # Every outcome clears the flag today.  Step 3d changes that for
+      # :suppressed, and this assertion with it.
+      assert_equal 0, Project.find(project.id).unreported_badge_warning
+    end
+  end
+
   # The counter must report mail actually enqueued.  perfect_passing has
-  # regained the level, so send_loss_email declines and nothing is sent;
-  # the count previously included such projects anyway.
+  # regained the level, so send_loss_email returns :not_relevant and
+  # nothing is sent; the count previously included such projects anyway.
   test 'send_loss_notifications does not count declined mail' do
     project = projects(:perfect_passing)
     project.update_column(:unreported_badge_loss, 1)

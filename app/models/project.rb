@@ -1161,12 +1161,42 @@ class Project < ApplicationRecord
     }
   }.freeze
 
+  # What one notification attempt did.  This is the vocabulary the block
+  # given to send_notifications answers in.
+  #
+  #   :sent          mail was handed to the mailer
+  #   :not_relevant  the notification no longer means anything, so there
+  #                  is nothing to send and nothing to keep
+  #   :suppressed    we chose not to send: the owner has opted out of
+  #                  important notifications, or has no usable address
+  #
+  # These three are distinguished now, before anything depends on the
+  # difference, because the outcomes call for different handling and the
+  # old Boolean could not express it: :not_relevant and :suppressed were
+  # both "false", and treating them alike is what discards a suppressed
+  # owner's notification permanently.  Later steps add the two failure
+  # outcomes and act on the distinction.  See docs/warning_failures.md.
+  NOTIFICATION_OUTCOMES = %i[sent not_relevant suppressed].freeze
+
+  # Confirm that a notification block answered in the agreed vocabulary.
+  # A block still returning the old +true+ would otherwise be read as
+  # "not sent", quietly undercounting mail and, once the outcomes drive
+  # clearing, quietly mishandling the flag.  Fail loudly instead.
+  # @param outcome [Symbol] what the block returned
+  # @return [Symbol] the same outcome, if it is a known one
+  # @raise [ArgumentError] if the outcome is not in NOTIFICATION_OUTCOMES
+  def self.checked_outcome(outcome)
+    return outcome if NOTIFICATION_OUTCOMES.include?(outcome)
+
+    raise ArgumentError, "Unknown notification outcome: #{outcome.inspect}"
+  end
+  private_class_method :checked_outcome
+
   # Send one series of notification emails in a rate-limited batch.
-  # Each email counts toward +cap+; notifications drained without sending
-  # (the owner opted out, or the block declined) do not.  Stops as soon as
-  # the cap is hit.  The flag is cleared either way, so a notification is
-  # not retried; changing that is a separate step, see
-  # docs/warning_failures.md.
+  # Only mail actually sent counts toward +cap+; notifications drained
+  # without sending do not.  Stops as soon as the cap is hit.  The flag is
+  # cleared whatever the outcome, so a notification is never retried;
+  # changing that is a separate step, see docs/warning_failures.md.
   #
   # @param pending [ActiveRecord::Relation] projects with a pending flag
   # @param cap [Integer] most emails to send in this run
@@ -1175,7 +1205,7 @@ class Project < ApplicationRecord
   # @yieldparam user [User] the project owner, already loaded
   # @yieldparam old_level [String] level the notification concerns
   # @yieldparam badge_suffix [String] 'badge' or 'baseline'
-  # @yieldreturn [Boolean] true if mail was enqueued
+  # @yieldreturn [Symbol] one of NOTIFICATION_OUTCOMES
   # @return [Integer] number of emails sent
   # rubocop:disable Metrics/MethodLength, Metrics/AbcSize
   def self.send_notifications(pending, cap, series)
@@ -1196,10 +1226,19 @@ class Project < ApplicationRecord
         rank = project[kind[:flag]]
         next if rank <= 0
 
-        if can_email && yield(project, user, kind[:levels][rank],
-                              kind[:suffix])
-          emails_sent += 1
-        end
+        outcome =
+          if can_email
+            checked_outcome(
+              yield(project, user, kind[:levels][rank], kind[:suffix])
+            )
+          else
+            :suppressed
+          end
+        emails_sent += 1 if outcome == :sent
+        # Every outcome clears the flag, :suppressed included, so an owner
+        # we cannot email loses the notification instead of keeping it for
+        # a day when we can.  Step 3d changes that; the outcomes are
+        # distinguished here so that it can.
         clear_notification_flag(
           project, kind[:flag] => 0, series[:sent_at] => now
         )
@@ -1227,9 +1266,7 @@ class Project < ApplicationRecord
   # @param user [User] the project owner (pre-fetched, avoids N+1)
   # @param old_level [String] the badge level that was lost
   # @param badge_suffix [String] 'badge' or 'baseline'
-  # @return [Boolean] true if mail was enqueued, false if declined
-  # Sends mail as a side effect, so it is a command, not a predicate.
-  # rubocop:disable Naming/PredicateMethod
+  # @return [Symbol] :sent, or :not_relevant if the level was regained
   def self.send_loss_email(project, user, old_level, badge_suffix)
     new_level =
       if badge_suffix == 'baseline'
@@ -1237,13 +1274,15 @@ class Project < ApplicationRecord
       else
         project.badge_level
       end
-    return false unless Sections.badge_level_lost?(old_level, new_level)
+    # The level is back, so there is no loss left to report.
+    unless Sections.badge_level_lost?(old_level, new_level)
+      return :not_relevant
+    end
 
     ReportMailer.email_owner_with_user(project, user, old_level, new_level,
                                        true, badge_suffix).deliver_later
-    true
+    :sent
   end
-  # rubocop:enable Naming/PredicateMethod
   private_class_method :send_loss_email
 
   # Returns projects with a pending badge-warning notification (either series).
@@ -1277,17 +1316,15 @@ class Project < ApplicationRecord
   # @param user [User] the project owner (pre-fetched, avoids N+1)
   # @param old_level [String] the badge level that will be lost
   # @param badge_suffix [String] 'badge' or 'baseline'
-  # @return [Boolean] true; a warning is always valid at send time, but the
-  #   Boolean keeps this parallel with send_loss_email so both call sites
-  #   can count mail the same way
-  # Sends mail as a side effect, so it is a command, not a predicate.
-  # rubocop:disable Naming/PredicateMethod
+  # @return [Symbol] always :sent; a warning is valid at send time, and
+  #   answering in the same vocabulary as send_loss_email lets one caller
+  #   handle both.  Step 3c adds a :not_relevant case here, for a warning
+  #   whose effective date has passed.
   def self.send_warning_email(project, user, old_level, badge_suffix)
     ReportMailer.warn_owner_with_user(project, user, old_level,
                                       badge_suffix).deliver_later
-    true
+    :sent
   end
-  # rubocop:enable Naming/PredicateMethod
   private_class_method :send_warning_email
 
   # Returns projects that first achieved +level+ during +target_month+.
