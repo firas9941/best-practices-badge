@@ -1194,9 +1194,9 @@ class Project < ApplicationRecord
 
   # Send one series of notification emails in a rate-limited batch.
   # Only mail actually sent counts toward +cap+; notifications drained
-  # without sending do not.  Stops as soon as the cap is hit.  The flag is
-  # cleared whatever the outcome, so a notification is never retried;
-  # changing that is a separate step, see docs/warning_failures.md.
+  # without sending do not.  Stops as soon as the cap is hit.  A sent or
+  # no-longer-relevant notification is cleared; a suppressed one keeps
+  # its flag for a later run.  See docs/warning_failures.md.
   #
   # Mail is delivered synchronously (deliver_now), as
   # ProjectsController.send_reminders already does at a larger volume, so
@@ -1231,8 +1231,9 @@ class Project < ApplicationRecord
       # Tight SELECT: only the fields needed for sending or skipping.
       # Bounded by the cap, so N+1 cost is minimal.
       user = User.select(LOSS_NOTIFY_USER_FIELDS).find(project.user_id)
-      can_email = user.important_notifications? &&
-                  user.encrypted_email.present?
+      # deliverable_email? is the mailers' own test, so what we count as
+      # sent and what they will actually send cannot drift apart.
+      can_email = user.important_notifications? && user.deliverable_email?
       now = Time.now.utc
 
       series[:kinds].each do |kind|
@@ -1250,10 +1251,16 @@ class Project < ApplicationRecord
             :suppressed
           end
         emails_sent += 1 if outcome == :sent
-        # Every outcome clears the flag, :suppressed included, so an owner
-        # we cannot email loses the notification instead of keeping it for
-        # a day when we can.  Step 3d changes that; the outcomes are
-        # distinguished here so that it can.
+        # A suppressed notification is deferred, not discarded: the flag
+        # stays set so that an owner who re-enables notifications, or
+        # whose address is repaired, still gets what they are owed.
+        # Clearing it here would mean that opting back in delivers
+        # nothing, since no new flag is raised unless the badge changes
+        # level again.  The cost is pending rows that may never drain,
+        # which the relevance guards bound and which the end-of-run
+        # check must not mistake for a stuck queue.
+        next if outcome == :suppressed
+
         clear_notification_flag(
           project, kind[:flag] => 0, series[:sent_at] => now
         )

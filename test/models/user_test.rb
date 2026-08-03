@@ -161,6 +161,29 @@ class UserTest < ActiveSupport::TestCase
     assert_equal 'CANNOT_DECRYPT', u.email_if_decryptable
   end
 
+  # deliverable_email? is the one place we decide whether an address can
+  # be mailed at all, so that a caller deciding whether to send cannot
+  # disagree with the mailer doing the sending.  Each rejection below is
+  # a reason a mailer already declined to send; see
+  # docs/warning_failures.md.
+  test 'deliverable_email? accepts a usable address' do
+    assert_predicate users(:test_user), :deliverable_email?
+  end
+
+  test 'deliverable_email? rejects a missing address' do
+    assert_not_predicate User.new, :deliverable_email?
+  end
+
+  test 'deliverable_email? rejects an address that will not decrypt' do
+    assert_not_predicate StubUserEmail.new, :deliverable_email?
+  end
+
+  test 'deliverable_email? rejects an address without an at sign' do
+    u = users(:test_user)
+    u.email = 'no-at-sign'
+    assert_not_predicate u, :deliverable_email?
+  end
+
   test 'Data model encrypted email addresses and blind index keys work' do
     # We precompute the user data fixtures, and it's possible we got it wrong.
     # Walk through the data set to do sanity checks for each value.

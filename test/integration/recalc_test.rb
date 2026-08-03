@@ -142,14 +142,50 @@ class RecalcTest < ActionDispatch::IntegrationTest
     assert_equal 0, Project.find(project.id).unreported_baseline_badge_loss
   end
 
-  test 'send_loss_notifications silently clears column when important_notifications false' do
+  # Suppression defers rather than discards.  Clearing here would mean an
+  # owner who re-enables notifications gets nothing, because no new flag
+  # is raised unless the badge changes level again.
+  test 'send_loss_notifications keeps the flag when notifications are off' do
     project = projects(:one)
     project.user.update_column(:important_notifications, false)
     project.update_column(:unreported_badge_loss, 1)
     assert_emails(0) do
       Project.send_loss_notifications
     end
+    assert_equal 1, Project.find(project.id).unreported_badge_loss
+    assert_nil Project.find(project.id).last_loss_sent_at
+  end
+
+  # The point of deferring: the notification is still there to deliver.
+  test 'send_loss_notifications delivers once notifications are back on' do
+    project = projects(:one)
+    project.user.update_column(:important_notifications, false)
+    project.update_column(:unreported_badge_loss, 1)
+    assert_emails(0) do
+      Project.send_loss_notifications
+    end
+    project.user.update_column(:important_notifications, true)
+    assert_emails(1) do
+      Project.send_loss_notifications
+    end
     assert_equal 0, Project.find(project.id).unreported_badge_loss
+  end
+
+  # The defect found while doing step 3b: the loop tested only that
+  # encrypted_email was present, while the mailer also required an
+  # address that decrypts and contains "@".  An owner failing only the
+  # mailer's test was counted as emailed and had the flag cleared,
+  # though no mail was ever created.
+  test 'send_loss_notifications keeps the flag for an unusable address' do
+    project = projects(:one)
+    user = project.user
+    user.email = 'no-at-sign'
+    user.save!(validate: false)
+    project.update_column(:unreported_badge_loss, 1)
+    assert_emails(0) do
+      assert_equal 0, Project.send_loss_notifications
+    end
+    assert_equal 1, Project.find(project.id).unreported_badge_loss
   end
 
   test 'send_loss_notifications skips email if badge already regained' do
@@ -297,9 +333,11 @@ class RecalcTest < ActionDispatch::IntegrationTest
         Project::NOTIFICATION_SERIES[:warning]
       ) { |_project, _user, _level, _suffix| outcome }
       assert_equal (outcome == :sent ? 1 : 0), sent, "outcome #{outcome}"
-      # Every outcome clears the flag today.  Step 3d changes that for
-      # :suppressed, and this assertion with it.
-      assert_equal 0, Project.find(project.id).unreported_badge_warning
+      # A suppressed notification is kept for a later run; the other two
+      # are finished with, one way or the other.
+      assert_equal (outcome == :suppressed ? 1 : 0),
+                   Project.find(project.id).unreported_badge_warning,
+                   "outcome #{outcome}"
     end
   end
 
@@ -398,14 +436,15 @@ class RecalcTest < ActionDispatch::IntegrationTest
     assert_equal 0, Project.find(project.id).unreported_baseline_badge_warning
   end
 
-  test 'send_warning_notifications silently clears column when important_notifications false' do
+  test 'send_warning_notifications keeps the flag when notifications are off' do
     project = projects(:one)
     project.user.update_column(:important_notifications, false)
     project.update_column(:unreported_badge_warning, 1)
     assert_emails(0) do
       Project.send_warning_notifications
     end
-    assert_equal 0, Project.find(project.id).unreported_badge_warning
+    assert_equal 1, Project.find(project.id).unreported_badge_warning
+    assert_nil Project.find(project.id).last_warning_sent_at
   end
 
   test 'send_warning_notifications sets last_warning_sent_at' do
