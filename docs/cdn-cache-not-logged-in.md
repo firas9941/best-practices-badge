@@ -13,6 +13,17 @@ the number of situations in which we write anything into that cookie**. The
 key enabling change is to stop emitting a CSRF token (and therefore a
 session cookie) on anonymous read-only pages that do not need one.
 
+> **Status, as of 2026-08-03.** Sections 1 to 10 are **implemented and in
+> production** (#2858, #2859, #2860, #2862). Read them as a record of the
+> design and the reasoning behind it, not as a plan: several are written
+> in the future tense from when they were proposals. Only
+> [section 11](#11-potential-future-work-purge-the-cdn-from-a-model-callback)
+> remains unimplemented, and it is the only part where a new note belongs.
+>
+> Sections 7 and 8, the rollout order and the staging verification steps,
+> describe a rollout that has already happened; they are kept because the
+> same checks are what you would repeat if this ever needed re-verifying.
+
 ---
 
 ## 1. Problem Statement
@@ -1058,13 +1069,15 @@ cookie-bypass rule, with the project surrogate key for purging).
 
 ## 10. Planned future work: CDN cache of unchanging pages
 
-> **Status: not part of this branch.** Everything in this section is recorded
-> here so the work is *ready to start* later; it will be implemented on a
-> **separate branch** after the project-show caching above (Sections 1–9) has
-> shipped. It is written down now because the design depends on, and reuses,
-> the mechanisms introduced above — capturing it here keeps the rationale and
-> the decisions in one place so the future branch is a straightforward
-> execution rather than a re-derivation.
+> **Status: implemented.** This shipped in "Cdn cache misc" (#2862), on a
+> separate branch as planned. `CACHE_UNCHANGING_PAGES`,
+> `UNCHANGING_SURROGATE_KEY`, and `cache_unchanging_page_on_cdn` are in
+> `app/controllers/application_controller.rb`; `static_pages_controller`
+> and `criteria_controller` use them; the boot-time purge and delayed
+> re-purge of section 10.4 are in `config/puma.rb`. What follows is the
+> design and its rationale, kept because the reasoning is not obvious from
+> the code, not a plan awaiting execution. The heading still says "planned
+> future work" because renaming it would break inbound links.
 
 ### 10.1 Goal and rationale
 
