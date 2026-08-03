@@ -10,6 +10,7 @@ require 'minitest/mock' # for stubbing the mailer to raise
 # rubocop:disable Metrics/ClassLength
 class RecalcTest < ActionDispatch::IntegrationTest
   include ActionMailer::TestHelper
+  include ActiveJob::TestHelper
 
   test 'Make sure recalc percentages only updates levels specified' do
     project = projects(:one)
@@ -163,6 +164,78 @@ class RecalcTest < ActionDispatch::IntegrationTest
     Project.update_all_badge_warnings(Criteria.keys,
                                       effective_date: Time.zone.today + 30)
     assert_equal 0, Project.find(project.id).warning_send_attempts
+  end
+
+  # --- CDN purge tests ---
+
+  # A project that actually changed must have its cached badge and JSON
+  # purged, twice: once now and once after a delay, the second closing
+  # the race where a response already in flight re-caches the old badge.
+  test 'update_all_badge_percentages purges each changed project' do
+    settle_badge_percentages
+    project = projects(:one)
+    project.update_column(:badge_percentage_0, 100)
+    project.update_column(:tiered_percentage, 100)
+    assert_enqueued_jobs 2, only: PurgeCdnProjectJob do
+      Project.update_all_badge_percentages(['0'])
+    end
+    assert_enqueued_with(job: PurgeCdnProjectJob,
+                         args: [project.record_key])
+  end
+
+  # The old code purged the entire cache every time, on the grounds that
+  # it had no cheap way to know what changed.  Rails skips the UPDATE
+  # when nothing differs, so project.changed? answers that for free, and
+  # a recalculation that changes nothing should cost the CDN nothing.
+  test 'update_all_badge_percentages purges nothing when nothing changed' do
+    settle_badge_percentages
+    purged_all = false
+    assert_no_enqueued_jobs only: PurgeCdnProjectJob do
+      FastlyRails.stub(:purge_all, ->(*) { purged_all = true }) do
+        Project.update_all_badge_percentages(['0'])
+      end
+    end
+    assert_not purged_all
+  end
+
+  # Above the threshold, individual purges would hit Fastly's rate
+  # limits and finish later than one full purge.  Forced here by
+  # lowering the threshold rather than by making 500 projects change.
+  test 'update_all_badge_percentages purges everything past the threshold' do
+    settle_badge_percentages
+    project = projects(:one)
+    project.update_column(:badge_percentage_0, 100)
+    project.update_column(:tiered_percentage, 100)
+    purged_all = false
+    with_cdn_purge_threshold(0) do
+      FastlyRails.stub(:purge_all, ->(*) { purged_all = true }) do
+        assert_no_enqueued_jobs only: PurgeCdnProjectJob do
+          Project.update_all_badge_percentages(['0'])
+        end
+      end
+    end
+    assert purged_all, 'expected a whole-cache purge past the threshold'
+  end
+
+  # The fixtures' stored percentages are hand-written and do not match
+  # what recalculation computes, so the first run modifies every one of
+  # them.  Run it once to settle them, so that a later run changes only
+  # what the test itself changed.
+  def settle_badge_percentages
+    Project.update_all_badge_percentages(['0'])
+  end
+
+  # Swap MAX_INDIVIDUAL_CDN_PURGES for the duration of a block.  Tests
+  # run in separate processes, not threads, so this cannot leak into a
+  # concurrently running test.
+  def with_cdn_purge_threshold(value)
+    original = Project::MAX_INDIVIDUAL_CDN_PURGES
+    Project.send(:remove_const, :MAX_INDIVIDUAL_CDN_PURGES)
+    Project.const_set(:MAX_INDIVIDUAL_CDN_PURGES, value)
+    yield
+  ensure
+    Project.send(:remove_const, :MAX_INDIVIDUAL_CDN_PURGES)
+    Project.const_set(:MAX_INDIVIDUAL_CDN_PURGES, original)
   end
 
   # --- send_loss_notifications tests ---

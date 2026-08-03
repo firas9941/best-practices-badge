@@ -35,9 +35,11 @@ against `main`:
 | `1eb214e8` | step 3f, the end-of-run check |
 | `c6b372ff` | simplifying that loop, and full local `rake` |
 
-All three sets are pushed as of 2026-08-03, and `rake default` passes
-locally, coverage included. Every check on GitHub passes: the test
-build, Brakeman, all four CodeQL analyses, DCO, spelling, and Kusari.
+Sets 1 to 3 are pushed as of 2026-08-03, and `rake default` passes
+locally at that point, coverage included. Every check on GitHub passes
+for them: the test build, Brakeman, all four CodeQL analyses, DCO,
+spelling, and Kusari. Set 4, the per-project CDN purge, was added
+afterward and has not yet been pushed.
 
 Brakeman matters most here. It gates `main`, runs only on GitHub, and
 had never seen the parameterized `UPDATE` that set 1 introduces. It
@@ -64,14 +66,15 @@ The pull request is still marked draft.
 
 ### What is done and what is next
 
-Sets 1, 2, and 3 are implemented. Sets 1 and 2 are green in CI; set 3
-was written as the seven steps under [The plan](#the-plan), each with
-its own tests, and passes the full non-system suite locally. The
-separable items are not started.
+Sets 1 to 4 are implemented. Sets 1 to 3 are green in CI; set 3 was
+written as the seven steps under [The plan](#the-plan), each with its
+own tests. Set 4 is local only so far. The remaining separable items
+are not started.
 
 What remains:
 
-1. Take the pull request out of draft and get it reviewed. This is a
+1. Push set 4, then take the pull request out of draft and get it
+   reviewed. This is a
    large change to code that mails people, so a second pair of eyes is
    worth more here than usual.
 2. Decide the separable items in or out. None of them block.
@@ -1329,6 +1332,9 @@ Keep `purge_all` as a fallback when the changed set exceeds a threshold:
 thousands of individual Fastly calls would hit rate limits and be worse
 than one full purge.
 
+**Done 2026-08-03**, in this branch rather than separately; see
+[Set 4](#set-4-purge-only-the-projects-that-changed).
+
 The cost of the present behavior is not hypothetical. The production
 recalculation on 2026-07-31 changed a small number of projects and cold
 started the cache for an entire site that is, by its own description,
@@ -1692,6 +1698,46 @@ Each step carries its own tests. Between them they cover the branches
 listed under [concern 7](#a-note-on-test-coverage): suppressed, not
 relevant, transient, permanent, exhausted, and write-affected-no-rows.
 
+### Set 4: purge only the projects that changed
+
+Done 2026-08-03. Listed among the separable items at first, then moved
+into this branch: the recalculation is what takes a badge away, so
+purging the badge that is no longer true belongs with it. Leaving it out
+would have meant shipping a repair that notifies an owner their badge is
+gone while the CDN carries on serving the old one.
+
+1. **Purge per project, after its own commit.**
+   `update_all_badge_percentages` asks `project.changed?` immediately
+   before saving, and enqueues `PurgeCdnProjectJob` for that project's
+   `record_key` once `with_lock` has committed. One key covers the
+   badge, the baseline badge, and the JSON, since all three carry it as
+   a surrogate key.
+2. **Purge twice, briefly apart.** The whole-cache purge this replaces
+   ran at the end of the recalculation, long after most projects had
+   committed, so the reorder race did not arise: a response in flight at
+   commit time had long since landed. Purging each project as soon as it
+   is saved brings that race back, so it is closed the way
+   `projects_controller` closes it around its own saves, with a repeat
+   after `BADGEAPP_PURGE_DELAY`. Both are jobs, so a failed purge is
+   retried with backoff rather than swallowed as `purge_all` swallows
+   it.
+3. **Fall back above `MAX_INDIVIDUAL_CDN_PURGES` (500).** Thousands of
+   individual purges would hit Fastly's rate limits and finish later
+   than one full purge. Crossing the threshold logs the reason.
+
+The claim this rests on, that `project.changed?` identifies exactly the
+affected rows at no cost, is now checked by a test rather than inferred
+from a staging log: a recalculation run twice purges nothing the second
+time. Doing that revealed something worth knowing about the fixtures.
+They are hand-written and their stored percentages do not match what
+recalculation computes, so the first run modifies every one of them; a
+test about "nothing changed" has to settle them first. Production is the
+other way round, which is what makes this change worth having.
+
+A recalculation that changes nothing now costs the CDN nothing at all,
+where before it cold-started the cache of an extremely busy site every
+time.
+
 ### Separable, any time
 
 1. **Fix the Fastly initializer ordering** and its misleading comment.
@@ -1711,13 +1757,11 @@ relevant, transient, permanent, exhausted, and write-affected-no-rows.
    parameterized SQL statement as in option 1D; that is both simpler and
    immune to this class of surprise.
 4. **Purge individual project data instead of the whole CDN cache.**
-   Have `update_all_badge_percentages` collect the `record_key` of each
-   project it actually changed, detected with `project.changed?` before
-   the save, and purge those keys through `PurgeCdnProjectJob`. Purge
-   each project **only after its updated data is stored**, so a request
-   arriving between purge and commit cannot re-cache the old value. Keep
-   `purge_all` as a fallback above a threshold. See
-   [The recalculation purges the whole CDN cache](#the-recalculation-purges-the-whole-cdn-cache).
+   Moved into this branch and **done 2026-08-03**; it is not separable
+   after all. The recalculation is what takes badges away, so the purge
+   that stops a lost badge still being served is part of the same
+   repair, not a tidy-up alongside it. See
+   [Set 4](#set-4-purge-only-the-projects-that-changed).
 
 ### Operational
 
