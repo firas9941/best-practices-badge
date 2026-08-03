@@ -1658,8 +1658,20 @@ receives.
    worked. A test reproduces exactly that, by making the write a no-op
    that still claims one row, and the check catches it.
 
-   It stays quiet when the run stopped at its cap, because the rest of
-   the queue was never examined and there is nothing to conclude.
+   It stays quiet when the run reached its cap, because the rest of the
+   queue was never examined and there is nothing to conclude. That
+   condition is simply `emails_sent < cap`, which is how option 4A
+   words the invariant. An earlier version tracked which of the two
+   `break`s the loop took, and that flag was both more code and an
+   awkward thing to test; deriving the answer costs only that a run
+   which examined everything and landed exactly on the cap also skips
+   the check, one night's alarm at worst.
+
+   The per-project work moved into `notify_project`, which returns how
+   many emails it sent and whether anything is still pending for that
+   project. `send_notifications` is then short enough to read at a
+   glance, and both cap checks are ordinary guard clauses that the
+   existing tests exercise.
 
 Each step carries its own tests. Between them they cover the branches
 listed under [concern 7](#a-note-on-test-coverage): suppressed, not

@@ -621,6 +621,28 @@ class RecalcTest < ActionDispatch::IntegrationTest
     assert_no_match(/did not drain/, log)
   end
 
+  # The cap can also fall between two projects rather than between two
+  # kinds of one project.  The next project must not be examined at all,
+  # and its untouched flag must not be reported as a queue that failed
+  # to drain.
+  test 'send_notifications stops between projects at the cap' do
+    ids = [projects(:one).id, projects(:two).id].sort
+    ids.each do |id|
+      Project.find(id).update_column(:unreported_badge_warning, 1)
+    end
+    log =
+      captured_log do
+        sent = Project.send(
+          :send_notifications, Project.where(id: ids).reorder(:id), 1,
+          Project::NOTIFICATION_SERIES[:warning]
+        ) { |_project, _user, _level, _suffix| :sent }
+        assert_equal 1, sent
+      end
+    assert_equal 0, Project.find(ids.first).unreported_badge_warning
+    assert_equal 1, Project.find(ids.second).unreported_badge_warning
+    assert_no_match(/did not drain/, log)
+  end
+
   # --- send_warning_notifications tests ---
 
   test 'send_warning_notifications sends email and clears column' do

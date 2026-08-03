@@ -1467,53 +1467,70 @@ class Project < ApplicationRecord
   # @yieldparam badge_suffix [String] 'badge' or 'baseline'
   # @yieldreturn [Symbol] one of NOTIFICATION_OUTCOMES
   # @return [Integer] number of emails sent
-  # rubocop:disable Metrics/MethodLength, Metrics/AbcSize
   def self.send_notifications(pending, cap, series, &block)
     emails_sent = 0
     deferred = 0
-    reached_cap = false
     pending.each do |project|
-      if emails_sent >= cap
-        reached_cap = true
-        break
-      end
+      break if emails_sent >= cap
 
-      # Tight SELECT: only the fields needed for sending or skipping.
-      # Bounded by the cap, so N+1 cost is minimal.
-      user = User.select(LOSS_NOTIFY_USER_FIELDS).find(project.user_id)
-      # deliverable_email? is the mailers' own test, so what we count as
-      # sent and what they will actually send cannot drift apart.
-      can_email = user.important_notifications? && user.deliverable_email?
-      now = Time.now.utc
-
-      still_pending = false
-      series[:kinds].each do |kind|
-        if emails_sent >= cap
-          reached_cap = true
-          break
-        end
-
-        rank = project[kind[:flag]]
-        next if rank <= 0
-
-        outcome =
-          if can_email
-            attempt_notification(project, user, kind, rank, &block)
-          else
-            :suppressed
-          end
-        emails_sent += 1 if outcome == :sent
-        still_pending ||= record_outcome(project, kind, series, outcome, now)
-      end
+      sent, still_pending =
+        notify_project(project, series, cap - emails_sent, &block)
+      emails_sent += sent
       deferred += 1 if still_pending
     end
-    # Stopping at the cap leaves work behind legitimately, and we have
-    # not looked at the rest, so there is nothing to conclude.
-    report_stuck_queue(pending, deferred) unless reached_cap
+    # Reaching the cap leaves work behind legitimately and means we did
+    # not look at the rest, so there is nothing to conclude.  A run that
+    # examined everything and still landed exactly on the cap skips the
+    # check too; that costs one night's alarm at worst, and is far
+    # cheaper than a flag tracking which of two breaks we took.
+    report_stuck_queue(pending, deferred) if emails_sent < cap
     emails_sent
   end
-  # rubocop:enable Metrics/MethodLength, Metrics/AbcSize
   private_class_method :send_notifications
+
+  # Send whatever +project+ has pending in this series, up to +allowed+
+  # more emails.
+  #
+  # @param project [Project] project to notify about
+  # @param series [Hash] one entry of NOTIFICATION_SERIES
+  # @param allowed [Integer] emails this project may still send
+  # @yieldparam project [Project] project to notify about
+  # @yieldparam user [User] the project owner, already loaded
+  # @yieldparam old_level [String] level the notification concerns
+  # @yieldparam badge_suffix [String] 'badge' or 'baseline'
+  # @yieldreturn [Symbol] one of NOTIFICATION_OUTCOMES
+  # @return [Array(Integer, Boolean)] emails sent, and whether anything
+  #   is still pending for this project afterward
+  # rubocop:disable Metrics/MethodLength, Metrics/AbcSize
+  def self.notify_project(project, series, allowed, &block)
+    # Tight SELECT: only the fields needed for sending or skipping.
+    # Bounded by the cap, so N+1 cost is minimal.
+    user = User.select(LOSS_NOTIFY_USER_FIELDS).find(project.user_id)
+    # deliverable_email? is the mailers' own test, so what we count as
+    # sent and what they will actually send cannot drift apart.
+    can_email = user.important_notifications? && user.deliverable_email?
+    now = Time.now.utc
+    sent = 0
+    still_pending = false
+    series[:kinds].each do |kind|
+      break if sent >= allowed
+
+      rank = project[kind[:flag]]
+      next if rank <= 0
+
+      outcome =
+        if can_email
+          attempt_notification(project, user, kind, rank, &block)
+        else
+          :suppressed
+        end
+      sent += 1 if outcome == :sent
+      still_pending ||= record_outcome(project, kind, series, outcome, now)
+    end
+    [sent, still_pending]
+  end
+  # rubocop:enable Metrics/MethodLength, Metrics/AbcSize
+  private_class_method :notify_project
 
   # Send badge-loss notification emails in a rate-limited daily batch.
   # @return [Integer] number of emails sent
