@@ -292,6 +292,25 @@ class User < ApplicationRecord
     'CANNOT_DECRYPT'
   end
 
+  # Can we actually deliver mail to this user's address?
+  #
+  # This asks only whether an address exists and is usable, never whether
+  # the user wants a particular message; that is important_notifications?
+  # and its kin.  It is the single place that question is answered, so
+  # that a caller deciding whether to send cannot disagree with the
+  # mailer that does the sending.  They did disagree: the notification
+  # loop tested only that encrypted_email was present, while the mailers
+  # also rejected an address that would not decrypt or had no "@", so an
+  # owner failing the second test but not the first was recorded as
+  # emailed when no mail existed.  See docs/warning_failures.md.
+  #
+  # @return [Boolean] true if we have a usable address for this user
+  def deliverable_email?
+    address = email_if_decryptable
+    address.present? && address != 'CANNOT_DECRYPT' &&
+      address.include?('@')
+  end
+
   # Returns true if email search functionality is available.
   # Email search requires the production blind index key to work correctly.
   # In development without EMAIL_BLIND_INDEX_KEY, searches will fail to match

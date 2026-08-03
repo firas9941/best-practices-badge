@@ -489,6 +489,23 @@ class ProjectsControllerTest < ActionDispatch::IntegrationTest
     assert_equal 'in_progress', body['badge_level']
   end
 
+  # The JSON describes the project; it is not a window into how we run
+  # the badging process.  Withholding these also means a write that only
+  # touches them cannot make a cached page stale.
+  test 'project JSON withholds badging-process bookkeeping' do
+    get "/projects/#{@project.id}.json"
+    assert_response :success
+    body = response.parsed_body
+    Project::BOOKKEEPING_FIELDS.each do |field|
+      assert_not body.key?(field), "#{field} should not be published"
+    end
+    # ...while still publishing what the project actually is.
+    assert_equal 'Pathfinder OS', body['name']
+    assert body.key?('badge_percentage_0')
+    assert body.key?('achieved_passing_at')
+    assert body.key?('user_id')
+  end
+
   test 'should show project JSON data without locale' do
     get "/projects/#{@project.id}.json"
     assert_response :success
@@ -1746,6 +1763,21 @@ class ProjectsControllerTest < ActionDispatch::IntegrationTest
     late_project.reload
     assert_not_nil late_project.last_reminder_at
     # assert_equal late_project.id, result[0]
+  end
+
+  # Sending a reminder writes only last_reminder_at, which is withheld
+  # from the project JSON and shown on no cached page, so it must not
+  # cost a CDN purge.  Purging for a field nobody can see is the waste
+  # that Project::BOOKKEEPING_FIELDS exists to make visible.
+  test 'sending reminders does not purge the CDN' do
+    late_project = Project.find_by(name: 'Pathfinder OS')
+    late_project.last_reminder_at = nil
+    late_project.lost_passing_at = nil
+    late_project.save!(touch: false)
+
+    assert_no_enqueued_jobs only: PurgeCdnProjectJob do
+      ProjectsController.send :send_reminders
+    end
   end
 
   # This is a unit test of a private method in ProjectsController.

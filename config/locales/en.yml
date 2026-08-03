@@ -1180,6 +1180,10 @@ en:
       This is an advance notice that your project's "%{old_level}" badge may be
       lost on %{effective_date} when updated criteria take effect.
       Please review your badge entry at the following URL before that date:
+    warned_level_message_no_date: |-
+      This is an advance notice that your project's "%{old_level}" badge may be
+      lost when updated criteria take effect.
+      Please review your badge entry at the following URL:
     unsubscribe_notice_html: >-
       To unsubscribe from these email notifications, please visit:
       <a href="%{unsubscribe_url}">%{unsubscribe_url}</a>

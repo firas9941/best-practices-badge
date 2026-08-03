@@ -13,6 +13,17 @@ the number of situations in which we write anything into that cookie**. The
 key enabling change is to stop emitting a CSRF token (and therefore a
 session cookie) on anonymous read-only pages that do not need one.
 
+> **Status, as of 2026-08-03.** Sections 1 to 10 are **implemented and in
+> production** (#2858, #2859, #2860, #2862). Read them as a record of the
+> design and the reasoning behind it, not as a plan: several are written
+> in the future tense from when they were proposals. Only
+> [section 11](#11-potential-future-work-purge-the-cdn-from-a-model-callback)
+> remains unimplemented, and it is the only part where a new note belongs.
+>
+> Sections 7 and 8, the rollout order and the staging verification steps,
+> describe a rollout that has already happened; they are kept because the
+> same checks are what you would repeat if this ever needed re-verifying.
+
 ---
 
 ## 1. Problem Statement
@@ -997,7 +1008,7 @@ that exact key.
   controller `update`/`destroy` actions
   ([`projects_controller.rb:694,765-770,814`](../app/controllers/projects_controller.rb))
   and the bulk recalculation (`Project.update_all_badge_percentages`, which
-  ends with `FastlyRails.purge_all`) — **not** into a model callback. Any
+  purges each project it changed) — **not** into a model callback. Any
   *other* path that changes a displayed project field via `save` /
   `update_column` without purging would leave the cached show page stale until
   `Surrogate-Control`'s `max-age` expires (10 days). No such path is known
@@ -1058,13 +1069,15 @@ cookie-bypass rule, with the project surrogate key for purging).
 
 ## 10. Planned future work: CDN cache of unchanging pages
 
-> **Status: not part of this branch.** Everything in this section is recorded
-> here so the work is *ready to start* later; it will be implemented on a
-> **separate branch** after the project-show caching above (Sections 1–9) has
-> shipped. It is written down now because the design depends on, and reuses,
-> the mechanisms introduced above — capturing it here keeps the rationale and
-> the decisions in one place so the future branch is a straightforward
-> execution rather than a re-derivation.
+> **Status: implemented.** This shipped in "Cdn cache misc" (#2862), on a
+> separate branch as planned. `CACHE_UNCHANGING_PAGES`,
+> `UNCHANGING_SURROGATE_KEY`, and `cache_unchanging_page_on_cdn` are in
+> `app/controllers/application_controller.rb`; `static_pages_controller`
+> and `criteria_controller` use them; the boot-time purge and delayed
+> re-purge of section 10.4 are in `config/puma.rb`. What follows is the
+> design and its rationale, kept because the reasoning is not obvious from
+> the code, not a plan awaiting execution. The heading still says "planned
+> future work" because renaming it would break inbound links.
 
 ### 10.1 Goal and rationale
 
@@ -1324,6 +1337,89 @@ instantly.
 > down so the decision can be made deliberately later; it is **not** required
 > for the project-show caching to be correct as shipped.
 
+**Read [11.0](#110-two-objections-raised-2026-08-03) before implementing
+this.** Two objections were raised against the design below after it was
+written, and one of them undercuts its main claim.
+
+### 11.0 Two objections raised 2026-08-03
+
+Recorded here rather than woven into the sections below, so that the
+original proposal stays readable as it was argued.
+
+#### The callback would miss most of what it is meant to catch
+
+This is the serious one. Section 11.1 justifies the callback as
+protection against a **future non-controller write path** that changes a
+displayed field without purging. But the non-controller writes that exist
+today deliberately use methods that skip callbacks, so an `after_commit`
+would never fire for them:
+
+| Write path | Method | Callbacks? |
+| ---------- | ------ | ---------- |
+| `Project.write_notification_columns` | parameterized SQL | no |
+| `Project.save_warning_columns` | `update_columns` | no |
+| `ProjectsController#set_level_saved_flag` | `update_column` | no |
+
+None of these is accidental. The SQL one is chosen in
+`docs/warning_failures.md` option 1D precisely to escape implicit ORM
+behavior, and `set_level_saved_flag` carries the comment "Use
+update_column to avoid triggering callbacks during automation". A future
+author writing bookkeeping code has every reason to reach for the same
+tools.
+
+So the callback would fire mainly for paths that already purge
+explicitly, which is duplication, while missing the class of write it was
+proposed to protect against. That is worse than a known gap: it looks
+like coverage and is not. Any version of this proposal has to say what it
+does about callback-skipping writes, and the honest answer may be that
+they still need explicit purges, which is most of what the callback was
+supposed to remove.
+
+#### A naive callback purges on changes nobody can see
+
+`after_commit` on any update purges whenever *any* column changes,
+including ones absent from every cached representation.
+
+When this objection was first raised it was nearly moot, because
+`app/views/projects/_project.json.jbuilder` emitted **every** attribute
+and `show_json` is CDN-cached, so almost no field was genuinely hidden.
+**That is no longer true.** `Project::BOOKKEEPING_FIELDS` now names the
+columns that record how we run the badging process rather than anything
+about the project, and the JSON view withholds them: the notification
+flags and timestamps, the delivery attempt counters, the warning
+effective date, `last_reminder_at`, `disabled_reminders`,
+`lock_version`, and the per-level `*_saved` edit-automation flags.
+
+So the objection is live, and the same list is most of its answer. Gate
+the purge on `saved_changes.keys` and skip when every changed column is
+in `BOOKKEEPING_FIELDS`, because by construction nothing cached shows
+them. That constant was written with this section in mind and is the
+place to extend if more columns turn out not to reach any cached page.
+
+Note what this does to the *first* objection as well. Two of the three
+callback-skipping write paths — `write_notification_columns` and
+`save_warning_columns` — now touch only bookkeeping columns, so they
+have nothing cached to invalidate and their invisibility to callbacks
+stops mattering. `set_level_saved_flag` writes only `*_saved`, likewise.
+Whether that leaves *any* real gap for the callback to close is the
+question to answer before building it.
+
+#### What changed underneath the proposal since it was written
+
+* The bulk recalculation now purges each project it changed, rather than
+  issuing one `FastlyRails.purge_all`. Section 11.2.1's "severe
+  regression" argument was rewritten accordingly; the remaining reason
+  for its `skip_callbacks` guard is duplication.
+* `ProjectsController.send_reminders` used to write `last_reminder_at`
+  and save without purging, leaving a stale cached `show_json` for up to
+  ten days. That was the one real gap a naive callback would have
+  closed. It is fixed, but not by purging: `last_reminder_at` is now in
+  `BOOKKEEPING_FIELDS` and withheld from the JSON, so there is nothing
+  cached left to go stale. A purge was added there first and then
+  removed as pointless, which is worth knowing because it is the whole
+  argument in miniature. The question to ask of a write is not "does it
+  purge?" but "does it change anything a reader can see?"
+
 ### 11.1 Motivation
 
 Purging is currently wired into specific code paths rather than the data model:
@@ -1331,7 +1427,8 @@ Purging is currently wired into specific code paths rather than the data model:
 * Controller `update`/`destroy` call `@project.purge_cdn_project` and schedule
   a delayed `PurgeCdnProjectJob`
   ([`projects_controller.rb:694,765-770,814`](../app/controllers/projects_controller.rb)).
-* The bulk recalculation issues one `FastlyRails.purge_all`
+* The bulk recalculation purges each project it actually changed, through
+  `PurgeCdnProjectJob`
   ([`project.rb`](../app/models/project.rb), `update_all_badge_percentages`).
 
 Both known write paths are covered, so the shipped feature is correct. The
@@ -1354,7 +1451,7 @@ reusing the existing `record_key` and `PurgeCdnProjectJob`:
 # Purge this project's cached CDN resources (badge, JSON, and the anonymous
 # show HTML -- all tagged with record_key) whenever the project changes by
 # ANY path, not just controller edits. Skipped during bulk recalculation,
-# which issues a single purge_all itself (update_all_badge_percentages).
+# which purges the projects it changes itself (update_all_badge_percentages).
 after_commit :enqueue_cdn_purge, on: %i[update destroy], unless: :skip_callbacks
 
 private
@@ -1372,13 +1469,19 @@ end
 The implementation details that make this correct (a naive callback is *worse*
 than today without them):
 
-1. **Gate on `skip_callbacks` — the critical pitfall.**
+1. **Gate on `skip_callbacks`.**
    `update_all_badge_percentages` sets the `cattr_accessor :skip_callbacks`
-   true, saves 10,000+ projects, and then issues **one** `FastlyRails.purge_all`.
-   Without `unless: :skip_callbacks`, the callback would fire on every one of
-   those commits and enqueue 20,000+ individual purge jobs in place of that
-   single purge_all — a severe regression. The flag is still true during each
-   in-loop commit, so the guard suppresses it correctly.
+   true, saves 10,000+ projects, and purges each one it actually changed.
+   Without `unless: :skip_callbacks`, the callback would fire on those same
+   commits and purge each changed project a second time. The flag is still
+   true during each in-loop commit, so the guard suppresses it correctly.
+
+   This item used to warn that the callback would replace a single
+   `purge_all` with 20,000+ individual jobs, calling that a severe
+   regression. That is no longer the comparison: the recalculation now
+   does the per-project purging itself, deliberately, and only for rows
+   it changed. The remaining reason for the guard is duplication, which
+   is wasteful rather than dangerous.
 2. **Use `after_commit`, not `after_save`.** Purge only after the data is
    durably committed; purging inside the transaction lets a concurrent anonymous
    read re-populate the cache with pre-commit (or about-to-roll-back) content.
@@ -1444,9 +1547,11 @@ should be acknowledged rather than silently assumed handled.
 * Assert a plain change enqueues the purge:
   `assert_enqueued_with(job: PurgeCdnProjectJob, args: [project.record_key])`
   after `project.update!(name: 'x')`.
-* Assert the **bulk path does not** enqueue per-project purges (guarding the
-  `skip_callbacks` pitfall in 11.2.1): run `update_all_badge_percentages` and
-  assert zero `PurgeCdnProjectJob` enqueues from the loop (the single
-  `purge_all` is a separate call).
+* Assert the **bulk path does not** enqueue a *second* purge per project
+  (guarding the `skip_callbacks` pitfall in 11.2.1). The bulk path already
+  enqueues `PurgeCdnProjectJob` twice for each project it changed, now and
+  again after a delay, so the assertion is about that count not growing,
+  not about it being zero. `test/integration/recalc_test.rb` covers the
+  bulk path's own purging.
 * Keep the Section 9.3 `Surrogate-Key` test, which ties the cached page to the
   key the callback purges.
