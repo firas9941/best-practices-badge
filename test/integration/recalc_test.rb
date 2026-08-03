@@ -541,6 +541,86 @@ class RecalcTest < ActionDispatch::IntegrationTest
     assert_equal 0, Project.find(project.id).unreported_baseline_badge_warning
   end
 
+  # --- end-of-run invariant tests ---
+
+  # Run +block+ with the log captured, and return what was logged.
+  def captured_log
+    logged = StringIO.new
+    original_logger = Rails.logger
+    Rails.logger = ActiveSupport::Logger.new(logged)
+    begin
+      yield
+    ensure
+      Rails.logger = original_logger
+    end
+    logged.string
+  end
+
+  # The check that does not take the other layers at their word.  This is
+  # the original defect's exact signature: every write reports success,
+  # the count of mail sent looks right, and the flags are all still set.
+  # Simulated by making the write a no-op that still claims one row.
+  test 'send_loss_notifications reports a queue that did not drain' do
+    project = projects(:one)
+    project.update_column(:unreported_badge_loss, 1)
+    log =
+      captured_log do
+        Project.stub(:update_one_project, 1) do
+          assert_equal 1, Project.send_loss_notifications
+        end
+      end
+    assert_equal 1, Project.find(project.id).unreported_badge_loss
+    assert_match(/Notification queue did not drain/, log)
+    assert_match(/1 projects still pending/, log)
+  end
+
+  test 'send_loss_notifications says nothing when the queue drains' do
+    project = projects(:one)
+    project.update_column(:unreported_badge_loss, 1)
+    log = captured_log { Project.send_loss_notifications }
+    assert_equal 0, Project.find(project.id).unreported_badge_loss
+    assert_no_match(/did not drain/, log)
+  end
+
+  # A deliberate deferral is not a stuck queue.  If this alarmed, it
+  # would alarm every night for as long as an owner stayed opted out,
+  # and a nightly false alarm is the habit that let the original defect
+  # run for five weeks.
+  test 'send_loss_notifications does not alarm about a deferred owner' do
+    project = projects(:one)
+    project.user.update_column(:important_notifications, false)
+    project.update_column(:unreported_badge_loss, 1)
+    log = captured_log { Project.send_loss_notifications }
+    assert_equal 1, Project.find(project.id).unreported_badge_loss
+    assert_no_match(/did not drain/, log)
+  end
+
+  test 'send_loss_notifications does not alarm about a pending retry' do
+    log =
+      captured_log do
+        failing_loss_run(Net::SMTPServerBusy.new('busy'))
+      end
+    assert_no_match(/did not drain/, log)
+  end
+
+  # Reaching the cap leaves work behind legitimately, and we have not
+  # looked at the rest, so there is nothing to conclude and nothing to
+  # report.
+  test 'send_notifications does not alarm when it stops at the cap' do
+    project = projects(:one)
+    project.update_column(:unreported_badge_warning, 1)
+    project.update_column(:unreported_baseline_badge_warning, 1)
+    log =
+      captured_log do
+        Project.send(
+          :send_notifications, Project.where(id: project.id), 1,
+          Project::NOTIFICATION_SERIES[:warning]
+        ) { |_project, _user, _level, _suffix| :sent }
+      end
+    assert_equal 1, Project.find(project.id).unreported_baseline_badge_warning
+    assert_no_match(/did not drain/, log)
+  end
+
   # --- send_warning_notifications tests ---
 
   test 'send_warning_notifications sends email and clears column' do

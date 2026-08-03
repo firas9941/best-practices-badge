@@ -50,10 +50,26 @@ had to be used.
 
 ### What is done and what is next
 
-Sets 1 and 2 are implemented, reviewed, and green in CI. Set 3 is not
-started; the separable items are not started. See [The plan](#the-plan),
-where set 3 is now broken into seven steps that can be reviewed and
-tested one at a time.
+Sets 1, 2, and 3 are implemented. Sets 1 and 2 are green in CI; set 3
+was written as the seven steps under [The plan](#the-plan), each with
+its own tests, and passes the full non-system suite locally. The
+separable items are not started.
+
+What remains before this can merge:
+
+1. Push and let CI see set 3. Brakeman in particular has not yet seen
+   any of it.
+2. Decide the separable items in or out. None of them block.
+3. The operational sequence under [Operational](#operational): deploy,
+   restore both caps to 20, then confirm on the following run that the
+   8 pending loss emails went out exactly once each and their flags
+   cleared.
+
+Note for whoever runs the suite next: editing `config/locales/en.yml`
+in step 3c makes the precompiled assets stale, so four tests in
+`test/controllers/badge_static_controller_test.rb` fail with "Stale
+precompiled assets detected" until `rake assets:precompile` is run.
+`public/assets` is gitignored, so this is a local step, not a commit.
 
 ### Deployment: everything lands together
 
@@ -1607,26 +1623,43 @@ receives.
    but abandonment forced the same question, and the answer has to be
    the same in every case.
 
-   **An accepted consequence, worth knowing before it happens.** The
-   cap counts mail sent, not attempts made, so a run continues through
-   the whole pending set even when every delivery is failing. During a
-   sustained outage each pending notification therefore burns one
-   attempt per night on the same cause, and after
-   `BADGEAPP_MAX_NOTIFICATION_ATTEMPTS` nights they are all abandoned
-   together. That is the bound working as designed, and every
-   abandonment is logged and reported rather than silent, but the
-   failure mode is "our mail was down for five days, so everyone's
-   pending notification was dropped at once". If that is not
-   acceptable, the fix is to distinguish a per-project failure from a
-   systemic one, for instance by not counting an attempt when every
-   delivery in the run has failed. Left undone deliberately: the
-   pending set is 8, and the machinery to tell those apart is worth
-   more than the risk today.
-7. **Step 3f: the invariant check (4A).** Purely additive; it touches
-   no mail path. Excludes projects that are suppressed or have a
-   non-zero attempt count, so normal operation raises no nightly false
-   alarm. Defer 4B; with the attempt counters in place, 4A plus the
-   abandonment report covers the same ground.
+   **The cap counts mail sent, not attempts made.** Decided 2026-08-03,
+   after the alternative was raised and rejected: what matters is
+   whether a message got through, not how many times we tried. So a run
+   continues through the whole pending set even when every delivery is
+   failing. The consequence to know about is that during a sustained
+   outage each pending notification burns one attempt per night on the
+   same cause, and after `BADGEAPP_MAX_NOTIFICATION_ATTEMPTS` nights
+   they are abandoned together: "our mail was down for five days, so
+   every pending notification was dropped at once". That is the bound
+   working as designed and every abandonment is logged and reported, so
+   it is loud rather than silent. If it ever needs softening, the way
+   is to tell a per-project failure from a systemic one, for instance
+   by not counting an attempt when every delivery in a run has failed.
+7. **Step 3f: the invariant check (4A). Done 2026-08-03.** Purely
+   additive; it touches no mail path. Excludes notifications we
+   deliberately left pending, so normal operation raises no nightly
+   false alarm. Defer 4B; with the attempt counters in place, 4A plus
+   the abandonment report covers the same ground.
+
+   It ended up stronger than the sketch. Rather than reasoning about
+   which projects *ought* to be excluded by joining `users` and reading
+   attempt counters, `report_stuck_queue` re-counts the pending set in
+   the database and compares it with the number the run knowingly
+   deferred. `record_outcome` answers whether each notification is
+   still pending, so the expected figure is a fact the run observed
+   rather than a rule that has to be kept in step with every future
+   reason for deferring. The concern about exclusions drifting out of
+   date, recorded under option 4A, largely goes away.
+
+   The point of counting from the database is that it takes no layer at
+   its word. The original defect reported eleven emails sent and eleven
+   flags cleared and left eleven flags set; every layer said it had
+   worked. A test reproduces exactly that, by making the write a no-op
+   that still claims one row, and the check catches it.
+
+   It stays quiet when the run stopped at its cap, because the rest of
+   the queue was never examined and there is nothing to conclude.
 
 Each step carries its own tests. Between them they cover the branches
 listed under [concern 7](#a-note-on-test-coverage): suppressed, not

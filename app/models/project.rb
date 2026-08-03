@@ -1337,21 +1337,25 @@ class Project < ApplicationRecord
   # @param series [Hash] one entry of NOTIFICATION_SERIES
   # @param outcome [Symbol] one of NOTIFICATION_OUTCOMES
   # @param now [Time] time to record as the delivery time
-  # @return [void]
+  # @return [Boolean] true if this notification is still pending, which
+  #   report_stuck_queue needs so that a deliberate deferral is not
+  #   mistaken for a queue that has stopped draining
   def self.record_outcome(project, kind, series, outcome, now)
     case outcome
-    when :sent
-      write_notification_columns(
-        project, kind[:flag] => 0, series[:sent_at] => now
-      )
-    when :not_relevant
-      write_notification_columns(project, kind[:flag] => 0)
+    when :sent, :not_relevant
+      columns = { kind[:flag] => 0 }
+      columns[series[:sent_at]] = now if outcome == :sent
+      write_notification_columns(project, columns)
+      false
     when :transient_failure, :permanent_failure
       handle_send_failure(project, kind, series, outcome)
+    else
+      # :suppressed writes nothing at all, deliberately.  Clearing here
+      # would mean an owner who re-enables notifications gets nothing,
+      # since no new flag is raised unless the badge changes level
+      # again.  It stays pending, on purpose.
+      true
     end
-    # :suppressed writes nothing at all, deliberately.  Clearing here
-    # would mean an owner who re-enables notifications gets nothing,
-    # since no new flag is raised unless the badge changes level again.
   end
   private_class_method :record_outcome
 
@@ -1362,17 +1366,23 @@ class Project < ApplicationRecord
   # @param kind [Hash] one entry of a series' :kinds
   # @param series [Hash] one entry of NOTIFICATION_SERIES
   # @param outcome [Symbol] :transient_failure or :permanent_failure
-  # @return [void]
+  # @return [Boolean] true if the notification is still pending
+  # Writes to the database, so it is a command that answers a question,
+  # not a predicate; a trailing "?" would suggest it has no effect.
+  # rubocop:disable Naming/PredicateMethod
   def self.handle_send_failure(project, kind, series, outcome)
     attempts = project[series[:attempts]] + 1
     if outcome == :transient_failure &&
        attempts < MAX_NOTIFICATION_ATTEMPTS
       # Leave the flag set so that a later run tries again.
       write_notification_columns(project, series[:attempts] => attempts)
+      true
     else
       abandon_notification(project, kind, series, outcome, attempts)
+      false
     end
   end
+  # rubocop:enable Naming/PredicateMethod
   private_class_method :handle_send_failure
 
   # Give up on a notification.  Clear the flag so it stops being
@@ -1399,6 +1409,42 @@ class Project < ApplicationRecord
   end
   private_class_method :abandon_notification
 
+  # Check, after a run that examined everything, that the queue actually
+  # drained.
+  #
+  # This re-reads the database rather than trusting what the writes above
+  # reported, which is the whole point of it.  The defect this repair
+  # exists for reported eleven emails sent and eleven flags cleared, and
+  # left eleven flags set; every layer said it had worked.  An
+  # end-to-end count is the one check that does not take their word for
+  # it.
+  #
+  # +expected+ is the number of projects we deliberately left pending:
+  # owners we cannot mail, and notifications waiting on a retry. Without
+  # that subtraction this would cry wolf every night, and a nightly
+  # false alarm is exactly the habit that let the original defect run
+  # for five weeks.
+  #
+  # @param pending [ActiveRecord::Relation] the pending-notification scope
+  # @param expected [Integer] projects deliberately left pending
+  # @return [void]
+  def self.report_stuck_queue(pending, expected)
+    # reselect: the caller's tight column list would become a syntax
+    # error inside COUNT().
+    remaining = pending.reselect('projects.id').count
+    return if remaining <= expected
+
+    message =
+      "Notification queue did not drain: #{remaining} projects still " \
+      'pending after a run that finished under its cap, of which ' \
+      "#{expected} were deliberately deferred. Flags may not be " \
+      'clearing; see docs/warning_failures.md.'
+    Rails.logger.error(message)
+    # No-op unless Sentry is configured (SENTRY_DSN set).
+    Sentry.capture_message(message)
+  end
+  private_class_method :report_stuck_queue
+
   # Send one series of notification emails in a rate-limited batch.
   # Only mail actually sent counts toward +cap+; notifications drained
   # without sending do not.  Stops as soon as the cap is hit.  What each
@@ -1424,8 +1470,13 @@ class Project < ApplicationRecord
   # rubocop:disable Metrics/MethodLength, Metrics/AbcSize
   def self.send_notifications(pending, cap, series, &block)
     emails_sent = 0
+    deferred = 0
+    reached_cap = false
     pending.each do |project|
-      break if emails_sent >= cap
+      if emails_sent >= cap
+        reached_cap = true
+        break
+      end
 
       # Tight SELECT: only the fields needed for sending or skipping.
       # Bounded by the cap, so N+1 cost is minimal.
@@ -1435,8 +1486,12 @@ class Project < ApplicationRecord
       can_email = user.important_notifications? && user.deliverable_email?
       now = Time.now.utc
 
+      still_pending = false
       series[:kinds].each do |kind|
-        break if emails_sent >= cap
+        if emails_sent >= cap
+          reached_cap = true
+          break
+        end
 
         rank = project[kind[:flag]]
         next if rank <= 0
@@ -1448,9 +1503,13 @@ class Project < ApplicationRecord
             :suppressed
           end
         emails_sent += 1 if outcome == :sent
-        record_outcome(project, kind, series, outcome, now)
+        still_pending ||= record_outcome(project, kind, series, outcome, now)
       end
+      deferred += 1 if still_pending
     end
+    # Stopping at the cap leaves work behind legitimately, and we have
+    # not looked at the rest, so there is nothing to conclude.
+    report_stuck_queue(pending, deferred) unless reached_cap
     emails_sent
   end
   # rubocop:enable Metrics/MethodLength, Metrics/AbcSize
