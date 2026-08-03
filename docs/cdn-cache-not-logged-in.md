@@ -1337,6 +1337,76 @@ instantly.
 > down so the decision can be made deliberately later; it is **not** required
 > for the project-show caching to be correct as shipped.
 
+**Read [11.0](#110-two-objections-raised-2026-08-03) before implementing
+this.** Two objections were raised against the design below after it was
+written, and one of them undercuts its main claim.
+
+### 11.0 Two objections raised 2026-08-03
+
+Recorded here rather than woven into the sections below, so that the
+original proposal stays readable as it was argued.
+
+#### The callback would miss most of what it is meant to catch
+
+This is the serious one. Section 11.1 justifies the callback as
+protection against a **future non-controller write path** that changes a
+displayed field without purging. But the non-controller writes that exist
+today deliberately use methods that skip callbacks, so an `after_commit`
+would never fire for them:
+
+| Write path | Method | Callbacks? |
+| ---------- | ------ | ---------- |
+| `Project.write_notification_columns` | parameterized SQL | no |
+| `Project.save_warning_columns` | `update_columns` | no |
+| `ProjectsController#set_level_saved_flag` | `update_column` | no |
+
+None of these is accidental. The SQL one is chosen in
+`docs/warning_failures.md` option 1D precisely to escape implicit ORM
+behavior, and `set_level_saved_flag` carries the comment "Use
+update_column to avoid triggering callbacks during automation". A future
+author writing bookkeeping code has every reason to reach for the same
+tools.
+
+So the callback would fire mainly for paths that already purge
+explicitly, which is duplication, while missing the class of write it was
+proposed to protect against. That is worse than a known gap: it looks
+like coverage and is not. Any version of this proposal has to say what it
+does about callback-skipping writes, and the honest answer may be that
+they still need explicit purges, which is most of what the callback was
+supposed to remove.
+
+#### A naive callback purges on changes nobody can see
+
+`after_commit` on any update purges whenever *any* column changes,
+including ones absent from every cached representation.
+
+Today that objection is nearly moot, but for an unstable reason:
+`app/views/projects/_project.json.jbuilder` emits **every** attribute
+with no exclusion list, and `show_json` is CDN-cached, so almost no field
+is genuinely hidden. Give that view a sensible field list, which is
+independently worth doing, and the objection becomes live.
+
+The fix makes both problems one problem. Gate the purge on
+`saved_changes.keys` intersected with the set of fields that appear in a
+cached representation, and define that set once:
+
+* it is the JSON view's field list, and
+* it is the purge trigger set.
+
+Deciding it once is better than the status quo in a way the naive
+callback is not.
+
+#### What changed underneath the proposal since it was written
+
+* The bulk recalculation now purges each project it changed, rather than
+  issuing one `FastlyRails.purge_all`. Section 11.2.1's "severe
+  regression" argument was rewritten accordingly; the remaining reason
+  for its `skip_callbacks` guard is duplication.
+* `ProjectsController.send_reminders` used to write `last_reminder_at`
+  and save without purging, leaving a stale cached `show_json` for up to
+  ten days. That was the one real gap a naive callback would have
+  closed, and it has since been fixed directly.
+
 ### 11.1 Motivation
 
 Purging is currently wired into specific code paths rather than the data model:
