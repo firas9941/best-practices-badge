@@ -997,7 +997,7 @@ that exact key.
   controller `update`/`destroy` actions
   ([`projects_controller.rb:694,765-770,814`](../app/controllers/projects_controller.rb))
   and the bulk recalculation (`Project.update_all_badge_percentages`, which
-  ends with `FastlyRails.purge_all`) — **not** into a model callback. Any
+  purges each project it changed) — **not** into a model callback. Any
   *other* path that changes a displayed project field via `save` /
   `update_column` without purging would leave the cached show page stale until
   `Surrogate-Control`'s `max-age` expires (10 days). No such path is known
@@ -1331,7 +1331,8 @@ Purging is currently wired into specific code paths rather than the data model:
 * Controller `update`/`destroy` call `@project.purge_cdn_project` and schedule
   a delayed `PurgeCdnProjectJob`
   ([`projects_controller.rb:694,765-770,814`](../app/controllers/projects_controller.rb)).
-* The bulk recalculation issues one `FastlyRails.purge_all`
+* The bulk recalculation purges each project it actually changed, through
+  `PurgeCdnProjectJob`
   ([`project.rb`](../app/models/project.rb), `update_all_badge_percentages`).
 
 Both known write paths are covered, so the shipped feature is correct. The
@@ -1354,7 +1355,7 @@ reusing the existing `record_key` and `PurgeCdnProjectJob`:
 # Purge this project's cached CDN resources (badge, JSON, and the anonymous
 # show HTML -- all tagged with record_key) whenever the project changes by
 # ANY path, not just controller edits. Skipped during bulk recalculation,
-# which issues a single purge_all itself (update_all_badge_percentages).
+# which purges the projects it changes itself (update_all_badge_percentages).
 after_commit :enqueue_cdn_purge, on: %i[update destroy], unless: :skip_callbacks
 
 private
@@ -1372,13 +1373,19 @@ end
 The implementation details that make this correct (a naive callback is *worse*
 than today without them):
 
-1. **Gate on `skip_callbacks` — the critical pitfall.**
+1. **Gate on `skip_callbacks`.**
    `update_all_badge_percentages` sets the `cattr_accessor :skip_callbacks`
-   true, saves 10,000+ projects, and then issues **one** `FastlyRails.purge_all`.
-   Without `unless: :skip_callbacks`, the callback would fire on every one of
-   those commits and enqueue 20,000+ individual purge jobs in place of that
-   single purge_all — a severe regression. The flag is still true during each
-   in-loop commit, so the guard suppresses it correctly.
+   true, saves 10,000+ projects, and purges each one it actually changed.
+   Without `unless: :skip_callbacks`, the callback would fire on those same
+   commits and purge each changed project a second time. The flag is still
+   true during each in-loop commit, so the guard suppresses it correctly.
+
+   This item used to warn that the callback would replace a single
+   `purge_all` with 20,000+ individual jobs, calling that a severe
+   regression. That is no longer the comparison: the recalculation now
+   does the per-project purging itself, deliberately, and only for rows
+   it changed. The remaining reason for the guard is duplication, which
+   is wasteful rather than dangerous.
 2. **Use `after_commit`, not `after_save`.** Purge only after the data is
    durably committed; purging inside the transaction lets a concurrent anonymous
    read re-populate the cache with pre-commit (or about-to-roll-back) content.
@@ -1444,9 +1451,11 @@ should be acknowledged rather than silently assumed handled.
 * Assert a plain change enqueues the purge:
   `assert_enqueued_with(job: PurgeCdnProjectJob, args: [project.record_key])`
   after `project.update!(name: 'x')`.
-* Assert the **bulk path does not** enqueue per-project purges (guarding the
-  `skip_callbacks` pitfall in 11.2.1): run `update_all_badge_percentages` and
-  assert zero `PurgeCdnProjectJob` enqueues from the loop (the single
-  `purge_all` is a separate call).
+* Assert the **bulk path does not** enqueue a *second* purge per project
+  (guarding the `skip_callbacks` pitfall in 11.2.1). The bulk path already
+  enqueues `PurgeCdnProjectJob` twice for each project it changed, now and
+  again after a delay, so the assertion is about that count not growing,
+  not about it being zero. `test/integration/recalc_test.rb` covers the
+  bulk path's own purging.
 * Keep the Section 9.3 `Surrogate-Key` test, which ties the cached page to the
   key the callback purges.

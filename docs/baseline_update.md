@@ -547,10 +547,13 @@ criteria from display, and close out the version notice.
    releases, which keeps memory bounded. (This is exactly why the earlier
    `RecalcBaselineBadgePercentages` migration was retired to a no-op.)
 
-   `update_all_badge_percentages` calls `FastlyRails.purge_all` on
-   completion, so the CDN badge cache is purged automatically; no
-   manual cache invalidation is needed. The next request for any
-   project's `/baseline` badge will fetch the freshly computed value.
+   `update_all_badge_percentages` purges each project it actually
+   changed from the CDN, through `PurgeCdnProjectJob`, so cache
+   invalidation is automatic and no manual step is needed. The next
+   request for an affected project's `/baseline` badge fetches the
+   freshly computed value. Projects the recalculation did not change
+   keep their cached badges, which is the point: this used to purge the
+   whole cache every time.
 
    **Badge-loss notifications are sent automatically.** For each project
    whose badge level dropped, `update_all_badge_percentages` records the

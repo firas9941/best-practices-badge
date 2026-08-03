@@ -681,7 +681,6 @@ class ProjectsController < ApplicationController
     respond_to do |format|
       if @project.save
         @project.send_new_project_email
-        # @project.purge_all
         flash[:success] = t('projects.new.thanks_adding')
         starting_section = validated_starting_section
         format.html { redirect_to edit_project_section_path(@project, starting_section) }
@@ -824,8 +823,6 @@ class ProjectsController < ApplicationController
       # is never used in DB queries
       @project, current_user, params[:deletion_rationale]
     ).deliver_now
-    # @project.purge
-    # @project.purge_all
     respond_to do |format|
       @project.homepage_url ||= project_find_default_url
       format.html do
