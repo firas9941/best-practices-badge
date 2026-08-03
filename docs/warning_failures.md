@@ -1284,6 +1284,14 @@ establishes that pattern, with a good explanatory comment, in
 comment at the same time, and consider narrowing the `rescue` so a
 `NameError` is not reported as a network problem.
 
+**Done 2026-08-03**, on branch `fix_fastly_check_and_worker`, all three
+parts. The diagnosis was confirmed rather than assumed: a probe
+initializer showed `FastlyRails` raising `NameError` in the initializer
+body and resolving in `after_initialize`. The `rescue` now lists the
+network exception classes, and anything else is reported as a bug in the
+check rather than as a Fastly outage. Both remain non-fatal; failing to
+verify the CDN is no reason to refuse to start.
+
 ### The `worker` dyno runs a stub and crash-loops
 
 `heroku ps` shows a `worker` dyno of size Standard-2X running
@@ -1299,6 +1307,20 @@ whether the stub task is still needed at all. This is costing a
 Standard-2X dyno to do nothing and producing a permanently red process
 in `heroku ps`, which trains us to ignore that display. That habit is
 part of why this investigation started later than it should have.
+
+**Done 2026-08-03**, on branch `fix_fastly_check_and_worker`. Both tiers
+were running it, production at Standard-2X and staging at Basic, and
+both were confirmed to have `SOLID_QUEUE_IN_PUMA=true`, so nothing was
+relying on the worker. Scaling it to zero could not affect job
+processing: the task it ran has an empty body, so it never worked a job
+in the first place.
+
+The stub task is gone, and the Procfile now explains why there is no
+`worker` line, since the trap is that Heroku's Ruby buildpack supplies
+`bundle exec rake jobs:work` as its default for a `worker` process type
+we never declared. Deleting the stub without saying that would invite
+someone to add it back the next time a stray worker filled the log with
+"Don't know how to build task".
 
 ### The recalculation purges the whole CDN cache
 
@@ -1807,7 +1829,10 @@ them.
 ### Separable, any time
 
 1. **Fix the Fastly initializer ordering** and its misleading comment.
-2. **Retire the stub `worker` dyno.**
+   Done 2026-08-03; see
+   [the finding](#the-fastly-credential-check-has-never-run).
+2. **Retire the stub `worker` dyno.** Done 2026-08-03; see
+   [the finding](#the-worker-dyno-runs-a-stub-and-crash-loops).
 3. **Audit for other writes that optimistic locking can disturb.**
    `projects` is the only table with a `lock_version` column today, and
    the survey in
