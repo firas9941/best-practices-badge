@@ -933,23 +933,61 @@ class Project < ApplicationRecord
   MAX_BADGE_WARNING_NOTIFICATIONS =
     (ENV['BADGEAPP_MAX_BADGE_WARNING_NOTIFICATIONS'] || 10).to_i
 
+  # How many times to try delivering one notification before giving up.
+  # At a nightly cadence this is five days to ride out an outage.  The
+  # bound is what stops "retry tomorrow" becoming "retry forever": a
+  # permanently rejected address would otherwise fail every night
+  # indefinitely, which is this incident again with a different cause.
+  MAX_NOTIFICATION_ATTEMPTS =
+    (ENV['BADGEAPP_MAX_NOTIFICATION_ATTEMPTS'] || 5).to_i
+
+  # How we tell "try again later" from "this will never work".  The
+  # split lives here as an explicit list rather than in a reviewer's
+  # head, because it decides whether an owner eventually hears from us.
+  #
+  # These constants come from net/smtp, which the mail gem loads at
+  # boot.  If that ever stopped being true this file would fail to load
+  # outright, which is a loud failure and the right kind.
+  TRANSIENT_SEND_ERRORS = [
+    Net::SMTPServerBusy, # 4xx, the server is asking us to wait
+    Net::OpenTimeout, Net::ReadTimeout,
+    Errno::ECONNRESET, Errno::ECONNREFUSED,
+    IOError
+  ].freeze
+
+  # 5xx and friends.  These do not improve overnight, so retrying only
+  # delays the report and wastes the attempt budget.
+  PERMANENT_SEND_ERRORS = [
+    Net::SMTPFatalError, Net::SMTPSyntaxError,
+    Net::SMTPAuthenticationError
+  ].freeze
+
   # Columns selected for the loss-notification project query.  Tight list so
   # we avoid pulling criteria status/justification data into memory.
   # tiered_percentage and badge_percentage_baseline_* are small integers
   # needed to compute the current badge level for the "now at X" email line.
+  #
+  # CAREFUL.  Trimming these two lists for memory is exactly how this
+  # code broke: omitting lock_version made every clear silently match no
+  # row.  Anything the notification path reads or writes must be listed,
+  # including the *_send_attempts counters, and anything a mail template
+  # comes to use, since deliver_now renders from the record as loaded.
+  # Omissions raise ActiveModel::MissingAttributeError rather than
+  # failing quietly, so add columns here before using them.
   LOSS_NOTIFY_PROJECT_FIELDS =
     'id, user_id, updated_at, unreported_badge_loss, ' \
-    'unreported_baseline_badge_loss, tiered_percentage, ' \
-    'badge_percentage_baseline_1, badge_percentage_baseline_2, ' \
-    'badge_percentage_baseline_3'
+    'unreported_baseline_badge_loss, loss_send_attempts, ' \
+    'tiered_percentage, badge_percentage_baseline_1, ' \
+    'badge_percentage_baseline_2, badge_percentage_baseline_3'
 
   # Columns selected for the warning-notification project query.
   # Includes badge_warning_effective_date so the email can state the deadline.
   WARN_NOTIFY_PROJECT_FIELDS =
     'id, user_id, updated_at, unreported_badge_warning, ' \
-    'unreported_baseline_badge_warning, badge_warning_effective_date, ' \
-    'tiered_percentage, badge_percentage_baseline_1, ' \
-    'badge_percentage_baseline_2, badge_percentage_baseline_3'
+    'unreported_baseline_badge_warning, warning_send_attempts, ' \
+    'badge_warning_effective_date, tiered_percentage, ' \
+    'badge_percentage_baseline_1, badge_percentage_baseline_2, ' \
+    'badge_percentage_baseline_3'
 
   # Columns selected when loading a user for loss/warning notification sending.
   # Tight list; the loop loads at most MAX_BADGE_*_NOTIFICATIONS users.
@@ -1070,7 +1108,9 @@ class Project < ApplicationRecord
   end
   private_class_method :projects_with_pending_loss_notifications
 
-  # Clear a pending-notification flag and record when we did it.
+  # Write the notification bookkeeping columns for one project: clearing
+  # a pending flag, stamping a delivery, counting a failed attempt, or
+  # any combination the caller names.
   #
   # This issues plain parameterized SQL rather than going through the ORM,
   # deliberately.  Both ORM paths carry hidden behavior that has already
@@ -1095,14 +1135,14 @@ class Project < ApplicationRecord
   # so they are first checked against the real schema; callers pass literal
   # symbols, never user input.
   #
-  # @param project [Project] project whose flag should be cleared
+  # @param project [Project] project whose bookkeeping should be written
   # @param columns [Hash] columns and values to write
   # @return [Boolean] true if exactly one row was updated
   # @raise [ArgumentError] if asked to write something that is not a column
   # This is a command that reports whether it succeeded, not a predicate;
   # a trailing "?" would wrongly suggest it has no side effects.
   # rubocop:disable Naming/PredicateMethod
-  def self.clear_notification_flag(project, columns)
+  def self.write_notification_columns(project, columns)
     rows_updated = update_one_project(project.id, columns)
     return true if rows_updated == 1
 
@@ -1110,10 +1150,10 @@ class Project < ApplicationRecord
     false
   end
   # rubocop:enable Naming/PredicateMethod
-  private_class_method :clear_notification_flag
+  private_class_method :write_notification_columns
 
   # Set the given columns on exactly one project, by parameterized SQL.
-  # See clear_notification_flag for why this does not use the ORM.
+  # See write_notification_columns for why this does not use the ORM.
   # @param id [Integer] project id
   # @param columns [Hash] columns and values to write
   # @return [Integer] number of rows updated
@@ -1162,6 +1202,7 @@ class Project < ApplicationRecord
   NOTIFICATION_SERIES = {
     loss: {
       sent_at: :last_loss_sent_at,
+      attempts: :loss_send_attempts,
       kinds: [
         {
           flag: :unreported_badge_loss,
@@ -1175,6 +1216,7 @@ class Project < ApplicationRecord
     },
     warning: {
       sent_at: :last_warning_sent_at,
+      attempts: :warning_send_attempts,
       kinds: [
         {
           flag: :unreported_badge_warning,
@@ -1191,19 +1233,23 @@ class Project < ApplicationRecord
   # What one notification attempt did.  This is the vocabulary the block
   # given to send_notifications answers in.
   #
-  #   :sent          mail was handed to the mailer
-  #   :not_relevant  the notification no longer means anything, so there
-  #                  is nothing to send and nothing to keep
-  #   :suppressed    we chose not to send: the owner has opted out of
-  #                  important notifications, or has no usable address
+  #   :sent               mail was delivered
+  #   :not_relevant       the notification no longer means anything, so
+  #                       there is nothing to send and nothing to keep
+  #   :suppressed         we chose not to send: the owner has opted out
+  #                       of important notifications, or has no usable
+  #                       address
+  #   :transient_failure  delivery failed in a way that may work later
+  #   :permanent_failure  delivery failed in a way that will not
   #
-  # These three are distinguished now, before anything depends on the
-  # difference, because the outcomes call for different handling and the
-  # old Boolean could not express it: :not_relevant and :suppressed were
-  # both "false", and treating them alike is what discards a suppressed
-  # owner's notification permanently.  Later steps add the two failure
-  # outcomes and act on the distinction.  See docs/warning_failures.md.
-  NOTIFICATION_OUTCOMES = %i[sent not_relevant suppressed].freeze
+  # The old Boolean could express none of this: everything but "sent"
+  # was "false", and treating those cases alike is what discarded a
+  # suppressed owner's notification permanently.  Each now gets the
+  # handling it deserves in record_outcome.  See
+  # docs/warning_failures.md.
+  NOTIFICATION_OUTCOMES = %i[
+    sent not_relevant suppressed transient_failure permanent_failure
+  ].freeze
 
   # Confirm that a notification block answered in the agreed vocabulary.
   # A block still returning the old +true+ would otherwise be read as
@@ -1219,11 +1265,144 @@ class Project < ApplicationRecord
   end
   private_class_method :checked_outcome
 
+  # Try to deliver one notification, turning a delivery failure into an
+  # outcome instead of letting it end the run.  Only the send itself is
+  # rescued: checked_outcome runs outside, so a block answering outside
+  # the vocabulary still fails loudly rather than being mistaken for a
+  # transient network problem.
+  #
+  # @param project [Project] project to notify about
+  # @param user [User] the project owner, already loaded
+  # @param kind [Hash] one entry of a series' :kinds
+  # @param rank [Integer] rank of the level this notification concerns
+  # @return [Symbol] one of NOTIFICATION_OUTCOMES
+  def self.attempt_notification(project, user, kind, rank)
+    result =
+      begin
+        yield(project, user, kind[:levels][rank], kind[:suffix])
+      rescue StandardError => e
+        classify_send_error(e, project, kind)
+      end
+    checked_outcome(result)
+  end
+  private_class_method :attempt_notification
+
+  # Decide whether a delivery failure is worth trying again.
+  # @param error [StandardError] what the delivery raised
+  # @param project [Project] project we were notifying about
+  # @param kind [Hash] one entry of a series' :kinds
+  # @return [Symbol] :transient_failure or :permanent_failure
+  def self.classify_send_error(error, project, kind)
+    Rails.logger.error(
+      "Notification #{kind[:flag]} for project #{project.id} failed: " \
+      "#{error.class}: #{error.message}"
+    )
+    return :permanent_failure if error_matches?(PERMANENT_SEND_ERRORS, error)
+    return :transient_failure if error_matches?(TRANSIENT_SEND_ERRORS, error)
+
+    # We could not classify it, which is a gap in those two lists and
+    # deserves attention now rather than in five nights' time.  Treat it
+    # as transient anyway: the attempt bound caps the cost of guessing
+    # wrong in that direction, while guessing "permanent" would drop the
+    # notification silently, with no bound and no signal.
+    Sentry.capture_exception(error)
+    :transient_failure
+  end
+  private_class_method :classify_send_error
+
+  # @param classes [Array<Class>] exception classes to test against
+  # @param error [StandardError] the error to classify
+  # @return [Boolean] true if +error+ is one of +classes+
+  def self.error_matches?(classes, error)
+    classes.any? { |klass| error.is_a?(klass) }
+  end
+  private_class_method :error_matches?
+
+  # Record what one notification attempt did.
+  #
+  #   :sent               clear the flag and stamp the delivery time
+  #   :not_relevant       clear the flag; nothing was delivered, so
+  #                       nothing is stamped
+  #   :suppressed         leave it pending, for a run when we can send
+  #   :transient_failure  count the attempt; give up once they run out
+  #   :permanent_failure  give up now, it will not improve tomorrow
+  #
+  # Only :sent writes the sent-at column.  Those columns are the record
+  # of delivery now that mail goes out synchronously, so stamping them
+  # when nothing was delivered would recreate the misleading state that
+  # made this incident so hard to diagnose.
+  #
+  # @param project [Project] project we were notifying about
+  # @param kind [Hash] one entry of a series' :kinds
+  # @param series [Hash] one entry of NOTIFICATION_SERIES
+  # @param outcome [Symbol] one of NOTIFICATION_OUTCOMES
+  # @param now [Time] time to record as the delivery time
+  # @return [void]
+  def self.record_outcome(project, kind, series, outcome, now)
+    case outcome
+    when :sent
+      write_notification_columns(
+        project, kind[:flag] => 0, series[:sent_at] => now
+      )
+    when :not_relevant
+      write_notification_columns(project, kind[:flag] => 0)
+    when :transient_failure, :permanent_failure
+      handle_send_failure(project, kind, series, outcome)
+    end
+    # :suppressed writes nothing at all, deliberately.  Clearing here
+    # would mean an owner who re-enables notifications gets nothing,
+    # since no new flag is raised unless the badge changes level again.
+  end
+  private_class_method :record_outcome
+
+  # A delivery failed.  Count the attempt, and stop trying once the
+  # count runs out, so that "retry tomorrow" cannot quietly become
+  # "retry forever" and recreate this incident with a different cause.
+  # @param project [Project] project we were notifying about
+  # @param kind [Hash] one entry of a series' :kinds
+  # @param series [Hash] one entry of NOTIFICATION_SERIES
+  # @param outcome [Symbol] :transient_failure or :permanent_failure
+  # @return [void]
+  def self.handle_send_failure(project, kind, series, outcome)
+    attempts = project[series[:attempts]] + 1
+    if outcome == :transient_failure &&
+       attempts < MAX_NOTIFICATION_ATTEMPTS
+      # Leave the flag set so that a later run tries again.
+      write_notification_columns(project, series[:attempts] => attempts)
+    else
+      abandon_notification(project, kind, series, outcome, attempts)
+    end
+  end
+  private_class_method :handle_send_failure
+
+  # Give up on a notification.  Clear the flag so it stops being
+  # retried, keep the attempt count as the record of why it stopped, and
+  # say so loudly: the owner will not hear this message, which is the
+  # price of not mailing the same person forever, and that price must
+  # not be paid in silence.
+  # @param project [Project] project we were notifying about
+  # @param kind [Hash] one entry of a series' :kinds
+  # @param series [Hash] one entry of NOTIFICATION_SERIES
+  # @param outcome [Symbol] why we are giving up
+  # @param attempts [Integer] attempts made, recorded as the reason
+  # @return [void]
+  def self.abandon_notification(project, kind, series, outcome, attempts)
+    message =
+      "Abandoning #{kind[:flag]} notification for project " \
+      "#{project.id} after #{attempts} attempt(s): #{outcome}."
+    Rails.logger.error(message)
+    # No-op unless Sentry is configured (SENTRY_DSN set).
+    Sentry.capture_message(message)
+    write_notification_columns(
+      project, kind[:flag] => 0, series[:attempts] => attempts
+    )
+  end
+  private_class_method :abandon_notification
+
   # Send one series of notification emails in a rate-limited batch.
   # Only mail actually sent counts toward +cap+; notifications drained
-  # without sending do not.  Stops as soon as the cap is hit.  A sent or
-  # no-longer-relevant notification is cleared; a suppressed one keeps
-  # its flag for a later run.  See docs/warning_failures.md.
+  # without sending do not.  Stops as soon as the cap is hit.  What each
+  # outcome does to the pending flag is in record_outcome.
   #
   # Mail is delivered synchronously (deliver_now), as
   # ProjectsController.send_reminders already does at a larger volume, so
@@ -1232,13 +1411,6 @@ class Project < ApplicationRecord
   # last_loss_sent_at and last_warning_sent_at could not honestly claim to
   # record deliveries.  The cost is that SMTP latency now sits in the
   # nightly task, bounded by +cap+.
-  #
-  # There is no rescue here yet, so a delivery that raises ends the run.
-  # That is deliberately safe in the meantime: the flag is cleared only
-  # after the send returns, so an interrupted run leaves the remaining
-  # flags set and the next night picks them up.  No notification is lost
-  # and none is duplicated.  Step 3e-2 replaces the abort with
-  # classification and a bounded retry.
   #
   # @param pending [ActiveRecord::Relation] projects with a pending flag
   # @param cap [Integer] most emails to send in this run
@@ -1250,7 +1422,7 @@ class Project < ApplicationRecord
   # @yieldreturn [Symbol] one of NOTIFICATION_OUTCOMES
   # @return [Integer] number of emails sent
   # rubocop:disable Metrics/MethodLength, Metrics/AbcSize
-  def self.send_notifications(pending, cap, series)
+  def self.send_notifications(pending, cap, series, &block)
     emails_sent = 0
     pending.each do |project|
       break if emails_sent >= cap
@@ -1271,26 +1443,12 @@ class Project < ApplicationRecord
 
         outcome =
           if can_email
-            checked_outcome(
-              yield(project, user, kind[:levels][rank], kind[:suffix])
-            )
+            attempt_notification(project, user, kind, rank, &block)
           else
             :suppressed
           end
         emails_sent += 1 if outcome == :sent
-        # A suppressed notification is deferred, not discarded: the flag
-        # stays set so that an owner who re-enables notifications, or
-        # whose address is repaired, still gets what they are owed.
-        # Clearing it here would mean that opting back in delivers
-        # nothing, since no new flag is raised unless the badge changes
-        # level again.  The cost is pending rows that may never drain,
-        # which the relevance guards bound and which the end-of-run
-        # check must not mistake for a stuck queue.
-        next if outcome == :suppressed
-
-        clear_notification_flag(
-          project, kind[:flag] => 0, series[:sent_at] => now
-        )
+        record_outcome(project, kind, series, outcome, now)
       end
     end
     emails_sent

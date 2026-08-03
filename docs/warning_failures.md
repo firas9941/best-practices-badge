@@ -1568,20 +1568,60 @@ receives.
    whole class of column belongs in a public API is a real question,
    but removing fields is a breaking API change and deserves its own
    decision rather than riding along with a notification fix.
-6. **Step 3e-2: classification and the bounded retry.** The transient
-   and permanent exception lists, with anything unrecognized treated as
-   transient; a `rescue` in `send_notifications` rather than in each
-   mailer helper, so it is written once; increment on transient failure;
-   clear, log, and report to Sentry on permanent failure or on
-   exhausting `BADGEAPP_MAX_NOTIFICATION_ATTEMPTS`.
+6. **Step 3e-2: classification and the bounded retry. Done
+   2026-08-03.** The transient and permanent exception lists, with
+   anything unrecognized treated as transient; a `rescue` in
+   `attempt_notification` rather than in each mailer helper, so it is
+   written once; increment on transient failure; clear, log, and report
+   to Sentry on permanent failure or on exhausting
+   `BADGEAPP_MAX_NOTIFICATION_ATTEMPTS`.
 
-   One mechanical detail to settle here: writing the incremented count
-   in the same statement as the flag clear means reading the current
-   value, so `warning_send_attempts` and `loss_send_attempts` have to
-   join the tight `*_NOTIFY_PROJECT_FIELDS` lists. Editing those lists
-   is precisely what caused the original defect. The non-zero
-   `lock_version` fixtures added in set 1 are what now guard against a
-   repeat.
+   The counters joined the tight `*_NOTIFY_PROJECT_FIELDS` lists, since
+   incrementing means reading the current value. Editing those lists is
+   precisely what caused the original defect, so they now carry a
+   warning, and it is worth recording why the risk is smaller than it
+   looks: an omitted column raises `ActiveModel::MissingAttributeError`
+   rather than failing quietly. That was confirmed directly, not
+   assumed. The trap was never that reading a missing column is silent;
+   it was that `update_columns` *wrote* one silently.
+
+   Two things came out differently from the sketch. `checked_outcome`
+   is deliberately outside the `rescue`, so a block answering outside
+   the vocabulary still fails loudly instead of being filed as a
+   network problem. And an unrecognized exception is reported to Sentry
+   at once, not five nights later when the attempts run out: we treat
+   it as transient because that is the safe direction, but failing to
+   classify it is a gap in those two lists and deserves a human sooner
+   than that.
+
+   `clear_notification_flag` became `write_notification_columns`. It
+   now counts attempts and stamps deliveries as well as clearing, and a
+   method named for one of the three things it does invites the reader
+   to assume the others do not happen.
+
+   **Only `:sent` writes the sent-at column now.** Previously a
+   no-longer-relevant notification stamped it too. Since step 3b those
+   columns are the record of delivery, so stamping one when nothing was
+   delivered would recreate the misleading state that made this
+   incident hard to diagnose. This was not in the sketch for this step,
+   but abandonment forced the same question, and the answer has to be
+   the same in every case.
+
+   **An accepted consequence, worth knowing before it happens.** The
+   cap counts mail sent, not attempts made, so a run continues through
+   the whole pending set even when every delivery is failing. During a
+   sustained outage each pending notification therefore burns one
+   attempt per night on the same cause, and after
+   `BADGEAPP_MAX_NOTIFICATION_ATTEMPTS` nights they are all abandoned
+   together. That is the bound working as designed, and every
+   abandonment is logged and reported rather than silent, but the
+   failure mode is "our mail was down for five days, so everyone's
+   pending notification was dropped at once". If that is not
+   acceptable, the fix is to distinguish a per-project failure from a
+   systemic one, for instance by not counting an attempt when every
+   delivery in the run has failed. Left undone deliberately: the
+   pending set is 8, and the machinery to tell those apart is worth
+   more than the risk today.
 7. **Step 3f: the invariant check (4A).** Purely additive; it touches
    no mail path. Excludes projects that are suppressed or have a
    non-zero attempt count, so normal operation raises no nightly false

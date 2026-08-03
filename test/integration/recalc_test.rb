@@ -5,6 +5,7 @@
 # SPDX-License-Identifier: MIT
 
 require 'test_helper'
+require 'minitest/mock' # for stubbing the mailer to raise
 
 # rubocop:disable Metrics/ClassLength
 class RecalcTest < ActionDispatch::IntegrationTest
@@ -315,22 +316,22 @@ class RecalcTest < ActionDispatch::IntegrationTest
 
   # Column names are interpolated into the UPDATE, so anything that is not
   # a real column must be refused rather than reaching the database.
-  test 'clear_notification_flag refuses a name that is not a column' do
+  test 'write_notification_columns refuses a name that is not a column' do
     assert_raises(ArgumentError) do
       Project.send(
-        :clear_notification_flag, projects(:one),
+        :write_notification_columns, projects(:one),
         'unreported_badge_loss = 0; DROP TABLE projects; --' => 1
       )
     end
     assert_raises(ArgumentError) do
-      Project.send(:clear_notification_flag, projects(:one), no_such_column: 1)
+      Project.send(:write_notification_columns, projects(:one), no_such_column: 1)
     end
   end
 
   # The failure path must be noisy.  A bookkeeping write that quietly
   # changed nothing is exactly what let the same emails go out night after
   # night; see docs/warning_failures.md.
-  test 'clear_notification_flag reports a write that matches no rows' do
+  test 'write_notification_columns reports a write that matches no rows' do
     missing = Project.new
     missing.id = -1 # no such row, so the update matches nothing
     logged = StringIO.new
@@ -338,7 +339,7 @@ class RecalcTest < ActionDispatch::IntegrationTest
     Rails.logger = ActiveSupport::Logger.new(logged)
     begin
       assert_not Project.send(
-        :clear_notification_flag, missing, unreported_badge_loss: 0
+        :write_notification_columns, missing, unreported_badge_loss: 0
       )
     ensure
       Rails.logger = original_logger
@@ -365,21 +366,25 @@ class RecalcTest < ActionDispatch::IntegrationTest
   end
 
   # Every outcome the vocabulary defines must be handled, not just the
-  # ones today's two mailers happen to return.
-  test 'send_notifications counts only the sent outcome' do
+  # ones today's two mailers happen to return.  Only :sent counts, and
+  # the flag survives exactly the outcomes that expect another try.
+  test 'send_notifications handles every outcome' do
     project = projects(:one)
+    flag_after = {
+      sent: 0, not_relevant: 0, suppressed: 1,
+      transient_failure: 1, permanent_failure: 0
+    }
     Project::NOTIFICATION_OUTCOMES.each do |outcome|
       project.update_column(:unreported_badge_warning, 1)
+      project.update_column(:warning_send_attempts, 0)
       sent = Project.send(
         :send_notifications, Project.where(id: project.id), 1,
         Project::NOTIFICATION_SERIES[:warning]
       ) { |_project, _user, _level, _suffix| outcome }
-      assert_equal (outcome == :sent ? 1 : 0), sent, "outcome #{outcome}"
-      # A suppressed notification is kept for a later run; the other two
-      # are finished with, one way or the other.
-      assert_equal (outcome == :suppressed ? 1 : 0),
+      assert_equal (outcome == :sent ? 1 : 0), sent, "counted #{outcome}"
+      assert_equal flag_after[outcome],
                    Project.find(project.id).unreported_badge_warning,
-                   "outcome #{outcome}"
+                   "flag after #{outcome}"
     end
   end
 
@@ -390,6 +395,84 @@ class RecalcTest < ActionDispatch::IntegrationTest
     project = projects(:perfect_passing)
     project.update_column(:unreported_badge_loss, 1)
     assert_equal 0, Project.send_loss_notifications
+  end
+
+  # The sent-at columns are the record of delivery now that mail goes out
+  # synchronously, so a notification that was never sent must not stamp
+  # one.  Claiming a delivery that did not happen is the misleading state
+  # that made this incident hard to diagnose.
+  test 'send_loss_notifications records no delivery when not relevant' do
+    project = projects(:perfect_passing)
+    project.update_column(:unreported_badge_loss, 1)
+    Project.send_loss_notifications
+    fresh = Project.find(project.id)
+    assert_equal 0, fresh.unreported_badge_loss
+    assert_nil fresh.last_loss_sent_at
+  end
+
+  # --- delivery failure tests ---
+
+  # Raise +error+ from the loss mailer for one pending project, and
+  # return that project reloaded.
+  def failing_loss_run(error, attempts: 0)
+    project = projects(:one)
+    project.update_column(:unreported_badge_loss, 1)
+    project.update_column(:loss_send_attempts, attempts)
+    ReportMailer.stub(:email_owner_with_user, ->(*) { raise error }) do
+      assert_equal 0, Project.send_loss_notifications
+    end
+    Project.find(project.id)
+  end
+
+  # A transient failure keeps the notification for another night, and
+  # counts the attempt so that "try again later" stays bounded.
+  test 'send_loss_notifications keeps the flag after a transient failure' do
+    fresh = failing_loss_run(Net::SMTPServerBusy.new('busy'))
+    assert_equal 1, fresh.unreported_badge_loss
+    assert_equal 1, fresh.loss_send_attempts
+    assert_nil fresh.last_loss_sent_at
+  end
+
+  # An unrecognized failure must be treated as transient.  Guessing
+  # "permanent" would drop the notification with no bound and no signal;
+  # guessing "transient" costs at most MAX_NOTIFICATION_ATTEMPTS tries
+  # and then reports.
+  test 'send_loss_notifications treats an unknown failure as transient' do
+    fresh = failing_loss_run(RuntimeError.new('something new'))
+    assert_equal 1, fresh.unreported_badge_loss
+    assert_equal 1, fresh.loss_send_attempts
+  end
+
+  # A 5xx will not improve overnight, so retrying only delays the report
+  # and spends the attempt budget for nothing.
+  test 'send_loss_notifications gives up at once on a permanent failure' do
+    fresh = failing_loss_run(Net::SMTPFatalError.new('rejected'))
+    assert_equal 0, fresh.unreported_badge_loss
+    assert_equal 1, fresh.loss_send_attempts
+    assert_nil fresh.last_loss_sent_at
+  end
+
+  # The bound itself: without it, a permanently failing address is this
+  # incident again, one attempt per night forever.  Giving up must be
+  # loud, because the owner never hears the message we abandoned.
+  test 'send_loss_notifications gives up once the attempts run out' do
+    logged = StringIO.new
+    original_logger = Rails.logger
+    Rails.logger = ActiveSupport::Logger.new(logged)
+    begin
+      fresh = failing_loss_run(
+        Net::SMTPServerBusy.new('busy'),
+        attempts: Project::MAX_NOTIFICATION_ATTEMPTS - 1
+      )
+    ensure
+      Rails.logger = original_logger
+    end
+    assert_equal 0, fresh.unreported_badge_loss
+    assert_equal Project::MAX_NOTIFICATION_ATTEMPTS,
+                 fresh.loss_send_attempts
+    assert_nil fresh.last_loss_sent_at
+    assert_match(/Abandoning unreported_badge_loss/, logged.string)
+    assert_match(/transient_failure/, logged.string)
   end
 
   # --- update_all_badge_warnings tests ---
