@@ -1472,17 +1472,29 @@ receives.
    common beyond their answer, and putting them in the descriptor would
    have meant the lambdas that concern 7 deliberately keeps out of it.
 
-   **A warning with no recorded date is sent, not skipped.** This is a
-   decision, not an oversight, and it is the reason the guard tests the
-   date rather than trusting it: we cannot show a deadline has passed
-   when we do not know what it was. The two ways to be wrong are not
-   equal. Sending states the deadline as blank; skipping discards the
-   notification for good and says nothing, which is the exact failure
-   this document exists to prevent. `save_warning_columns` always
-   records a date, so a missing one is a data fault we should not
-   compound by going quiet. It also turns out that no fixture sets that
-   column, so the opposite choice would have quietly broken six
-   existing tests into passing for the wrong reason.
+   **A warning with no recorded date is sent, not skipped**, and says
+   nothing about when. This is a decision, not an oversight, and it is
+   the reason the guard tests the date rather than trusting it: we
+   cannot show a deadline has passed when we do not know what it was.
+   Skipping would discard the notification for good and say nothing,
+   which is the exact failure this document exists to prevent, and a
+   fault in our own bookkeeping is a poor reason to leave an owner
+   unwarned about their badge. `save_warning_columns` always records a
+   date, so a missing one is a fault on our side, not theirs. It also
+   turns out that no fixture sets that column, so skipping would have
+   quietly turned six existing tests into tests that pass for the wrong
+   reason.
+
+   The first cut sent the ordinary message with the date interpolated
+   as blank, which reads as "may be lost on ." and then refers the
+   owner to a date it never gave. That is a poor thing to send. So
+   `warned_level.text.erb` now chooses between two messages, and
+   `report_mailer.warned_level_message_no_date` warns without naming a
+   day. The rendered output of both was checked by hand as well as by
+   test, since an ERB conditional in a plain-text mail can easily leave
+   stray blank lines. The new key exists only in `en.yml`; the other
+   locales fall back to English until translation.io carries it, which
+   is the normal path for a new string.
 
    The boundary is inclusive: a warning whose deadline is today is
    still sent, because that date is the last day the warning is true

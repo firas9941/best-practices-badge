@@ -1334,10 +1334,12 @@ class Project < ApplicationRecord
   #
   # A project with no recorded date is warned rather than skipped.  We
   # cannot show a deadline has passed when we do not know what it was,
-  # and the two ways to be wrong here are not equal: sending states the
-  # deadline as blank, while skipping discards the notification for good
-  # and says nothing.  save_warning_columns always records a date, so
-  # this case is a data fault we should not compound by going quiet.
+  # and skipping would discard the notification for good and say
+  # nothing.  save_warning_columns always records a date, so a missing
+  # one is a data fault, and a fault in our bookkeeping is a poor reason
+  # to leave an owner unwarned about their badge.  The template answers
+  # with warned_level_message_no_date, which warns without naming a day,
+  # so the owner gets a true message rather than one with a hole in it.
   #
   # @param project [Project] the project at risk of losing its badge
   # @param user [User] the project owner (pre-fetched, avoids N+1)
