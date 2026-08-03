@@ -10,7 +10,8 @@ reported success and the database recorded nothing at all.
 
 ## Where this stands, and how to resume
 
-Written 2026-08-01, at the end of the first working session.
+Written 2026-08-01 at the end of the first working session, updated
+2026-08-03.
 
 ### Where the work lives
 
@@ -25,20 +26,21 @@ against `main`:
 | `0431d26a` | set 2, the unification |
 | `cfd7b86b` | this status section |
 
-**Check that pull request's CI first when resuming.** Brakeman gates
-`main` and runs only on GitHub, so it has not yet seen the parameterized
-`UPDATE` that set 1 introduces. If it objects to the interpolated column
-names, the rationale for a `config/brakeman.ignore` entry is in
-[option 1D](#option-1d-a-parameterized-sql-statement-chosen): values are
-bound, column names are checked against the schema, and the statement is
-short enough to verify by inspection.
+Every check on that pull request passed as of 2026-08-03. That includes
+Brakeman, which gates `main`, runs only on GitHub, and had not
+previously seen the parameterized `UPDATE` that set 1 introduces. It
+raised no objection to the interpolated column names, so no
+`config/brakeman.ignore` entry was needed and the rationale recorded in
+[option 1D](#option-1d-a-parameterized-sql-statement-chosen) has not
+had to be used.
 
 ### Production state right now
 
 * Both notification caps are **zero**. That is the only thing preventing
   duplicate mail, nothing anywhere tracks that they are off, and the
   planned monitoring will not catch it (a cap of zero exits the loop
-  legitimately). Restore them to 20 once set 1 is deployed.
+  legitimately). Restore them to 20 once all of set 3 is deployed; see
+  [Deployment: everything lands together](#deployment-everything-lands-together).
 * 8 badge-loss flags are pending, deliberately: 8887, 11675, 11718,
   11957, 11985, 11996, 12038, 12059. Each owner is owed exactly one
   email when the caps come back.
@@ -48,18 +50,62 @@ short enough to verify by inspection.
 
 ### What is done and what is next
 
-Sets 1 and 2 are implemented and reviewed. Set 3 is not started; the
-separable items are not started. See [The plan](#the-plan).
+Sets 1 and 2 are implemented, reviewed, and green in CI. Set 3 is not
+started; the separable items are not started. See [The plan](#the-plan),
+where set 3 is now broken into seven steps that can be reviewed and
+tested one at a time.
 
-Set 1 is deployable on its own and is what makes restoring the caps safe.
+### Deployment: everything lands together
+
+Decided 2026-08-03, revising the earlier intent to deploy set 1 on its
+own and restore the caps at that point.
+
+Nothing is merged or deployed until all of set 3 is complete. The caps
+stay at zero until then, and are restored only after the whole pipeline
+is in place.
+
+The earlier plan had set 1 deploy alone, on the reasoning that set 1 is
+what makes duplicates impossible and that leaving legitimate
+notifications suppressed any longer than necessary is its own quiet
+failure. That reasoning still holds as far as it goes, but three things
+outweigh it:
+
+* **We learn more by finishing.** Set 3 changes delivery semantics
+  (`deliver_now`), what a set flag means (deferred rather than
+  discarded), and adds retry state. Implementing all of it is likely to
+  surface facts that would change how we would have wanted set 1 to
+  behave in production. Mailing under one semantics and then changing
+  the semantics underneath the same queue is avoidable work.
+* **Waiting is strictly better for at least one owner.** Under set 1 and
+  2 as they stand, an owner we cannot email has their flag cleared and
+  their notification discarded. Project 12038 has no usable address and
+  is in the pending set right now, so deploying before set 3 would throw
+  its notification away permanently. Set 3's suppression rule defers
+  instead, so waiting preserves it.
+* **Little accumulates in the meantime.** The pending flags are raised
+  only by `update_all_badge_percentages` and `save_warning_columns`,
+  both reached only from operator-run rake tasks, never from an ordinary
+  project edit. If we run no recalculation during this window, the
+  pending set stays exactly as it is: 8 loss flags and no warnings.
+
+The cost we are accepting is that those 8 owners wait longer for the one
+email each is owed. That is bounded and known.
+
+The residual risk is the one the first bullet under
+[Production state right now](#production-state-right-now) names: the
+caps are off, nothing tracks that, and the longer this work takes the
+longer that stays true with no alarm. If set 3 stalls, restoring the
+caps on top of sets 1 and 2 remains available as a fallback, at the cost
+of project 12038's pending notification. Deciding to stop and ship is
+better than drifting into a stop by inattention.
 
 ### Decisions already made
 
 Do not relitigate these; the reasoning is in this document. Option 1D
 (parameterized SQL, not the ORM), 3B and 3C for tests, concern 5 for the
 counter, design 6B with bounded retries and attempt counters, suppression
-defers rather than discards, relevance guards, and concern 7's
-unification.
+defers rather than discards, relevance guards, concern 7's unification,
+and deploying everything together rather than set 1 first.
 
 Two open nits, both deliberate and neither urgent: `NOTIFICATION_SERIES`
 is shallow-frozen, and `send_notifications` sits in the file's loss
@@ -1282,9 +1328,11 @@ The `update_all` call goes in one small private helper shared by both
 existing loops. That is not the full unification of concern 7; it is the
 minimum needed so the fix is not written twice.
 
-After this deploys and the 8 pending loss emails have gone out
-correctly, the caps can be restored to 20. From that point the system is
-no longer suppressed, which is the main goal.
+This set was originally intended to deploy on its own, with the caps
+restored as soon as it did. That is no longer the plan; see
+[Deployment: everything lands together](#deployment-everything-lands-together).
+It remains true that set 1 is what makes duplicates impossible, and so
+what makes restoring the caps safe at all.
 
 ### Set 2: unification, with no behavior change
 
@@ -1301,6 +1349,10 @@ bounded retry with its two new columns and migration, and the invariant
 check (4A). This set carries the schema change and the behavior changes,
 so it deserves the most careful review; putting it last means it lands
 on an already-unified, already-correct pipeline.
+
+By the principle above, this set sprawls, so it is split again. See
+[Set 3 in the plan](#set-3-delivery-semantics-and-resilience-1) for the
+seven steps.
 
 ### Separable at any time
 
@@ -1328,8 +1380,8 @@ In execution order, grouped by change set; see
    assert the second run sends nothing. Expect 3B to require fixing
    whatever else it uncovers; that is the point.
 
-Deploy, confirm the 8 pending loss emails go out correctly, then restore
-both caps to 20. The system is no longer suppressed from here.
+Done, and green in CI. Not deployed on its own; everything lands
+together once set 3 is complete.
 
 ### Set 2: unification, no behavior change
 
@@ -1341,30 +1393,86 @@ both caps to 20. The system is no longer suppressed from here.
 
 ### Set 3: delivery semantics and resilience
 
-1. **Restructure to design 6B.** Send with `deliver_now`, then clear the
-   flag and stamp the sent-at column in one statement, so the
-   timestamp records a delivery rather than an attempt. Safe only
-   because set 1 made the write incapable of silently matching zero
-   rows.
-2. **Add the guards (concern 6).** Skip suppressed owners *without*
-   clearing their flag, so opting back in still delivers; and clear
-   without sending when a notification is no longer relevant, meaning a
-   regained badge or a warning whose effective date has passed.
-3. **Bound the retries.** Add the two attempt columns
-   (`warning_send_attempts`, `loss_send_attempts`, shared by the metal
-   and baseline kinds as the sent-at columns already are), classify
-   failures by the exception lists in concern 6 with anything
-   unrecognized treated as transient, and abandon after
-   `BADGEAPP_MAX_NOTIFICATION_ATTEMPTS` tries. Reset each counter
-   wherever its flag is raised; forgetting that makes a project
-   permanently unnotifiable.
-4. **Add the invariant check (4A)**, excluding projects that are
-   suppressed or mid-retry so that normal operation raises no nightly
-   false alarm. Defer 4B; with the attempt counters in place, 4A plus
-   the abandonment report covers the same ground.
-5. **Add the branch tests** listed under concern 7: suppressed, not
-   relevant, transient, permanent, exhausted, and
-   write-affected-no-rows.
+Subdivided 2026-08-03 into seven steps, in dependency order. Set 3 is
+the largest and riskiest part of this repair, and the steps below exist
+so that each piece can be reviewed and tested on its own rather than as
+one diff carrying a schema change, a delivery-semantics change, and new
+control flow all at once. Nothing merges until all seven are done; see
+[Deployment: everything lands together](#deployment-everything-lands-together).
+
+The keystone is step 3a. As set 2 left it, `send_notifications` receives
+a **Boolean** from its yield block, and set 3 needs at least five
+distinct outcomes: sent, not relevant, suppressed, transient failure,
+and permanent failure. Widening that contract first, without changing
+any behavior, gives every later step a seam to plug into.
+
+Three of the seven change nothing observable (3a, 3e-1, 3f is purely
+additive), which leaves only four steps that alter what an owner
+receives.
+
+1. **Step 3a: an outcome vocabulary. No behavior change.**
+   Replace the Boolean yield contract with a symbol, `:sent` or
+   `:not_relevant`. These two cases are conflated today:
+   `send_loss_email` returns `false` both when the badge has been
+   regained and when it declines for any other reason, and the caller
+   cannot tell them apart. `send_notifications` maps `:sent` to "count
+   and clear" and `:not_relevant` to "clear without counting", which is
+   exactly what it does now. Review is a question of equivalence, and
+   the existing tests in `test/integration/recalc_test.rb` should pass
+   untouched.
+2. **Step 3b: `deliver_now` (design 6B).** One line in each of
+   `send_loss_email` and `send_warning_email`, so `last_*_sent_at`
+   records a delivery rather than an enqueue. This is safe to land
+   before any failure handling exists, and the reason is worth stating:
+   the flag is already cleared *after* the yield, so an SMTP exception
+   aborts the run with the flag still set, and the next night retries.
+   No duplicate is possible in that window. Tests move from
+   `assert_enqueued_emails` to `assert_emails`.
+3. **Step 3c: relevance guards.** For warnings, return `:not_relevant`
+   when `badge_warning_effective_date` has passed;
+   `WARN_NOTIFY_PROJECT_FIELDS` already selects that column. For
+   losses, the regained-badge check already exists inside
+   `send_loss_email`; express it through 3a's vocabulary so both series
+   use one mechanism rather than two.
+4. **Step 3d: suppression defers.** An owner we cannot email keeps
+   their pending flag instead of losing it. Two lines and their tests.
+   It is separated from 3c because it is the step that creates
+   permanently pending rows, which is the fact step 3f has to be built
+   around.
+5. **Step 3e-1: the attempt columns and their reset. No behavior
+   change.** The migration adding `warning_send_attempts` and
+   `loss_send_attempts`, each with a `comment:`, **and** the reset
+   wherever a flag is raised: `update_all_badge_percentages` for the
+   loss columns and `save_warning_columns` for the warning columns.
+   Nothing reads the new columns yet.
+
+   This is the most valuable split in the set. The reset rule is the
+   one this document calls the easiest to overlook, and the one whose
+   omission makes a project permanently unnotifiable. Landing it while
+   it is the only thing in the diff makes it impossible to overlook.
+6. **Step 3e-2: classification and the bounded retry.** The transient
+   and permanent exception lists, with anything unrecognized treated as
+   transient; a `rescue` in `send_notifications` rather than in each
+   mailer helper, so it is written once; increment on transient failure;
+   clear, log, and report to Sentry on permanent failure or on
+   exhausting `BADGEAPP_MAX_NOTIFICATION_ATTEMPTS`.
+
+   One mechanical detail to settle here: writing the incremented count
+   in the same statement as the flag clear means reading the current
+   value, so `warning_send_attempts` and `loss_send_attempts` have to
+   join the tight `*_NOTIFY_PROJECT_FIELDS` lists. Editing those lists
+   is precisely what caused the original defect. The non-zero
+   `lock_version` fixtures added in set 1 are what now guard against a
+   repeat.
+7. **Step 3f: the invariant check (4A).** Purely additive; it touches
+   no mail path. Excludes projects that are suppressed or have a
+   non-zero attempt count, so normal operation raises no nightly false
+   alarm. Defer 4B; with the attempt counters in place, 4A plus the
+   abandonment report covers the same ground.
+
+Each step carries its own tests. Between them they cover the branches
+listed under [concern 7](#a-note-on-test-coverage): suppressed, not
+relevant, transient, permanent, exhausted, and write-affected-no-rows.
 
 ### Separable, any time
 
@@ -1407,11 +1515,12 @@ both caps to 20. The system is no longer suppressed from here.
    badge-loss email when the caps are restored. Disposition decided
    2026-07-31.
 4. Restore `BADGEAPP_MAX_BADGE_LOSS_NOTIFICATIONS` and
-   `BADGEAPP_MAX_BADGE_WARNING_NOTIFICATIONS` to 20 **after set 1 is
-   deployed**, not after everything. Set 1 is what makes the duplicates
-   impossible; leaving the caps at zero until sets 2 and 3 land would
-   keep legitimate notifications suppressed for no reason, which is its
-   own quiet failure.
+   `BADGEAPP_MAX_BADGE_WARNING_NOTIFICATIONS` to 20 **after all three
+   sets are deployed**, then confirm on the following run that the 8
+   pending loss emails went out, exactly once each, and that the flags
+   cleared. Revised 2026-08-03; this item previously called for
+   restoring the caps as soon as set 1 was deployed. See
+   [Deployment: everything lands together](#deployment-everything-lands-together).
 
 ## Open questions
 
