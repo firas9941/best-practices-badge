@@ -738,18 +738,7 @@ class Project < ApplicationRecord
         project.update_tiered_percentage
         project.update_baseline_tiered_percentage
         if notify_losses
-          # Store the rank of each lost level so the daily notification task
-          # can send emails in a rate-limited batch.  We always overwrite with
-          # the most recent loss; the daily task handles clearing.
-          if Sections.badge_level_lost?(old_metal_level, project.badge_level)
-            project.unreported_badge_loss =
-              Sections::BADGE_LEVEL_RANK[old_metal_level]
-          end
-          if Sections.badge_level_lost?(old_baseline_level,
-                                        project.baseline_badge_level)
-            project.unreported_baseline_badge_loss =
-              Sections::BADGE_LEVEL_RANK[old_baseline_level]
-          end
+          record_pending_losses(project, old_metal_level, old_baseline_level)
         end
         project.save(validate: false, touch: false)
       end
@@ -763,6 +752,40 @@ class Project < ApplicationRecord
     FastlyRails.purge_all
   end
   # rubocop:enable Metrics/MethodLength, Metrics/AbcSize
+
+  # Note any badge level +project+ has just lost, so the daily task can
+  # notify its owner in a rate-limited batch.  We always overwrite with
+  # the most recent loss; the daily task handles clearing.
+  #
+  # Assigns rather than writes: the caller saves.  That is safe here
+  # because the record came from find_each and is fully loaded, unlike
+  # the notification loop's tight SELECT.
+  #
+  # Resetting loss_send_attempts is the reason this is worth its own
+  # method.  A project that exhausted its attempts on an earlier loss
+  # would otherwise be permanently unnotifiable, and the next genuine
+  # loss would be dropped without a word.  See docs/warning_failures.md.
+  #
+  # @param project [Project] project just recalculated, not yet saved
+  # @param old_metal [String] metal level before recalculation
+  # @param old_baseline [String] baseline level before recalculation
+  # @return [void]
+  def self.record_pending_losses(project, old_metal, old_baseline)
+    ranks = Sections::BADGE_LEVEL_RANK
+    metal_lost = Sections.badge_level_lost?(old_metal,
+                                            project.badge_level)
+    baseline_lost = Sections.badge_level_lost?(
+      old_baseline, project.baseline_badge_level
+    )
+    return unless metal_lost || baseline_lost
+
+    project.unreported_badge_loss = ranks[old_metal] if metal_lost
+    if baseline_lost
+      project.unreported_baseline_badge_loss = ranks[old_baseline]
+    end
+    project.loss_send_attempts = 0
+  end
+  private_class_method :record_pending_losses
 
   # Preview or record which projects will lose a badge when criteria change.
   #
@@ -879,14 +902,18 @@ class Project < ApplicationRecord
     old_metal_level,
     old_baseline_level
   )
-    cols = { badge_warning_effective_date: effective_date }
-    if metal_lost
-      cols[:unreported_badge_warning] =
-        Sections::BADGE_LEVEL_RANK[old_metal_level]
-    end
+    # Reset the attempt count: this is a new warning, and a project that
+    # exhausted its attempts on an earlier one must not be left
+    # permanently unwarnable.  Unconditional because the caller reaches
+    # here only when a level is at risk.  See docs/warning_failures.md.
+    ranks = Sections::BADGE_LEVEL_RANK
+    cols = {
+      badge_warning_effective_date: effective_date,
+      warning_send_attempts: 0
+    }
+    cols[:unreported_badge_warning] = ranks[old_metal_level] if metal_lost
     if baseline_lost
-      cols[:unreported_baseline_badge_warning] =
-        Sections::BADGE_LEVEL_RANK[old_baseline_level]
+      cols[:unreported_baseline_badge_warning] = ranks[old_baseline_level]
     end
     project.update_columns(cols)
   end

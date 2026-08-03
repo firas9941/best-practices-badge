@@ -122,6 +122,48 @@ class RecalcTest < ActionDispatch::IntegrationTest
     assert_equal 0, Project.find(project.id).unreported_badge_loss
   end
 
+  # The attempt counters bound retries, so raising a flag must reset the
+  # matching one.  Without this, a project that used up its attempts on
+  # an earlier notification is permanently unnotifiable, and the next
+  # genuine loss or warning is dropped in silence.  That is the failure
+  # this whole repair exists to prevent, so it is asserted directly
+  # rather than left to the retry logic that will read these columns.
+  test 'update_all_badge_percentages resets loss_send_attempts on a loss' do
+    project = projects(:one)
+    project.update_column(:badge_percentage_0, 100)
+    project.update_column(:tiered_percentage, 100)
+    project.update_column(:loss_send_attempts, 5)
+    Project.update_all_badge_percentages(['0'])
+    assert_equal 0, Project.find(project.id).loss_send_attempts
+  end
+
+  test 'update_all_badge_percentages resets attempts on a baseline loss' do
+    project = projects(:one)
+    project.update_column(:badge_percentage_baseline_1, 100)
+    project.update_column(:loss_send_attempts, 5)
+    Project.update_all_badge_percentages(['baseline-1'])
+    assert_equal 0, Project.find(project.id).loss_send_attempts
+  end
+
+  # A recalculation that loses nothing must leave the count alone; it
+  # belongs to the notification still pending, not to the run.
+  test 'update_all_badge_percentages leaves attempts alone without a loss' do
+    project = projects(:one)
+    project.update_column(:loss_send_attempts, 5)
+    Project.update_all_badge_percentages(['0'])
+    assert_equal 5, Project.find(project.id).loss_send_attempts
+  end
+
+  test 'update_all_badge_warnings resets warning_send_attempts' do
+    project = projects(:one)
+    project.update_column(:badge_percentage_0, 100)
+    project.update_column(:tiered_percentage, 100)
+    project.update_column(:warning_send_attempts, 5)
+    Project.update_all_badge_warnings(Criteria.keys,
+                                      effective_date: Time.zone.today + 30)
+    assert_equal 0, Project.find(project.id).warning_send_attempts
+  end
+
   # --- send_loss_notifications tests ---
 
   test 'send_loss_notifications sends email and clears column' do

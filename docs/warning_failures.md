@@ -1535,16 +1535,39 @@ receives.
    worth doing before the caps are restored, but as a check on what the
    pending set contains rather than as a load-bearing assumption.
 5. **Step 3e-1: the attempt columns and their reset. No behavior
-   change.** The migration adding `warning_send_attempts` and
-   `loss_send_attempts`, each with a `comment:`, **and** the reset
-   wherever a flag is raised: `update_all_badge_percentages` for the
-   loss columns and `save_warning_columns` for the warning columns.
-   Nothing reads the new columns yet.
+   change. Done 2026-08-03.** The migration adding
+   `warning_send_attempts` and `loss_send_attempts`, each with a
+   `comment:`, **and** the reset wherever a flag is raised:
+   `update_all_badge_percentages` for the loss columns and
+   `save_warning_columns` for the warning columns. Nothing reads the
+   new columns yet.
 
    This is the most valuable split in the set. The reset rule is the
    one this document calls the easiest to overlook, and the one whose
    omission makes a project permanently unnotifiable. Landing it while
    it is the only thing in the diff makes it impossible to overlook.
+
+   The loss half moved into a new `record_pending_losses`, which also
+   shortens `update_all_badge_percentages`; the reset is the reason
+   that logic is worth naming. The warning half resets unconditionally,
+   because `update_all_badge_warnings` reaches `save_warning_columns`
+   only when a level is at risk. Three tests assert the reset happens
+   on a loss, on a baseline loss, and on a warning, and a fourth
+   asserts a recalculation that loses nothing leaves the count alone:
+   the count belongs to the notification still pending, not to the run.
+   The migration was rolled back and re-applied to confirm it reverses.
+
+   **These two columns are published in the project JSON API.**
+   `app/views/projects/_project.json.jbuilder` emits every attribute of
+   the record, with no exclusion list, so `loss_send_attempts` and
+   `warning_send_attempts` now appear in `/projects/:id.json` beside
+   `unreported_badge_loss`, `last_loss_sent_at`, and `lock_version`,
+   which are already published the same way. Nothing here is sensitive
+   and the behavior matches how this table's other bookkeeping columns
+   are already treated, so this step did not change it. Whether that
+   whole class of column belongs in a public API is a real question,
+   but removing fields is a breaking API change and deserves its own
+   decision rather than riding along with a notification fix.
 6. **Step 3e-2: classification and the bounded retry.** The transient
    and permanent exception lists, with anything unrecognized treated as
    transient; a `rescue` in `send_notifications` rather than in each

@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_06_07_150000) do
+ActiveRecord::Schema[8.1].define(version: 2026_08_03_120000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "citext"
   enable_extension "pg_catalog.plpgsql"
@@ -292,6 +292,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_06_07_150000) do
     t.text "license_per_file_justification"
     t.integer "license_per_file_status", limit: 2, default: 0, null: false
     t.integer "lock_version", default: 0, comment: "Rails optimistic locking column; incremented on each update to detect concurrent edits"
+    t.integer "loss_send_attempts", default: 0, null: false, comment: "Failed attempts to deliver the pending badge-loss notification; reset to 0 when a loss is newly recorded"
     t.datetime "lost_baseline_1_at"
     t.datetime "lost_baseline_2_at"
     t.datetime "lost_baseline_3_at"
@@ -542,6 +543,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_06_07_150000) do
     t.integer "vulnerability_report_response_status", limit: 2, default: 0, null: false
     t.text "vulnerability_response_process_justification"
     t.integer "vulnerability_response_process_status", limit: 2, default: 0, null: false
+    t.integer "warning_send_attempts", default: 0, null: false, comment: "Failed attempts to deliver the pending badge-warning notification; reset to 0 when a warning is newly recorded"
     t.text "warnings_fixed_justification"
     t.integer "warnings_fixed_status", limit: 2, default: 0, null: false
     t.text "warnings_justification"
