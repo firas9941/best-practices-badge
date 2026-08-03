@@ -931,16 +931,13 @@ class ProjectsController < ApplicationController
         inactive_project.last_reminder_at = Time.now.utc
         inactive_project.save!(touch: false)
       end
-      # last_reminder_at is one of the fields show_json publishes, so the
-      # cached copy is now stale.  Purge the same way update and destroy
-      # do: once now, and once after a delay, the second closing the race
-      # where a response already in flight re-caches the old body.  This
-      # is easy to miss precisely because the field is invisible on the
-      # HTML page; see docs/cdn-cache-not-logged-in.md section 9.3.
-      inactive_project.purge_cdn_project
-      PurgeCdnProjectJob.set(
-        wait: BADGE_PURGE_DELAY.seconds
-      ).perform_later(inactive_project.record_key)
+      # No CDN purge here, deliberately.  This writes only
+      # last_reminder_at, which Project::BOOKKEEPING_FIELDS withholds
+      # from the project JSON, and no cached page shows it; the admin
+      # reminders summary that does is never cached.  So nothing the CDN
+      # holds has gone stale.  It briefly was published, and this loop
+      # briefly purged for it; withholding the column is the better fix,
+      # because it removes the reason rather than adding a purge.
     end
     projects.map(&:id) # Return a list of project ids that were reminded.
   end

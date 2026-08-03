@@ -1765,17 +1765,17 @@ class ProjectsControllerTest < ActionDispatch::IntegrationTest
     # assert_equal late_project.id, result[0]
   end
 
-  # Sending a reminder writes last_reminder_at, which show_json publishes,
-  # so the project's cached copy must be purged.  Nothing on the HTML page
-  # shows this field, which is exactly why the staleness went unnoticed.
-  test 'sending reminders purges the reminded project from the CDN' do
+  # Sending a reminder writes only last_reminder_at, which is withheld
+  # from the project JSON and shown on no cached page, so it must not
+  # cost a CDN purge.  Purging for a field nobody can see is the waste
+  # that Project::BOOKKEEPING_FIELDS exists to make visible.
+  test 'sending reminders does not purge the CDN' do
     late_project = Project.find_by(name: 'Pathfinder OS')
     late_project.last_reminder_at = nil
     late_project.lost_passing_at = nil
     late_project.save!(touch: false)
 
-    assert_enqueued_with(job: PurgeCdnProjectJob,
-                         args: [late_project.record_key]) do
+    assert_no_enqueued_jobs only: PurgeCdnProjectJob do
       ProjectsController.send :send_reminders
     end
   end

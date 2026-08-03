@@ -776,8 +776,11 @@ class Project < ApplicationRecord
         # Ask before saving; afterward the record reports no changes.
         # Rails skips the UPDATE entirely when nothing differs, so most
         # projects in a typical recalculation are untouched and need no
-        # purge at all.
-        modified = project.changed?
+        # purge at all.  Bookkeeping columns do not count: nothing
+        # cached shows them, so a project whose only change was a
+        # pending-notification flag has nothing stale to purge.
+        modified =
+          project.changed.any? { |c| BOOKKEEPING_FIELDS.exclude?(c) }
         project.save(validate: false, touch: false)
       end
       # Only once with_lock has committed.  Purging while the old value

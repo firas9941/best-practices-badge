@@ -1413,7 +1413,12 @@ question to answer before building it.
 * `ProjectsController.send_reminders` used to write `last_reminder_at`
   and save without purging, leaving a stale cached `show_json` for up to
   ten days. That was the one real gap a naive callback would have
-  closed, and it has since been fixed directly.
+  closed. It is fixed, but not by purging: `last_reminder_at` is now in
+  `BOOKKEEPING_FIELDS` and withheld from the JSON, so there is nothing
+  cached left to go stale. A purge was added there first and then
+  removed as pointless, which is worth knowing because it is the whole
+  argument in miniature. The question to ask of a write is not "does it
+  purge?" but "does it change anything a reader can see?"
 
 ### 11.1 Motivation
 

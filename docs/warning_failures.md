@@ -1777,6 +1777,20 @@ branch. Withholding these columns removes the reason those writes
 invalidate anything, which is a better answer than adding a purge to
 each of them and accepting nightly CDN churn for fields nobody reads.
 
+That is not a hypothetical preference. `send_reminders` was first fixed
+the other way, by adding a purge, and this set made that purge
+pointless: it writes only `last_reminder_at`, which is now withheld and
+appears on no cached page. The purge was removed again, and the reason
+recorded where it was, so nobody restores it. Two purge jobs a night
+per reminded project, for a field no reader can see, is exactly the
+waste this list is meant to prevent.
+
+`update_all_badge_percentages` uses the same rule: a project whose only
+change was a pending-notification flag is not purged, because nothing
+cached shows that flag. In practice a raised loss flag always
+accompanies a percentage change, so this changes no behavior today; it
+states the rule in the one place where it could otherwise drift.
+
 The constant is deliberately a list of what to **withhold**, not what to
 publish. New project data should reach the JSON without anyone having to
 ask; only a column that answers "what has the badge application done
