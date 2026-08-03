@@ -709,13 +709,6 @@ class Project < ApplicationRecord
   # bounds the working set so the recalc fits in a normal dyno.
   BULK_RECALC_BATCH_SIZE = 100
 
-  # Above this many changed projects, purge the whole CDN cache rather
-  # than purging each one. Thousands of individual purges would hit
-  # Fastly's rate limits and finish later than one full purge. A full
-  # purge costs a cold cache for an extremely busy site, so it is the
-  # fallback, not the default.
-  MAX_INDIVIDUAL_CDN_PURGES = 500
-
   # update the precalculated values.
   # NOTE: No emails are sent to badge losers or gainers — email notification
   # only happens through the controller's normal save flow.
@@ -762,10 +755,16 @@ class Project < ApplicationRecord
       next unless modified
 
       changed += 1
-      purge_project_cdn_data(project) if changed <= MAX_INDIVIDUAL_CDN_PURGES
+      purge_project_cdn_data(project)
     end
     Project.skip_callbacks = false
-    purge_all_if_too_many_changed(changed)
+    # Say what we did.  purge_all logged nothing on success, so its
+    # effect could never be confirmed from the log afterward; see
+    # docs/warning_failures.md.
+    Rails.logger.info(
+      "Recalculation changed #{changed} projects and purged each from " \
+      'the CDN.'
+    )
   end
   # rubocop:enable Metrics/MethodLength, Metrics/AbcSize
 
@@ -787,6 +786,12 @@ class Project < ApplicationRecord
   #
   # Both are jobs, not direct calls, so a purge that fails is retried
   # with backoff rather than swallowed, which is what `purge_all` does.
+  # That retry is also why there is no "too many changed, purge
+  # everything instead" fallback here. Fastly answers a rate limit with
+  # an unsuccessful response, `purge_by_key` returns false, the job
+  # raises and backs off, so a large recalculation purges more slowly
+  # rather than losing purges. Dropping the whole cache of a site this
+  # busy to avoid going slowly would be the worse trade.
   #
   # @param project [Project] project whose cached data is now stale
   # @return [void]
@@ -800,22 +805,6 @@ class Project < ApplicationRecord
       .perform_later(key)
   end
   private_class_method :purge_project_cdn_data
-
-  # Fall back to purging the whole CDN cache when too many projects
-  # changed to purge individually.
-  # @param changed [Integer] projects the recalculation actually modified
-  # @return [void]
-  def self.purge_all_if_too_many_changed(changed)
-    return if changed <= MAX_INDIVIDUAL_CDN_PURGES
-
-    Rails.logger.info(
-      "Recalculation changed #{changed} projects, more than " \
-      "#{MAX_INDIVIDUAL_CDN_PURGES}, so purging the whole CDN cache."
-    )
-    # A no-op in test and development, where Fastly credentials are absent.
-    FastlyRails.purge_all
-  end
-  private_class_method :purge_all_if_too_many_changed
 
   # Note any badge level +project+ has just lost, so the daily task can
   # notify its owner in a rate-limited batch.  We always overwrite with

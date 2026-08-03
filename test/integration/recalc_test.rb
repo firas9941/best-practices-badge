@@ -198,23 +198,22 @@ class RecalcTest < ActionDispatch::IntegrationTest
     assert_not purged_all
   end
 
-  # Above the threshold, individual purges would hit Fastly's rate
-  # limits and finish later than one full purge.  Forced here by
-  # lowering the threshold rather than by making 500 projects change.
-  test 'update_all_badge_percentages purges everything past the threshold' do
+  # There is no "too many changed, purge everything instead" fallback,
+  # and there should not be one: a rate-limited purge is retried with
+  # backoff, so a big recalculation goes slower rather than losing
+  # purges, while a whole-cache purge would cold-start a very busy site.
+  test 'update_all_badge_percentages never purges the whole cache' do
     settle_badge_percentages
     project = projects(:one)
     project.update_column(:badge_percentage_0, 100)
     project.update_column(:tiered_percentage, 100)
     purged_all = false
-    with_cdn_purge_threshold(0) do
-      FastlyRails.stub(:purge_all, ->(*) { purged_all = true }) do
-        assert_no_enqueued_jobs only: PurgeCdnProjectJob do
-          Project.update_all_badge_percentages(['0'])
-        end
-      end
+    FastlyRails.stub(:purge_all, ->(*) { purged_all = true }) do
+      Project.update_all_badge_percentages(['0'])
     end
-    assert purged_all, 'expected a whole-cache purge past the threshold'
+    assert_not purged_all
+    assert_enqueued_with(job: PurgeCdnProjectJob,
+                         args: [project.record_key])
   end
 
   # The fixtures' stored percentages are hand-written and do not match
@@ -223,19 +222,6 @@ class RecalcTest < ActionDispatch::IntegrationTest
   # what the test itself changed.
   def settle_badge_percentages
     Project.update_all_badge_percentages(['0'])
-  end
-
-  # Swap MAX_INDIVIDUAL_CDN_PURGES for the duration of a block.  Tests
-  # run in separate processes, not threads, so this cannot leak into a
-  # concurrently running test.
-  def with_cdn_purge_threshold(value)
-    original = Project::MAX_INDIVIDUAL_CDN_PURGES
-    Project.send(:remove_const, :MAX_INDIVIDUAL_CDN_PURGES)
-    Project.const_set(:MAX_INDIVIDUAL_CDN_PURGES, value)
-    yield
-  ensure
-    Project.send(:remove_const, :MAX_INDIVIDUAL_CDN_PURGES)
-    Project.const_set(:MAX_INDIVIDUAL_CDN_PURGES, original)
   end
 
   # --- send_loss_notifications tests ---

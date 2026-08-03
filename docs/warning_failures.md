@@ -1328,9 +1328,16 @@ the old value from a request that arrives between the purge and the
 commit, leaving stale badges behind with no further purge coming. The
 controller already follows this ordering around saves.
 
-Keep `purge_all` as a fallback when the changed set exceeds a threshold:
-thousands of individual Fastly calls would hit rate limits and be worse
-than one full purge.
+This paragraph originally went on to recommend keeping `purge_all` as a
+fallback when the changed set exceeds a threshold, on the grounds that
+thousands of individual Fastly calls would hit rate limits. **That was
+wrong, and the implementation does not do it.** Rate limiting arrives as
+an unsuccessful HTTP response, so `purge_by_key` returns false,
+`PurgeCdnProjectJob` raises, and Active Job retries with backoff. A
+large recalculation therefore purges more slowly; it does not lose
+purges. The threshold would have traded a mechanism that already
+handles the problem for one that cold-starts the cache of a site that is
+extremely busy and constantly under attack.
 
 **Done 2026-08-03**, in this branch rather than separately; see
 [Set 4](#set-4-purge-only-the-projects-that-changed).
@@ -1721,9 +1728,19 @@ gone while the CDN carries on serving the old one.
    after `BADGEAPP_PURGE_DELAY`. Both are jobs, so a failed purge is
    retried with backoff rather than swallowed as `purge_all` swallows
    it.
-3. **Fall back above `MAX_INDIVIDUAL_CDN_PURGES` (500).** Thousands of
-   individual purges would hit Fastly's rate limits and finish later
-   than one full purge. Crossing the threshold logs the reason.
+3. **No fallback to `purge_all`, at any size.** This document
+   originally called for one above a threshold, and a first cut
+   implemented it; it was removed on review, and the reasoning is worth
+   keeping because the fallback sounds prudent. Its purpose was to
+   avoid Fastly's rate limits, but rate limiting arrives as an
+   unsuccessful HTTP response, so `purge_by_key` returns false, the job
+   raises, and Active Job retries with backoff. The problem was already
+   handled. What the fallback added was a way to cold-start the cache
+   of a very busy site in order to avoid going slowly, which is the
+   worse trade, plus a constant, a branch, and a test that had to swap
+   a constant out from under the class to reach it. The recalculation
+   now logs how many projects it changed and purged, which `purge_all`
+   never did.
 
 The claim this rests on, that `project.changed?` identifies exactly the
 affected rows at no cost, is now checked by a test rather than inferred
