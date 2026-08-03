@@ -437,5 +437,55 @@ class RecalcTest < ActionDispatch::IntegrationTest
       Project.send_warning_notifications
     end
   end
+
+  # Relevance guard.  A warning announces a deadline, so once that date
+  # is past the message would state a deadline in the past.  The 11 stale
+  # flags of 2026-07-31 had to be cleared by hand for exactly this
+  # reason; see docs/warning_failures.md.
+  test 'send_warning_notifications skips a warning whose date has passed' do
+    project = projects(:one)
+    project.update_column(:unreported_badge_warning, 1)
+    project.update_column(:badge_warning_effective_date,
+                          Time.zone.today - 1)
+    assert_emails(0) do
+      Project.send_warning_notifications
+    end
+    assert_equal 0, Project.find(project.id).unreported_badge_warning
+  end
+
+  test 'send_warning_notifications skips a stale baseline warning' do
+    project = projects(:one)
+    project.update_column(:unreported_baseline_badge_warning, 1)
+    project.update_column(:badge_warning_effective_date,
+                          Time.zone.today - 1)
+    assert_emails(0) do
+      Project.send_warning_notifications
+    end
+    assert_equal 0,
+                 Project.find(project.id).unreported_baseline_badge_warning
+  end
+
+  # The deadline is the last day the warning is true, not the first day
+  # it is stale, so a warning due today is still worth sending.
+  test 'send_warning_notifications still warns on the effective date' do
+    project = projects(:one)
+    project.update_column(:unreported_badge_warning, 1)
+    project.update_column(:badge_warning_effective_date, Time.zone.today)
+    assert_emails(1) do
+      Project.send_warning_notifications
+    end
+  end
+
+  # Deliberate: with no date recorded we cannot show the deadline has
+  # passed, and skipping would discard the notification silently, which
+  # is the failure this whole repair exists to stop.  Warn instead.
+  test 'send_warning_notifications warns when no date was recorded' do
+    project = projects(:one)
+    project.update_column(:unreported_badge_warning, 1)
+    assert_nil Project.find(project.id).badge_warning_effective_date
+    assert_emails(1) do
+      Project.send_warning_notifications
+    end
+  end
 end
 # rubocop:enable Metrics/ClassLength

@@ -1458,12 +1458,35 @@ receives.
    `deliver_later` only enqueued it; line coverage rose by 37 lines when
    they started delivering for real. The mailer and its templates had
    been exercised only by the mailer tests.
-3. **Step 3c: relevance guards.** For warnings, return `:not_relevant`
-   when `badge_warning_effective_date` has passed;
+3. **Step 3c: relevance guards. Done 2026-08-03.** For warnings, return
+   `:not_relevant` when `badge_warning_effective_date` has passed;
    `WARN_NOTIFY_PROJECT_FIELDS` already selects that column. For
    losses, the regained-badge check already exists inside
    `send_loss_email`; express it through 3a's vocabulary so both series
    use one mechanism rather than two.
+
+   The loss half needed no work: step 3a had already converted that
+   check to `:not_relevant`, so this step was the warning guard alone.
+   Each guard lives in its own mailer helper, parallel to the other,
+   rather than in `send_notifications`. The two tests have nothing in
+   common beyond their answer, and putting them in the descriptor would
+   have meant the lambdas that concern 7 deliberately keeps out of it.
+
+   **A warning with no recorded date is sent, not skipped.** This is a
+   decision, not an oversight, and it is the reason the guard tests the
+   date rather than trusting it: we cannot show a deadline has passed
+   when we do not know what it was. The two ways to be wrong are not
+   equal. Sending states the deadline as blank; skipping discards the
+   notification for good and says nothing, which is the exact failure
+   this document exists to prevent. `save_warning_columns` always
+   records a date, so a missing one is a data fault we should not
+   compound by going quiet. It also turns out that no fixture sets that
+   column, so the opposite choice would have quietly broken six
+   existing tests into passing for the wrong reason.
+
+   The boundary is inclusive: a warning whose deadline is today is
+   still sent, because that date is the last day the warning is true
+   rather than the first day it is stale.
 4. **Step 3d: suppression defers.** An owner we cannot email keeps
    their pending flag instead of losing it. It is separated from 3c
    because it is the step that creates permanently pending rows, which

@@ -1325,17 +1325,29 @@ class Project < ApplicationRecord
   end
 
   # Deliver one warning-notification email.
-  # Unlike send_loss_email, there is no "already-regained" check — the badge
-  # has not been lost yet, so the warning is always valid at send time.
+  #
+  # A warning states a deadline, so it stops meaning anything once that
+  # deadline is behind us: the badge has by then been lost or kept, and
+  # either way the message would announce a date in the past.  This is
+  # what the 11 stale flags of 2026-07-31 would have done had they not
+  # been cleared by hand; see docs/warning_failures.md.
+  #
+  # A project with no recorded date is warned rather than skipped.  We
+  # cannot show a deadline has passed when we do not know what it was,
+  # and the two ways to be wrong here are not equal: sending states the
+  # deadline as blank, while skipping discards the notification for good
+  # and says nothing.  save_warning_columns always records a date, so
+  # this case is a data fault we should not compound by going quiet.
+  #
   # @param project [Project] the project at risk of losing its badge
   # @param user [User] the project owner (pre-fetched, avoids N+1)
   # @param old_level [String] the badge level that will be lost
   # @param badge_suffix [String] 'badge' or 'baseline'
-  # @return [Symbol] always :sent; a warning is valid at send time, and
-  #   answering in the same vocabulary as send_loss_email lets one caller
-  #   handle both.  Step 3c adds a :not_relevant case here, for a warning
-  #   whose effective date has passed.
+  # @return [Symbol] :sent, or :not_relevant if the deadline has passed
   def self.send_warning_email(project, user, old_level, badge_suffix)
+    deadline = project.badge_warning_effective_date
+    return :not_relevant if deadline && deadline < Time.zone.today
+
     ReportMailer.warn_owner_with_user(project, user, old_level,
                                       badge_suffix).deliver_now
     :sent
