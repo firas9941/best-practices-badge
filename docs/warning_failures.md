@@ -368,6 +368,14 @@ Note the general lesson for answering "was this user emailed?": the
 delivery. `solid_queue_jobs` is, and it was the only source that could
 settle the question.
 
+**That is reversed by step 3b**, which switched these two loops to
+`deliver_now`. From that point they enqueue no job at all, so
+notification mail leaves no trace in `solid_queue_jobs`, and
+`last_loss_sent_at` and `last_warning_sent_at` become the record of
+delivery, which is the entire point of design 6B. A future investigation
+that reaches for `solid_queue_jobs` first, as this one did, will find
+nothing and must not read that as nothing having been sent.
+
 ### A discrepancy worth noting
 
 The task reported 16 emails on 2026-07-22 (5 loss plus 11 warning) but
@@ -1427,14 +1435,29 @@ receives.
    equivalence; the existing tests in `test/integration/recalc_test.rb`
    passed with one mechanical change, a block returning `true` that now
    returns `:sent`.
-2. **Step 3b: `deliver_now` (design 6B).** One line in each of
-   `send_loss_email` and `send_warning_email`, so `last_*_sent_at`
-   records a delivery rather than an enqueue. This is safe to land
-   before any failure handling exists, and the reason is worth stating:
-   the flag is already cleared *after* the yield, so an SMTP exception
-   aborts the run with the flag still set, and the next night retries.
-   No duplicate is possible in that window. Tests move from
-   `assert_enqueued_emails` to `assert_emails`.
+2. **Step 3b: `deliver_now` (design 6B). Done 2026-08-03.** One line in
+   each of `send_loss_email` and `send_warning_email`, so
+   `last_*_sent_at` records a delivery rather than an enqueue. This is
+   safe to land before any failure handling exists, and the reason is
+   worth stating: the flag is already cleared *after* the yield, so an
+   SMTP exception aborts the run with the flag still set, and the next
+   night retries. No duplicate is possible in that window. Tests move
+   from `assert_enqueued_emails` to `assert_emails`.
+
+   Two things this turned up. First, mail templates were checked before
+   the change for anything the tight `SELECT` lists do not load;
+   `lost_level.text.erb` and `warned_level.text.erb` use only
+   precomputed instance variables, and `Project` does not override
+   `to_param`, so rendering a partially loaded record is safe. Under
+   `deliver_later` this would not have mattered, because Active Job
+   serializes through a Global ID and the job reloads the record in
+   full. Anything later added to those templates now has to be in
+   `LOSS_NOTIFY_PROJECT_FIELDS` or `WARN_NOTIFY_PROJECT_FIELDS`.
+
+   Second, these tests never rendered the mail at all before, since
+   `deliver_later` only enqueued it; line coverage rose by 37 lines when
+   they started delivering for real. The mailer and its templates had
+   been exercised only by the mailer tests.
 3. **Step 3c: relevance guards.** For warnings, return `:not_relevant`
    when `badge_warning_effective_date` has passed;
    `WARN_NOTIFY_PROJECT_FIELDS` already selects that column. For
@@ -1442,10 +1465,31 @@ receives.
    `send_loss_email`; express it through 3a's vocabulary so both series
    use one mechanism rather than two.
 4. **Step 3d: suppression defers.** An owner we cannot email keeps
-   their pending flag instead of losing it. Two lines and their tests.
-   It is separated from 3c because it is the step that creates
-   permanently pending rows, which is the fact step 3f has to be built
-   around.
+   their pending flag instead of losing it. It is separated from 3c
+   because it is the step that creates permanently pending rows, which
+   is the fact step 3f has to be built around.
+
+   Noticed while doing 3b, and larger than the "two lines" this step
+   was first scoped at: `send_notifications` and the mailers disagree
+   about what "can email" means. The loop checks
+   `important_notifications?` and `encrypted_email.present?`, while
+   `email_owner_with_user` and `warn_owner_with_user` *also* return
+   early when the address cannot be decrypted, when `email?` is false,
+   or when the address has no `@`. An owner failing only the mailer's
+   checks is counted as `:sent` and has their flag cleared, though no
+   mail exists. That is a second source of the overcount this document
+   attributes to `send_loss_email` alone, and it applies to warnings
+   too.
+
+   It matters here specifically because project 12038, the pending
+   project the report renders as `Alesso <>`, is very likely this case
+   rather than a blank `encrypted_email`. If so, 3d as originally
+   scoped would not defer it at all; it would keep counting and
+   clearing it exactly as today. So 3d must move the address test to
+   one place that both the loop and the mailers agree on, and return
+   `:suppressed` for every reason the mailers currently swallow.
+   Confirm 12038's actual state against production before assuming
+   which check it fails.
 5. **Step 3e-1: the attempt columns and their reset. No behavior
    change.** The migration adding `warning_send_attempts` and
    `loss_send_attempts`, each with a `comment:`, **and** the reset

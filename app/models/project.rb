@@ -1198,6 +1198,21 @@ class Project < ApplicationRecord
   # cleared whatever the outcome, so a notification is never retried;
   # changing that is a separate step, see docs/warning_failures.md.
   #
+  # Mail is delivered synchronously (deliver_now), as
+  # ProjectsController.send_reminders already does at a larger volume, so
+  # that the outcome of delivery is known here.  With deliver_later the
+  # loop learned only that a job had been enqueued, which is why
+  # last_loss_sent_at and last_warning_sent_at could not honestly claim to
+  # record deliveries.  The cost is that SMTP latency now sits in the
+  # nightly task, bounded by +cap+.
+  #
+  # There is no rescue here yet, so a delivery that raises ends the run.
+  # That is deliberately safe in the meantime: the flag is cleared only
+  # after the send returns, so an interrupted run leaves the remaining
+  # flags set and the next night picks them up.  No notification is lost
+  # and none is duplicated.  Step 3e-2 replaces the abort with
+  # classification and a bounded retry.
+  #
   # @param pending [ActiveRecord::Relation] projects with a pending flag
   # @param cap [Integer] most emails to send in this run
   # @param series [Hash] one entry of NOTIFICATION_SERIES
@@ -1280,7 +1295,7 @@ class Project < ApplicationRecord
     end
 
     ReportMailer.email_owner_with_user(project, user, old_level, new_level,
-                                       true, badge_suffix).deliver_later
+                                       true, badge_suffix).deliver_now
     :sent
   end
   private_class_method :send_loss_email
@@ -1322,7 +1337,7 @@ class Project < ApplicationRecord
   #   whose effective date has passed.
   def self.send_warning_email(project, user, old_level, badge_suffix)
     ReportMailer.warn_owner_with_user(project, user, old_level,
-                                      badge_suffix).deliver_later
+                                      badge_suffix).deliver_now
     :sent
   end
   private_class_method :send_warning_email

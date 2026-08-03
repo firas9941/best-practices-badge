@@ -124,19 +124,19 @@ class RecalcTest < ActionDispatch::IntegrationTest
 
   # --- send_loss_notifications tests ---
 
-  test 'send_loss_notifications enqueues email and clears column' do
+  test 'send_loss_notifications sends email and clears column' do
     project = projects(:one)
     project.update_column(:unreported_badge_loss, 1) # rank of 'passing'
-    assert_enqueued_emails(1) do
+    assert_emails(1) do
       Project.send_loss_notifications
     end
     assert_equal 0, Project.find(project.id).unreported_badge_loss
   end
 
-  test 'send_loss_notifications enqueues baseline email and clears column' do
+  test 'send_loss_notifications sends baseline email and clears column' do
     project = projects(:one)
     project.update_column(:unreported_baseline_badge_loss, 1) # rank of 'baseline-1'
-    assert_enqueued_emails(1) do
+    assert_emails(1) do
       Project.send_loss_notifications
     end
     assert_equal 0, Project.find(project.id).unreported_baseline_badge_loss
@@ -146,7 +146,7 @@ class RecalcTest < ActionDispatch::IntegrationTest
     project = projects(:one)
     project.user.update_column(:important_notifications, false)
     project.update_column(:unreported_badge_loss, 1)
-    assert_enqueued_emails(0) do
+    assert_emails(0) do
       Project.send_loss_notifications
     end
     assert_equal 0, Project.find(project.id).unreported_badge_loss
@@ -158,7 +158,7 @@ class RecalcTest < ActionDispatch::IntegrationTest
     # current — the badge was regained — so no email should be sent.
     project = projects(:perfect_passing)
     project.update_column(:unreported_badge_loss, 1)
-    assert_enqueued_emails(0) do
+    assert_emails(0) do
       Project.send_loss_notifications
     end
     assert_equal 0, Project.find(project.id).unreported_badge_loss
@@ -178,10 +178,10 @@ class RecalcTest < ActionDispatch::IntegrationTest
   test 'send_loss_notifications does not repeat on a second run' do
     project = projects(:one)
     project.update_column(:unreported_badge_loss, 1)
-    assert_enqueued_emails(1) do
+    assert_emails(1) do
       Project.send_loss_notifications
     end
-    assert_enqueued_emails(0) do
+    assert_emails(0) do
       Project.send_loss_notifications
     end
   end
@@ -189,10 +189,10 @@ class RecalcTest < ActionDispatch::IntegrationTest
   test 'send_loss_notifications does not repeat baseline mail on a second run' do
     project = projects(:one)
     project.update_column(:unreported_baseline_badge_loss, 1)
-    assert_enqueued_emails(1) do
+    assert_emails(1) do
       Project.send_loss_notifications
     end
-    assert_enqueued_emails(0) do
+    assert_emails(0) do
       Project.send_loss_notifications
     end
   end
@@ -303,7 +303,7 @@ class RecalcTest < ActionDispatch::IntegrationTest
     end
   end
 
-  # The counter must report mail actually enqueued.  perfect_passing has
+  # The counter must report mail actually sent.  perfect_passing has
   # regained the level, so send_loss_email returns :not_relevant and
   # nothing is sent; the count previously included such projects anyway.
   test 'send_loss_notifications does not count declined mail' do
@@ -380,19 +380,19 @@ class RecalcTest < ActionDispatch::IntegrationTest
 
   # --- send_warning_notifications tests ---
 
-  test 'send_warning_notifications enqueues email and clears column' do
+  test 'send_warning_notifications sends email and clears column' do
     project = projects(:one)
     project.update_column(:unreported_badge_warning, 1) # rank of 'passing'
-    assert_enqueued_emails(1) do
+    assert_emails(1) do
       Project.send_warning_notifications
     end
     assert_equal 0, Project.find(project.id).unreported_badge_warning
   end
 
-  test 'send_warning_notifications enqueues baseline email and clears column' do
+  test 'send_warning_notifications sends baseline email and clears column' do
     project = projects(:one)
     project.update_column(:unreported_baseline_badge_warning, 1)
-    assert_enqueued_emails(1) do
+    assert_emails(1) do
       Project.send_warning_notifications
     end
     assert_equal 0, Project.find(project.id).unreported_baseline_badge_warning
@@ -402,7 +402,7 @@ class RecalcTest < ActionDispatch::IntegrationTest
     project = projects(:one)
     project.user.update_column(:important_notifications, false)
     project.update_column(:unreported_badge_warning, 1)
-    assert_enqueued_emails(0) do
+    assert_emails(0) do
       Project.send_warning_notifications
     end
     assert_equal 0, Project.find(project.id).unreported_badge_warning
@@ -419,10 +419,10 @@ class RecalcTest < ActionDispatch::IntegrationTest
   test 'send_warning_notifications does not repeat on a second run' do
     project = projects(:one)
     project.update_column(:unreported_badge_warning, 1)
-    assert_enqueued_emails(1) do
+    assert_emails(1) do
       Project.send_warning_notifications
     end
-    assert_enqueued_emails(0) do
+    assert_emails(0) do
       Project.send_warning_notifications
     end
   end
@@ -430,10 +430,10 @@ class RecalcTest < ActionDispatch::IntegrationTest
   test 'send_warning_notifications does not repeat baseline mail on a second run' do
     project = projects(:one)
     project.update_column(:unreported_baseline_badge_warning, 1)
-    assert_enqueued_emails(1) do
+    assert_emails(1) do
       Project.send_warning_notifications
     end
-    assert_enqueued_emails(0) do
+    assert_emails(0) do
       Project.send_warning_notifications
     end
   end
