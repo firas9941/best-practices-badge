@@ -532,10 +532,6 @@ else
   end
 end
 
-desc 'Stub do-nothing jobs:work task to eliminate Heroku log complaints'
-task 'jobs:work' do
-end
-
 desc 'Run in fake_production mode'
 # This tests the asset pipeline
 task :fake_production do
