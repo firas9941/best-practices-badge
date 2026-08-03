@@ -54,17 +54,25 @@ end
 # mode constants can be reloaded but initializers only run once at boot.
 fastly_api_key = ENV.fetch('FASTLY_API_KEY', nil)
 fastly_service_id = ENV.fetch('FASTLY_SERVICE_ID', nil)
+
+# We *must* do this in after_initialize, not directly in this initializer.
+# Zeitwerk's main autoloader is set up in Rails' Finisher, which runs
+# *after* config/initializers, so constants autoloaded from app/ (such as
+# FastlyRails) cannot be resolved here.  This code used to call
+# FastlyRails directly, so it raised NameError on every boot.  NameError
+# is a StandardError, so the rescue below caught it and logged it as a
+# possible network problem.  In other words, this check never checked
+# anything, and the log gave a misleading reason.  See
+# docs/warning_failures.md.  In after_initialize the autoloader is ready,
+# and we still run before the web server accepts any requests.
 if !Rails.env.test? && fastly_api_key.present? && fastly_service_id.present?
-  begin
+  Rails.application.config.after_initialize do
     response = HTTParty.get(
       "https://api.fastly.com/service/#{fastly_service_id}",
       headers: { 'Fastly-Key': fastly_api_key, 'User-Agent': USER_AGENT },
       timeout: 5
     )
     if response.success?
-      # FastlyRails is Zeitwerk-autoloaded (app/lib/), but calling it here is
-      # acceptable: initializers run after the autoloader is active, and we are
-      # not caching the constant for use after a potential reload.
       FastlyRails.log_service_name(
         response['name'],
         ENV.fetch('FASTLY_SERVICE_NAME_EXPECTED', nil),
@@ -78,10 +86,25 @@ if !Rails.env.test? && fastly_api_key.present? && fastly_service_id.present?
         'CDN purges will fail silently until this is resolved.'
       )
     end
-  rescue StandardError => e
+  # Only claim a network problem when we really had one.  We list the
+  # network exception classes on purpose; the old blanket rescue is what
+  # let a bug in our own code look like a Fastly outage.
+  rescue HTTParty::Error, SocketError, OpenSSL::SSL::SSLError,
+         Net::OpenTimeout, Net::ReadTimeout, Errno::ECONNREFUSED,
+         Errno::ECONNRESET, EOFError => e
     Rails.logger.warn(
-      "FASTLY WARNING: Cannot reach Fastly API at startup (#{e.class}: #{e}). " \
-      'This may be a transient network issue; CDN purge ability is unconfirmed.'
+      'FASTLY WARNING: Cannot reach Fastly API at startup ' \
+      "(#{e.class}: #{e}). This may be a transient network issue; " \
+      'CDN purge ability is unconfirmed.'
+    )
+  # Anything else is a bug in this check itself, not a problem at Fastly,
+  # so say that instead.  This is still non-fatal; if we can't verify the
+  # CDN that's no reason to refuse to start.
+  rescue StandardError => e
+    Rails.logger.error(
+      'FASTLY CHECK BUG: the startup credential check itself failed ' \
+      "(#{e.class}: #{e}). This is our bug, not a Fastly outage. " \
+      'CDN purge ability is unconfirmed.'
     )
   end
 end
