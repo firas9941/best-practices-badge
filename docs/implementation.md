@@ -379,8 +379,11 @@ to make sure that migrations by *themselves* don't directly execute
 the time-consuming process of recalculating all projects.)
 
 **If your migration will change some percentage calculations**,
-make *sure* you run `rake production_to_main` before merging into `main`,
-to prevent spurious warnings to projects about them losing badges.
+the tier it runs on needs current production data first, or projects
+will get spurious warnings about losing badges.
+You don't have to remember to do this: `rake deploy_staging` depends on
+`rake production_to_staging`, which restores the latest production
+backup into staging before the deploy.
 
 Once you've created the migration file, check it first by running
 "rake rubocop".  This will warn you of some potential issues, and

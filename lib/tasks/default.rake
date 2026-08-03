@@ -492,28 +492,11 @@ task :pull_production_alternative do
      '           -d development db/latest.dump'
 end
 
-desc 'Copy active main database into development (requires access privs)'
-task :pull_main do
-  puts 'Getting main database'
-  Rake::Task['drop_database'].reenable
-  Rake::Task['drop_database'].invoke
-  sh 'heroku pg:pull DATABASE_URL development --app master-bestpractices'
-  Rake::Task['db:migrate'].reenable
-  Rake::Task['db:migrate'].invoke
-end
-
 # This just copies the most recent backup of production; in almost
 # all cases this is adequate, and this way we don't disturb production
 # unnecessarily.  If you want the current active database, you can
 # force a backup with:
 # heroku pg:backups:capture --app production-bestpractices
-desc 'Copy production database backup to main stage, overwriting main database'
-task :production_to_main do
-  sh 'heroku pg:backups:restore $(heroku pg:backups:url ' \
-     '--app production-bestpractices) DATABASE_URL --app master-bestpractices'
-  sh 'heroku run:detached bundle exec rake db:migrate --app master-bestpractices'
-end
-
 desc 'Copy production database backup to staging, overwriting staging database'
 task :production_to_staging do
   sh 'heroku pg:backups:restore $(heroku pg:backups:url ' \
@@ -802,7 +785,7 @@ end
 # You can run a SQL command to do this instead, but an error such as
 # forgetting the WHERE clause can cause a big mistake. The statement would be:
 # echo "UPDATE projects SET user_id = {OWNER_NUM} WHERE id = {PROJECT_NUM}" | \
-#  heroku pg:psql --app master-bestpractices
+#  heroku pg:psql --app production-bestpractices
 
 desc 'Change owner of PROJECT. rake change_owner -- PROJECT_NUM NEW_OWNER_NUM'
 task change_owner: :environment do
