@@ -1601,17 +1601,13 @@ receives.
    the count belongs to the notification still pending, not to the run.
    The migration was rolled back and re-applied to confirm it reverses.
 
-   **These two columns are published in the project JSON API.**
-   `app/views/projects/_project.json.jbuilder` emits every attribute of
-   the record, with no exclusion list, so `loss_send_attempts` and
-   `warning_send_attempts` now appear in `/projects/:id.json` beside
-   `unreported_badge_loss`, `last_loss_sent_at`, and `lock_version`,
-   which are already published the same way. Nothing here is sensitive
-   and the behavior matches how this table's other bookkeeping columns
-   are already treated, so this step did not change it. Whether that
-   whole class of column belongs in a public API is a real question,
-   but removing fields is a breaking API change and deserves its own
-   decision rather than riding along with a notification fix.
+   **These two columns were briefly published in the project JSON API,
+   and are not any more.** `_project.json.jbuilder` emitted every
+   attribute with no exclusion list, so they appeared in
+   `/projects/:id.json` beside `unreported_badge_loss`,
+   `last_loss_sent_at`, and `lock_version`. That was resolved before
+   this branch merged, in set 5, which is why the counters never became
+   public API in a released version.
 6. **Step 3e-2: classification and the bounded retry. Done
    2026-08-03.** The transient and permanent exception lists, with
    anything unrecognized treated as transient; a `rescue` in
@@ -1754,6 +1750,45 @@ other way round, which is what makes this change worth having.
 A recalculation that changes nothing now costs the CDN nothing at all,
 where before it cold-started the cache of an extremely busy site every
 time.
+
+### Set 5: stop publishing badging-process bookkeeping
+
+Done 2026-08-03. `app/views/projects/_project.json.jbuilder` emitted
+every one of a project's 450 columns, so `/projects/:id.json` published
+our notification flags, sent-at timestamps, delivery attempt counters,
+`last_reminder_at`, `lock_version`, and the per-level `*_saved`
+edit-automation flags. `Project::BOOKKEEPING_FIELDS` now names those and
+the view withholds them.
+
+This is in the branch for two reasons, one urgent and one structural.
+
+The urgent one: `loss_send_attempts` and `warning_send_attempts` are new
+here and had never shipped. Publishing a field is easy and withdrawing
+one is a breaking API change, so the moment to decide was before the
+merge, not after.
+
+The structural one is the more interesting. Because the JSON published
+everything, every bookkeeping write changed a CDN-cached response, which
+made *every* write a write that must purge. That is how
+`send_reminders` came to leave stale cached JSON for ten days at a time
+without anyone noticing, and the same was true of
+`write_notification_columns` and `save_warning_columns` in this very
+branch. Withholding these columns removes the reason those writes
+invalidate anything, which is a better answer than adding a purge to
+each of them and accepting nightly CDN churn for fields nobody reads.
+
+The constant is deliberately a list of what to **withhold**, not what to
+publish. New project data should reach the JSON without anyone having to
+ask; only a column that answers "what has the badge application done
+lately" belongs on the list. A model test asserts every name in it is a
+real column, since a typo would silently publish the field it was meant
+to withhold.
+
+It is also the seed for
+[section 11](cdn-cache-not-logged-in.md#11-potential-future-work-purge-the-cdn-from-a-model-callback) of the CDN document:
+these are exactly the columns whose change cannot make any cached page
+stale, so a future purge callback can skip a write that touched only
+them.
 
 ### Separable, any time
 

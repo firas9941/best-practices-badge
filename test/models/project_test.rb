@@ -24,6 +24,13 @@ class ProjectTest < ActiveSupport::TestCase
     assert @project_built.valid?
   end
 
+  # A misspelled entry here would withhold nothing and publish the real
+  # column silently, which is the failure this list exists to prevent.
+  test 'every bookkeeping field is a real column' do
+    unknown = Project::BOOKKEEPING_FIELDS - Project.column_names.to_set
+    assert_empty unknown, "not projects columns: #{unknown.to_a}"
+  end
+
   test 'user id should be present' do
     @project_built.user_id = nil
     assert_not @project_built.valid?

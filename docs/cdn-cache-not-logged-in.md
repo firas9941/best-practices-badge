@@ -1380,21 +1380,29 @@ supposed to remove.
 `after_commit` on any update purges whenever *any* column changes,
 including ones absent from every cached representation.
 
-Today that objection is nearly moot, but for an unstable reason:
-`app/views/projects/_project.json.jbuilder` emits **every** attribute
-with no exclusion list, and `show_json` is CDN-cached, so almost no field
-is genuinely hidden. Give that view a sensible field list, which is
-independently worth doing, and the objection becomes live.
+When this objection was first raised it was nearly moot, because
+`app/views/projects/_project.json.jbuilder` emitted **every** attribute
+and `show_json` is CDN-cached, so almost no field was genuinely hidden.
+**That is no longer true.** `Project::BOOKKEEPING_FIELDS` now names the
+columns that record how we run the badging process rather than anything
+about the project, and the JSON view withholds them: the notification
+flags and timestamps, the delivery attempt counters, the warning
+effective date, `last_reminder_at`, `disabled_reminders`,
+`lock_version`, and the per-level `*_saved` edit-automation flags.
 
-The fix makes both problems one problem. Gate the purge on
-`saved_changes.keys` intersected with the set of fields that appear in a
-cached representation, and define that set once:
+So the objection is live, and the same list is most of its answer. Gate
+the purge on `saved_changes.keys` and skip when every changed column is
+in `BOOKKEEPING_FIELDS`, because by construction nothing cached shows
+them. That constant was written with this section in mind and is the
+place to extend if more columns turn out not to reach any cached page.
 
-* it is the JSON view's field list, and
-* it is the purge trigger set.
-
-Deciding it once is better than the status quo in a way the naive
-callback is not.
+Note what this does to the *first* objection as well. Two of the three
+callback-skipping write paths — `write_notification_columns` and
+`save_warning_columns` — now touch only bookkeeping columns, so they
+have nothing cached to invalidate and their invisibility to callbacks
+stops mattering. `set_level_saved_flag` writes only `*_saved`, likewise.
+Whether that leaves *any* real gap for the callback to close is the
+question to answer before building it.
 
 #### What changed underneath the proposal since it was written
 

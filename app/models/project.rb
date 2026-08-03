@@ -155,6 +155,37 @@ class Project < ApplicationRecord
   ALL_CRITERIA_JUSTIFICATION = Criteria.all.map(&:justification).freeze
   ALL_CRITERIA_JUSTIFICATION_STRINGS =
     ALL_CRITERIA_JUSTIFICATION.map(&:to_s).freeze
+
+  # Columns that record how *we* run the badging process, as opposed to
+  # anything about the project or its owner.  The published JSON is meant
+  # to describe the project; when we last emailed someone about it, how
+  # many delivery attempts we have made, and which edit form they have
+  # opened are our business, not the reader's.
+  #
+  # Adding a column does NOT normally belong here.  New project data
+  # should appear in the JSON without anyone having to ask, which is why
+  # this is a list of what to withhold rather than a list of what to
+  # publish.  Add to it only when a column answers "what has the badge
+  # application done lately", not "what is this project like".
+  #
+  # A Set built once at startup: the JSON view consults it for every one
+  # of a project's 450 columns, on every cache miss.
+  #
+  # These are also, not by coincidence, the columns whose change cannot
+  # make any cached page stale, since nothing cached shows them.  That
+  # makes this list the natural starting point for deciding which writes
+  # must purge the CDN; see docs/cdn-cache-not-logged-in.md section 11.
+  BOOKKEEPING_FIELDS = (
+    %w[
+      lock_version
+      last_reminder_at disabled_reminders
+      unreported_badge_loss unreported_baseline_badge_loss
+      unreported_badge_warning unreported_baseline_badge_warning
+      last_loss_sent_at last_warning_sent_at
+      loss_send_attempts warning_send_attempts
+      badge_warning_effective_date
+    ] + Sections::LEVEL_SAVED_FLAGS.values.map(&:to_s)
+  ).to_set.freeze
   # Achievement status fields are internal tracking fields that keep raw integer values
   # (not converted to/from strings like criteria status fields)
   ACHIEVEMENT_STATUS_FIELDS = %i[

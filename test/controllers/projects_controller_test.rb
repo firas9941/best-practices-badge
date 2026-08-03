@@ -489,6 +489,23 @@ class ProjectsControllerTest < ActionDispatch::IntegrationTest
     assert_equal 'in_progress', body['badge_level']
   end
 
+  # The JSON describes the project; it is not a window into how we run
+  # the badging process.  Withholding these also means a write that only
+  # touches them cannot make a cached page stale.
+  test 'project JSON withholds badging-process bookkeeping' do
+    get "/projects/#{@project.id}.json"
+    assert_response :success
+    body = response.parsed_body
+    Project::BOOKKEEPING_FIELDS.each do |field|
+      assert_not body.key?(field), "#{field} should not be published"
+    end
+    # ...while still publishing what the project actually is.
+    assert_equal 'Pathfinder OS', body['name']
+    assert body.key?('badge_percentage_0')
+    assert body.key?('achieved_passing_at')
+    assert body.key?('user_id')
+  end
+
   test 'should show project JSON data without locale' do
     get "/projects/#{@project.id}.json"
     assert_response :success
