@@ -276,16 +276,10 @@ and delete `dockerfiles/`.
 * **Con.** If we ever need a package again, we need somewhere to put
   it. See approach B.
 
-For the automation half: **Dependabot has no CircleCI ecosystem**, so it
-cannot bump this pin. **Renovate does**: its `circleci` manager supports
-the `docker` and `orb` datasources, so one bot can keep both the image
-digest and the `browser-tools` orb current, by pull request, with CI
-proving each bump before it merges. Adding Renovate is a new tool for
-this project, which is the main cost of this approach.
-
-A smaller alternative is a scheduled GitHub Actions workflow that
-resolves the current digest for the tag and opens a pull request when it
-differs. Less capable than Renovate, but no new service.
+For the automation half, this approach depends entirely on a bot being
+able to bump a digest inside `.circleci/config.yml`, which Dependabot
+cannot do. See
+[Keeping the remaining pins current](#keeping-the-remaining-pins-current-renovate-not-dependabot).
 
 #### Approach B: keep a custom image, but build it automatically
 
@@ -367,10 +361,31 @@ result as the tag of the image we push:
 badgeapp-test:<base-digest>-<dockerfile-hash>-<ruby-version>
 ```
 
-Then the pipeline's first job asks the registry whether that tag exists.
-If it does, which is nearly always, the job ends in seconds and the test
-job pulls the image exactly as it does today. If it does not, the job
-builds and pushes it, and every later run hits it.
+**On the common path the pipeline should do no extra work at all.** An
+earlier draft of this section proposed a job that checks the registry
+and exits when the tag already exists. The check itself is a single
+registry request, so it costs milliseconds, but a CircleCI job is a
+fresh container: starting one costs seconds whatever it then does. Ten
+seconds added to every pull request, to discover that nothing needs
+doing, is a bad trade.
+
+So do not check on the common path. Let a **scheduled job** be the only
+thing that builds and pushes, and let ordinary pipelines simply use the
+image. That is zero added time, not a fast check.
+
+Two triggers are enough:
+
+* **On a schedule**, resolve the current base digest and rebuild if the
+  key has changed. This is what keeps us current.
+* **When the inputs change**, that is on a pull request touching
+  `dockerfiles/` or `.ruby-version`, build before testing. Rare, and
+  exactly when someone wants the new image tested.
+
+A rebuild takes minutes, because Ruby has to be compiled. That is
+acceptable and worth saying plainly: it is work that has to happen
+somewhere to stay current, and until now it happened by hand, or more
+accurately did not happen. Minutes of machine time on a schedule is a
+better place for it than a person's afternoon.
 
 Keying on the base digest is what makes this stay current without
 anyone deciding to update it. When Heroku rebuilds the stack image, and
@@ -409,26 +424,9 @@ machinery:
    executors start more slowly than Docker executors, which spends
    some of the test time we are protecting.
 
-**The cost to watch is the cache miss, not the cache hit.** A miss has
-to install Ruby, and Heroku's own prebuilt Ruby tarballs are not
-publicly readable, so we would compile it. That is minutes, not
-seconds, and with the scheme above it lands on whoever's pull request
-happens to be first after Heroku rebuilds their stack image.
-
-Two ways to keep that off a developer's pull request:
-
-* **Rebuild on a schedule as well as on demand.** A nightly or weekly
-  job warms the cache for the current base digest, so ordinary pull
-  requests almost always hit it. The on-demand path stays as a
-  correctness backstop for when someone edits the Dockerfile.
-* **Let a miss fall back to the last good image** rather than blocking,
-  and let the scheduled job do the real build. Faster, but it means a
-  pull request can be tested on a slightly older image than the one it
-  asked for, which is a subtle thing to debug later. Prefer the first.
-
-With a scheduled warm-up, the honest description of the steady state is
-that the pipeline gains one job that takes a few seconds and does
-nothing, and we never build an image by hand again.
+With the scheduled trigger doing the building, the steady state is that
+ordinary pipelines are unchanged, and we never build an image by hand
+again.
 
 #### Approach A revisited, given approach D
 
@@ -447,6 +445,45 @@ problem in front of us, staleness, rather than the one we were asked to
 solve, which is that the test and production environments differ and
 that keeping them together has been too hard. D is the answer to that
 question. A is the answer to a different one.
+
+#### Keeping the remaining pins current: Renovate, not Dependabot
+
+Whichever approach is taken, `.circleci/config.yml` still pins things
+that are not ours and that nothing rebuilds for us: the
+`circleci/browser-tools` orb, the `cimg/postgres` secondary image, and
+the `cimg/node` image the deploy job now uses. Those want a bot.
+
+**Dependabot cannot do it.** It has no CircleCI support at all, so it
+never reads `.circleci/config.yml`. This is checkable rather than a
+matter of opinion: `dependabot/dependabot-core` carries one directory
+per supported ecosystem, 43 of them, including `bundler`, `docker`,
+`github_actions`, and `npm_and_yarn`, and there is no `circleci`
+directory among them. Its `docker` ecosystem reads Dockerfiles, not CI
+configurations, so it can bump a `FROM` line but not an `image:` line.
+
+**Renovate can.** It has a `circleci` manager whose documentation states
+that it "supports extracting the following datasources: docker, orb", so
+one bot handles both the image references and the orb versions in that
+file, by pull request, with our own CI proving each bump before it
+merges.
+
+They are complementary rather than competing, and using both is
+reasonable:
+
+| Tool | Covers here |
+| ---- | ----------- |
+| Dependabot | `Gemfile`, npm, GitHub Actions workflows, `dockerfiles/*/Dockerfile` |
+| Renovate | `.circleci/config.yml`: executor images and orb versions |
+
+One practical caution: run Renovate with `enabledManagers` limited to
+`circleci`. Left at its defaults it will also read the Gemfile and the
+Dockerfiles, and open pull requests competing with Dependabot's for the
+same upgrades. Keeping each tool in its own lane is what makes running
+two of them pleasant rather than noisy.
+
+Note that under approach D the test image's own tag needs no bot at
+all, because the scheduled build maintains it. Renovate's job is the
+third-party pins around it.
 
 #### Approach E: build the image inside the test job
 
