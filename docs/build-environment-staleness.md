@@ -135,7 +135,27 @@ where 22.04 ships 3.0.2). That was a side effect of choosing a
 browser-free image, not a decision.
 
 Heroku also reports that Heroku-26 is available, so the gap will widen
-if the stack is upgraded before the test image is.
+if the stack is upgraded before the test image is. Upgrading production
+to Heroku-26 while CI stays where it is would put two LTS releases
+between them.
+
+**This gap cannot be closed with a stock CircleCI image while we are on
+Ruby 3.4.** CircleCI pins an operating system per Ruby line, not per
+image tag:
+
+| cimg-ruby line | Base | Ubuntu |
+| -------------- | ---- | ------ |
+| 3.4 | `cimg/base:2026.03-22.04` | 22.04 |
+| 4.0 | `cimg/base:2026.03` | 24.04 |
+
+`cimg/base:2026.03` and `cimg/base:2026.03-24.04` have the same digest,
+`sha256:fdfacc6c…`, so the unsuffixed tag is the 24.04 one. Every
+`cimg/ruby:3.4.x` image, current or not, is Ubuntu 22.04 and will stay
+that way. Ruby 4.0 is where CircleCI moved to 24.04, and nothing they
+publish is on 26.04 at all.
+
+So "use a current stock image" fixes the age of our test environment
+without touching the operating system it runs.
 
 ## Finding 5: the production build installs an unpinned Node
 
@@ -300,28 +320,55 @@ Capybara driving the remote browser.
 
 Reasonable later; not the first move.
 
-#### Approach D: match production's operating system
+#### Approach D: build on the same stack image production uses
 
-Production builds on **Heroku-24**, which is Ubuntu 24.04. Every
-`cimg/ruby` image is still Ubuntu 22.04: `cimg-ruby`'s 3.4 Dockerfile
-reads `FROM cimg/base:2026.03-22.04`. So **no stock CircleCI Ruby image
-closes finding 4 today.**
+Build the test image `FROM heroku/heroku:24-build` (or `26-build` when
+production moves), and install Ruby, Chrome, and chromedriver on it.
+Rebuild it automatically, as in approach B.
 
-To match production we would have to build from `heroku/heroku:24` and
-install Ruby and Chrome ourselves, which is a large custom image and
-puts us back in the situation approach A escapes.
+Heroku publishes and maintains these images. `heroku/heroku:24`, `:26`,
+and both `-build` variants exist and were last rebuilt 2026-07-29, so
+they are not an abandoned artifact we would be pinning to.
 
-* **Pro.** Genuine parity: same distribution, same system libraries.
-* **Con.** The most maintenance of any option here, for the problem we
-  are trying to stop having.
-* **Con.** Would not match production exactly anyway, since Heroku's
-  Ruby comes from its buildpack, not from apt.
+* **Pro.** It is the only approach that closes finding 4. The test
+  environment is the same distribution, the same system libraries, and
+  the same OpenSSL as production, which is where "worked in CI, failed
+  in production" actually comes from.
+* **Pro.** It tracks production. Moving to Heroku-26 becomes a one-line
+  change to the Dockerfile plus an automated rebuild, instead of
+  waiting for someone else to publish an image we can use.
+* **Pro.** It decouples our Ruby version from CircleCI's choices. We
+  are not stuck on Ubuntu 22.04 merely because we are on Ruby 3.4.
+* **Con.** It is a custom image, which is the thing we are trying to
+  stop maintaining by hand. Only worth doing together with the
+  automation in approach B; hand-built, it recreates this document.
+* **Con.** More to install than a stock image gives us: Ruby, Chrome,
+  and chromedriver, plus whatever the browser needs. That is a real
+  amount of Dockerfile to get right once.
+* **Con.** Our Ruby would not be Heroku's exact binary. Heroku's
+  buildpack fetches prebuilt Ruby tarballs that are not publicly
+  readable; the obvious S3 paths return HTTP 403. We would build or
+  install Ruby ourselves. The operating system and its libraries would
+  match, which is the part that matters for native extensions; the Ruby
+  build itself would not be byte-identical.
 
-The honest position is that OS parity and low maintenance are in
-tension, and low maintenance has been the thing we actually failed at.
-Take the Ruby parity that approach A gives, record the operating system
-gap, and revisit if CircleCI moves `cimg/ruby` to 24.04 or if a bug
-appears that the gap explains.
+#### Approach A revisited, given approach D
+
+Approach A and approach D optimise for different things, and the choice
+between them is a judgment about which failure we would rather have:
+
+* **A** gives us zero image maintenance and a permanent Ubuntu 22.04
+  test environment while production runs 24.04, moving to 26.04.
+* **D** gives us a matching operating system, at the cost of a custom
+  image that must be built automatically or it will rot exactly as the
+  present one did.
+
+An earlier draft of this document recommended A and proposed recording
+the operating system gap as accepted. That was optimising for the
+problem in front of us, staleness, rather than the one we were asked to
+solve, which is that the test and production environments differ and
+that keeping them together has been too hard. D is the answer to that
+question. A is the answer to a different one.
 
 #### Approach E: build the image inside the test job
 
@@ -331,14 +378,23 @@ the run, which is exactly the test time we are trying to protect.
 ## Suggested order
 
 1. **Pin Node for the production build** (finding 5). Independent,
-   cheap, and the only finding that can break a deploy.
-2. **Delete the custom test image** and point CircleCI at stock
-   `cimg/ruby:3.4.10-browsers`, pinned by digest. This takes Ruby to
-   3.4.10 at the same time, closing finding 3, and removes findings 1
-   and 2 by removing the thing that caused them. Confirm the suite
-   passes before deleting `dockerfiles/`.
-3. **Add automated digest bumps**, by Renovate or a scheduled workflow,
-   so step 2 does not decay the way the current arrangement did.
-4. **Record finding 4 as accepted**, since no stock image closes it,
-   and revisit when `cimg/ruby` moves to Ubuntu 24.04 or when a failure
-   makes the gap matter.
+   cheap, and the only finding that can break a deploy. Do this first
+   regardless of what is decided about the image.
+2. **Decide between approach A and approach D**, because the rest
+   follows from it. The question is not which is better engineering but
+   which problem we are solving: A ends image maintenance and leaves
+   the operating systems different; D makes them the same and requires
+   an image we build automatically.
+3. **Whichever is chosen, automate it before relying on it.** For A
+   that is Renovate or a scheduled workflow bumping a digest. For D it
+   is a scheduled rebuild that opens a pull request. The failure this
+   document describes is not that our image is old, it is that keeping
+   it current was manual.
+4. **Take Ruby to 3.4.10 in the same change**, closing finding 3. Under
+   A that means pinning `cimg/ruby:3.4.10-browsers`, which exists,
+   built 2026-06-30. Under D it means naming 3.4.10 in our own
+   Dockerfile.
+5. **If D is chosen, upgrade production to Heroku-26 afterwards, not
+   before.** Doing the test environment first means the stack upgrade
+   gets tested somewhere before it reaches production, which is the
+   whole point of having the environments match.
