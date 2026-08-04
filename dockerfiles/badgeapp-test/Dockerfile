@@ -22,6 +22,17 @@
 ARG BASE_IMAGE=heroku/heroku:24-build
 FROM ${BASE_IMAGE}
 
+# This label is not decoration. On ghcr.io a package pushed with a
+# personal access token is NOT linked to a repository by default, and an
+# unlinked package must be administered at the package level, which
+# needs an organisation owner. This label links it at publication time,
+# after which the package inherits the repository's access permissions,
+# so a repository admin can manage it and set it public. Without it,
+# turning the package public becomes someone else's ticket.
+LABEL org.opencontainers.image.source=https://github.com/ossf/best-practices-badge
+LABEL org.opencontainers.image.description="CI test image: Ubuntu 24.04 (Heroku-24 stack), Heroku's prebuilt Ruby, and the Node package.json pins. No browser, no JDK, no gems."
+LABEL org.opencontainers.image.licenses=MIT
+
 # Supplied by prepare-image, read from the files that already govern
 # them: .ruby-version and package.json's engines.node.  They are not
 # defaulted here, so a mismatch fails loudly instead of building

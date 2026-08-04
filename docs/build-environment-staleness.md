@@ -424,9 +424,35 @@ resolved from static configuration before any step exists to consult a
 cache. Workspaces have the same shape and the additional limit of
 living only within one workflow run.
 
-So the image must come from a registry. CircleCI's caching is still
-useful *within* `prepare-image`, for Docker layers on the rare miss, and
-that is where to apply it.
+So with the **docker executor**, the image must come from a registry.
+CircleCI's caching is still useful *within* `prepare-image`, for Docker
+layers on the rare miss, and that is where to apply it.
+
+**That is a statement about the docker executor, not about CI in
+general**, and an earlier version of this section overstated it. On a
+**machine executor**, a VM with Docker, you can restore a cached image
+tarball, `docker load` it, and run the tests inside it with
+`docker run`; no registry is involved at all. The same is true of a
+plain GitHub Actions runner.
+
+It was not chosen because it restructures a working pipeline rather
+than extending it:
+
+* PostgreSQL and Chrome are secondary containers reachable on
+  `localhost`, which is what makes `PG_HOST` and `SELENIUM_REMOTE_URL`
+  work. They would have to be started by hand on a docker network.
+* Every step runs natively in the executor today; each would have to go
+  through `docker run`, with the workspace mounted, and
+  `store_test_results` and `store_artifacts` reading host paths.
+* Machine executors start more slowly and cost more per minute.
+* A cache miss still builds the image inside the job, which is the
+  "spends the test time we are protecting" objection already recorded
+  against building in-job.
+
+So the trade is: a registry costs one push credential forever; a machine
+executor costs a one-off restructuring and slower jobs, and no
+credential. Worth revisiting if the credential ever becomes the
+sticking point.
 
 **Use `ghcr.io` under the `ossf` organisation, and make the image
 public.** That answers the complaint in finding 2, which was not about
@@ -937,18 +963,40 @@ registry correctly rather than plausibly.
 ### What is still needed to turn it on
 
 `prepare-image` is defined but not referenced by any workflow, so it
-does not run. That is deliberate: it needs two things that do not exist
-yet, and adding it before they do would simply turn CI red.
+does not run. That is deliberate: it needs a published image and a push
+credential, and wiring it in first would simply turn CI red.
 
-1. **A `ghcr.io/ossf/badgeapp-test` package**, public, so the `build`
-   job needs no pull credential.
-2. **A CircleCI context** supplying `GHCR_USER` and `GHCR_TOKEN`, the
-   token being a GitHub App installation token or fine-grained personal
-   access token with `packages: write` and nothing else, restricted to
-   the people who may hold it.
+It needs a registry, a repository in it, and a CircleCI context holding
+the push credential. **Which registry is not yet decided**, and the job
+takes it from one environment variable, `IMAGE_REPO`, so the choice is
+a one-line change either way.
 
-Then adding it to the workflow is a few lines, and step 4 points the
-`build` job at `badgeapp-test:current`.
+**`ghcr.io/ossf/badgeapp-test`** is the better long-term home: owned by
+the organisation rather than a person, which was the real complaint in
+finding 2, and its public pulls are not metered as DockerHub's are.
+Its permissions, checked 2026-08-05:
+
+* **Creating public packages** is governed by an organisation setting,
+  `Settings > Packages > Package Creation`, which only an organisation
+  **owner** can change. It may already permit them.
+* **Making a package public** needs *package* admin. A package pushed
+  with a personal access token is **not linked to a repository by
+  default**, and an unlinked package must be administered at the
+  package level, which is again owner territory.
+* That second gate is why the `Dockerfile` now carries
+  `LABEL org.opencontainers.image.source`. It links the package to this
+  repository at publication, after which the package **inherits the
+  repository's permissions**, so a repository admin can manage it and
+  set it public without an organisation owner.
+
+**DockerHub under an account we already control** is the interim that
+needs nobody's permission: a new repository, and an access token minted
+by its owner. It fixes what finding 2 actually complained about, which
+was seven manual steps rather than the choice of registry, and leaves
+the ownership question for whenever the organisation side is easy.
+
+Then adding the job to the workflow is a few lines, and step 4 points
+the `build` job at `badgeapp-test:current`.
 
 **Two things in the job could not be tested from here** and should be
 watched on its first run: whether `cimg/base` carries `docker buildx`,
