@@ -1246,6 +1246,13 @@ class Project < ApplicationRecord
   # so they are first checked against the real schema; callers pass literal
   # symbols, never user input.
   #
+  # Going around the ORM also means going around its type serialization,
+  # so values are quoted as the database adapter sees them.  That is
+  # correct for every column `projects` has, since they are all plain
+  # scalars: boolean, date, datetime, integer, string, and text.  If
+  # someone ever adds a jsonb, array, or custom-typed column, do not
+  # write it through here without checking that it round-trips.
+  #
   # @param project [Project] project whose bookkeeping should be written
   # @param columns [Hash] columns and values to write
   # @return [Boolean] true if exactly one row was updated

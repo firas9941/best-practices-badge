@@ -1356,7 +1356,7 @@ would never fire for them:
 
 | Write path | Method | Callbacks? |
 | ---------- | ------ | ---------- |
-| `Project.write_notification_columns` | parameterized SQL | no |
+| `Project.write_bookkeeping_columns` | parameterized SQL | no |
 | `Project.save_warning_columns` | `update_columns` | no |
 | `ProjectsController#set_level_saved_flag` | `update_column` | no |
 
@@ -1397,7 +1397,7 @@ them. That constant was written with this section in mind and is the
 place to extend if more columns turn out not to reach any cached page.
 
 Note what this does to the *first* objection as well. Two of the three
-callback-skipping write paths — `write_notification_columns` and
+callback-skipping write paths — `write_bookkeeping_columns` and
 `save_warning_columns` — now touch only bookkeeping columns, so they
 have nothing cached to invalidate and their invisibility to callbacks
 stops mattering. `set_level_saved_flag` writes only `*_saved`, likewise.
