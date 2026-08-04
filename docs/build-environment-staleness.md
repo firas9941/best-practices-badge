@@ -1027,6 +1027,130 @@ which the registry-side retag needs, and whether `docker manifest
 inspect` works with the experimental flag the job sets. Both fail
 loudly rather than silently if absent.
 
+### Alternative: GitHub Actions publishes, CircleCI consumes
+
+Written 2026-08-05 for comparison, after the objection that a classic
+token in CircleCI is "yet another key to manage, one that is likely to
+repeatedly expire at inconvenient times". That objection is correct, and
+this design answers it by having **no long-lived credential anywhere**.
+
+**The two designs differ in exactly one thing: who holds a secret.**
+Everything else is shared, including the `Dockerfile`, the cache key,
+the stable tag and its race. So this is a narrow decision, not a rewrite.
+
+| Property | CircleCI pushes | Actions publishes |
+| -------- | --------------- | ----------------- |
+| Secret in CircleCI | `GHCR_USER` + classic PAT | **none** |
+| Secret anywhere | classic PAT, expires | **none**; `GITHUB_TOKEN` is minted per run and dies with the job |
+| Rotation chore | yes, unless set never to expire | **none** |
+| Package auto-links to the repo | no, needs the `source` label | **yes**, inherently |
+| Systems involved | one | two |
+| Waiting | none | CircleCI may wait for a publish |
+
+Checked, not assumed: **a public `ghcr.io` package can be read with no
+credentials at all.** `docker manifest inspect` on a public package
+succeeds after `docker logout`, and the anonymous token endpoint returns
+a token for the asking. So the consuming side genuinely needs nothing.
+
+#### The workflow
+
+```yaml
+name: Test image
+on: [push, pull_request]
+permissions:
+  contents: read
+  packages: write        # the whole permission budget
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@<pinned>
+      - name: Work out what the image should be
+        run: |          # identical logic to prepare-image
+          ...           # STACK, RUBY_VERSION, NODE_VERSION,
+          ...           # BASE_DIGEST, RECIPE_HASH -> TAG
+      - name: Log in
+        run: echo '${{ secrets.GITHUB_TOKEN }}' | \
+             docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+      - name: Build if new, then point current at it
+        run: |
+          docker manifest inspect "$REPO:$TAG" >/dev/null 2>&1 || {
+            docker build ... -t "$REPO:$TAG" ...
+            docker push "$REPO:$TAG"
+          }
+          docker buildx imagetools create -t "$REPO:current" "$REPO:$TAG"
+```
+
+`GITHUB_TOKEN` is minted for the run and expires when it ends, so there
+is nothing to store, nothing to rotate, and nothing to leak past the
+job. `packages: write` is the entire privilege: it cannot push code,
+merge, or deploy.
+
+#### The wait, on the CircleCI side
+
+```yaml
+  await-image:
+    executor: image-builder
+    steps:
+      - checkout
+      - run:
+          name: Wait for the image this tree describes
+          command: |
+            # Same computation as the workflow, then poll the PUBLIC
+            # registry until "current" resolves to our tag. No login:
+            # anonymous read of a public package is enough.
+            for i in $(seq 1 60); do
+              want="$(digest_of "$REPO:$TAG")"
+              have="$(digest_of "$REPO:current")"
+              [ -n "$want" ] && [ "$want" = "$have" ] && exit 0
+              sleep 10
+            done
+            echo 'ERROR: image never appeared; is the Actions run green?'
+            exit 1
+```
+
+with `requires: [await-image]` on `build`. A job's executor image is
+resolved when that job *starts*, so by the time `build` boots, the right
+image is published and `current` points at it. Ten minutes of patience
+is plenty and costs nothing on the common path, where the image already
+exists and the first poll succeeds.
+
+#### The assertion, which both designs should have
+
+Bake the recipe hash into the image and check it from inside the job
+that booted it:
+
+```yaml
+      - run:
+          name: Confirm we booted the image this tree describes
+          command: |
+            want="$(compute_recipe_hash)"
+            got="$(cat /etc/badgeapp-recipe-hash)"
+            [ "$want" = "$got" ] || {
+              echo "ERROR: booted an image built from recipe $got,"
+              echo "but this tree describes $want."
+              exit 1; }
+```
+
+This is worth having **whichever design wins**, because it is strictly
+stronger than what either offers alone: it converts "silently tested the
+wrong image" into a failure that names both hashes.
+
+#### The one thing neither design fixes
+
+`current` is a shared mutable name, so two branches that change the
+recipe at once can still repoint it under each other. The assertion
+above makes that loud rather than silent, which is the important part,
+but it can still fail a pull request for something another branch did.
+
+The clean fix is the **parameterized executor fed by dynamic
+configuration** already listed under
+[Also considered](#also-considered): each pipeline would use its own
+exact tag and there would be no shared name at all. That remains
+untested and is more machinery than the race currently justifies, but it
+is the end state if the flapping ever becomes real rather than
+theoretical.
+
 ### What step 4 must change in the CI configuration
 
 Not done yet, and listed here so it is not rediscovered:
