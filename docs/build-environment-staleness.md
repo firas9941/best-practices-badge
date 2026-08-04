@@ -573,11 +573,36 @@ guard that has never been seen to fail is a guess.
   that matters is in the other container, and the wait step prints it.
   Any Chrome in the test image is not the one under test.
 
-Still unverified, because it cannot be tested from here: **whether
-`resource_class: medium` is enough**. That is 2 vCPU and 4 GB, now
-shared by Ruby, PostgreSQL and a Java-plus-Chrome container. If the
-grid never becomes ready, or a container is killed, try `large` before
-suspecting the design.
+### The resource budget, now measured rather than assumed
+
+`.circleci/config.yml:105` sets `resource_class: medium` on the `build`
+job, and has since commit `687477ba`. That is good practice in itself:
+CircleCI's reference says the default "is subject to change" and that
+specifying one explicitly is preferred. The `deploy` job sets none and
+so takes that changeable default.
+
+**What `medium` actually grants was not verified.** CircleCI's docs are
+rendered client-side and the figures live in a partial that could not be
+retrieved, so the familiar "2 vCPU, 4 GB" is repeated here by nobody.
+Rather than guess, the version-banner step now prints `nproc` and the
+cgroup memory limit, which is the method CircleCI's own reference
+recommends. Read those numbers from the next run before touching
+`resource_class` in either direction. The block handles cgroup v1 and
+v2, since v2 replaced `hierarchical_memory_limit` with `memory.max`,
+and says so plainly rather than failing if neither is readable.
+
+The budget is shared by every container in the job, and adding a
+Java-plus-Chrome container made it tighter without anyone measuring it.
+If the grid never becomes ready, or a container is killed, that is the
+first place to look, and `large` is the first thing to try.
+
+**A related trap, from CircleCI's own reference.** Java and other
+runtimes that introspect `/proc` for CPU count "may request 32 CPU
+cores and run slower than they would when requesting one core" under
+resource classes. Selenium Grid is a Java program. If the grid is
+mysteriously slow rather than absent, this, not memory, is the likely
+cause, and the cure is to pin its thread count rather than to buy a
+larger machine.
 
 ### Two dead fragments found while doing this
 

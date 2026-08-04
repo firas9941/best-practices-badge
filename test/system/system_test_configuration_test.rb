@@ -25,6 +25,12 @@ class SystemTestConfigurationTest < ApplicationSystemTestCase
   # we asked for the right thing, the second that asking worked, since
   # reading page.driver.browser forces a real session to be created.
   test 'SELENIUM_REMOTE_URL, when set, is the browser actually used' do
+    # In CI the variable is not optional. Skipping here would be the same
+    # silent pass in a different disguise: CI would drive whatever browser
+    # happened to be lying around and report success.
+    if ENV['CI'].present? && SELENIUM_REMOTE_URL.blank?
+      flunk 'CI must set SELENIUM_REMOTE_URL; see .circleci/config.yml'
+    end
     skip 'no remote browser configured' if SELENIUM_REMOTE_URL.blank?
 
     assert_equal SELENIUM_REMOTE_URL, page.driver.options[:url]

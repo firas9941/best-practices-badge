@@ -173,10 +173,28 @@ jobs:
     # Chrome is deliberately not listed: the Chrome that matters is the
     # one in the selenium container, and the wait step above prints its
     # version. Any Chrome in this image is not the one under test.
+    #
+    # The memory and CPU lines answer a real question rather than
+    # decorating the log. "resource_class: medium" is shared by every
+    # container in this job, and adding the selenium container (Java plus
+    # Chrome) made that budget tighter without anyone measuring it. Read
+    # these numbers before changing resource_class, in either direction.
+    # The cgroup path is the method CircleCI's own documentation
+    # recommends; v2 replaced memory.stat's hierarchical_memory_limit
+    # with memory.max, so try both and print whichever exists.
     - run: |
         ruby --version
         node --version
         java --version
+        echo "CPUs visible: $(nproc)"
+        if [ -r /sys/fs/cgroup/memory.max ]; then
+          echo "memory limit (cgroup v2): $(cat /sys/fs/cgroup/memory.max)"
+        elif [ -r /sys/fs/cgroup/memory/memory.stat ]; then
+          grep hierarchical_memory_limit /sys/fs/cgroup/memory/memory.stat
+        else
+          echo 'memory limit: could not read a cgroup limit'
+        fi
+        free -m 2>/dev/null || true
     # Prepare for artifact and test results
     - run: mkdir -p $CIRCLE_ARTIFACTS $CIRCLE_TEST_REPORTS
     # Force cleanup to make deterministic.
