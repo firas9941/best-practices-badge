@@ -30,8 +30,11 @@ staging 2026-08-04):
 buildpack still has to be added to the two Heroku applications, in the
 order given under [Pinning Node](#pinning-node-for-the-production-build).
 
-**Decided, not yet built:** steps 2 to 10 of
+**Decided, not yet built:** steps 2 to 11 of
 [The plan](#the-plan).
+
+**Still open:** [Chrome](#open-question-chrome), which decides part of
+what the new `Dockerfile` contains.
 
 ## Finding 1: a frozen image freezes its trust anchors too
 
@@ -225,6 +228,24 @@ without the architecture segment.
 Using Heroku's binary means the interpreter matches production, not just
 the operating system, and the build is a download rather than a compile.
 
+**Install the Node that `package.json` pins**, 24.19.0, from the same
+place Heroku's Node buildpack takes it, so CI minifies JavaScript with
+the interpreter production minifies with. Node is no longer optional in
+this image for a second reason: `license_finder` activates its NPM
+scanner on the presence of `package.json`, so `rake default` now shells
+out to `npm`. Read the version from `package.json` rather than repeating
+it, so the two cannot drift.
+
+**Verify before building anything else** that
+`heroku/heroku:24-build` carries `libpq` and its headers, and a working
+C toolchain, since the `pg` gem and several others compile against them.
+It ought to, being the image Heroku's own buildpacks compile in, but it
+is a five-minute check that would sink this approach if it failed, so do
+it first rather than discover it at the end.
+
+**Chrome and chromedriver are not settled**; see
+[Open question: Chrome](#open-question-chrome).
+
 ### Pinning
 
 The build job resolves what `heroku/heroku:24-build` points at now and
@@ -249,33 +270,50 @@ configuration before any step runs:
 prepare-image  ->  build (tests)
 ```
 
-Tag each build with the base digest it came from:
+Tag each build with everything that determines its contents:
 
 ```text
-badgeapp-test:heroku24-ruby3.4.10-<short-base-digest>
+badgeapp-test:heroku24-ruby3.4.10-<base-digest>-<recipe-hash>
 ```
+
+where `<recipe-hash>` is a hash over the `Dockerfile` and every file it
+copies in. **Both halves are needed.** The base digest alone keeps us
+current with nobody deciding anything, because when Heroku rebuilds the
+stack image the key changes by itself; but it cannot notice that *we*
+changed the recipe. The recipe hash alone would cache too well, because
+an operating system security update changes nothing we wrote. An earlier
+version of this design used only the base digest and Ruby, which would
+have let a pull request that edits the `Dockerfile` score a cache hit
+and run its tests against the image it had just replaced.
 
 `prepare-image` then:
 
 1. Resolves what `heroku/heroku:24-build` points at now: one request.
-2. Asks the registry whether the matching tag exists: one request.
-3. If it does, runs `circleci-agent step halt`, ending the job
-   successfully and immediately.
+2. Computes the recipe hash from the working tree.
+3. Asks the registry whether the matching tag exists: one request.
+4. **Points `badgeapp-test:current` at that tag**, whether it was
+   already there or has just been built.
+5. Halts with `circleci-agent step halt` if the tag already existed, so
+   the build is skipped.
 
-**Order matters.** The `checkout`, the `setup_remote_docker` that
-provisions a Docker environment, and the build all come *after* the
-halt, so none runs on the common path. Give the job a small executor
-image; its only requirement is an HTTPS client.
+**Step 4 happens on both paths, and that is the whole point.** An
+earlier version halted at step 3 on a cache hit, leaving `:current`
+wherever the last cache *miss* had put it. That is silently wrong as
+soon as two Ruby versions are in flight, which is exactly what
+`propose_ruby_upgrade` produces: a branch on 3.4.1 and a branch on
+3.4.10 would alternate cache hits, neither repointing `:current`, and
+each would run its tests on the other's interpreter without saying so.
 
-Keying on the base digest is what keeps us current with nobody deciding
-anything: when Heroku rebuilds the stack image, the key changes by
-itself. Keying only on our Dockerfile would cache too well, because an
-operating system security update changes nothing we wrote.
+**Order still matters for the expensive parts.** The `checkout` needed
+for the recipe hash is cheap; the `setup_remote_docker` that provisions
+a Docker environment, and the build itself, come after the halt, so
+neither runs on the common path. The common path is now two registry
+requests and one registry write rather than pure early exit. That is the
+price of a `:current` that is always right, and it is worth paying.
 
-The tests run against a stable tag, `badgeapp-test:current`, which
-`prepare-image` points at whatever it just built. That keeps
-`.circleci/config.yml` unchanged except when Ruby or the stack changes,
-which is exactly when a human should read it.
+The tests run against `badgeapp-test:current`, so
+`.circleci/config.yml` stays unchanged except when Ruby or the stack
+changes, which is exactly when a human should read it.
 
 **Decisions taken:**
 
@@ -283,11 +321,88 @@ which is exactly when a human should read it.
   comparing digest strings. The latter keeps one tag but means walking a
   manifest to a config blob and handling multi-architecture indexes.
   Simple wins while both are reliable.
-* The stable tag is mutable, so two branches editing the Dockerfile at
-  once could race. Accepted: unlikely, and the loser's next pipeline
-  corrects it.
+* The stable tag is mutable, so two branches can still race between
+  step 4 and the `build` job pulling it. Accepted, with eyes open: the
+  window is seconds rather than a whole pipeline, and a mismatch shows
+  up as a test failure on a rerunnable job rather than as a quiet pass.
+  If that judgement ever changes, the fix is the parameterized executor
+  under [Also considered](#also-considered), which removes the shared
+  mutable name entirely.
 * A miss takes a few minutes. Accepted: that work must happen somewhere
   to stay current, and until now it happened by hand, or rather did not.
+
+### Why not CircleCI's own cache
+
+Asked, and the answer is no, for a structural reason rather than a
+preference. **`save_cache` and `restore_cache` are steps, and steps run
+inside the executor.** By the time any cache could be restored, the
+container we wanted to restore is already the one we are running in.
+This is the same fact recorded above, that a job cannot run inside an
+image it just built, seen from another angle: the executor's image is
+resolved from static configuration before any step exists to consult a
+cache. Workspaces have the same shape and the additional limit of
+living only within one workflow run.
+
+So the image must come from a registry. CircleCI's caching is still
+useful *within* `prepare-image`, for Docker layers on the rare miss, and
+that is where to apply it.
+
+**Use `ghcr.io` under the `ossf` organisation, and make the image
+public.** That answers the complaint in finding 2, which was not about
+DockerHub as such but about push access to one person's personal
+account. Public means the `build` job needs no pull credential at all,
+so the only secret is `prepare-image`'s push token: a GitHub App
+installation token or fine-grained personal access token with
+`packages: write` and nothing else, in a CircleCI context restricted to
+the people who may hold it.
+
+Making it public also removes most of the rate-limit exposure below,
+since `ghcr.io` does not meter anonymous pulls the way DockerHub does.
+
+### Registry rate limits
+
+DockerHub meters anonymous pulls, and we would rather not trade rights
+for headroom by authenticating a pull that needs no authentication.
+
+With the image on `ghcr.io`, what remains is the pull of
+`heroku/heroku:24-build`, which happens only on a cache miss, and the
+`cimg/postgres` and `cimg/node` pulls we already do today. So the
+exposure is small and mostly unchanged.
+
+Handle it by waiting rather than by escalating privilege: retry the base
+image pull with exponential backoff and a generous ceiling. A rate limit
+is a transient condition with a known cure, and the cure is patience.
+Log each retry, so a limit we are actually living inside shows up as
+something visible rather than as a slow build nobody can explain.
+
+## Open question: Chrome
+
+Deferred deliberately on 2026-08-05, to be settled on its own rather
+than folded into the image work. Recorded here so the discussion starts
+from what is already known.
+
+* **The two mechanisms disagree today.** `.circleci/config.yml` runs
+  `browser-tools/install-chromedriver` at test time, while this design
+  says the image carries Chrome and chromedriver. Pick one. The orb
+  matches chromedriver to whatever Chrome it finds, which is its whole
+  purpose, so it is not obviously the part to drop.
+* **Chrome is the next thing that will go stale.** Its version appears
+  nowhere in the cache key, so an image is rebuilt for a new base or a
+  new recipe, never for a new Chrome. Installing "latest" at build time
+  means Chrome tracks whatever the rebuilds happen to catch, and the tag
+  therefore does not identify the contents.
+* **Installing Chrome reintroduces finding 1.** It means adding Google's
+  apt repository to our own `Dockerfile`, which is the trust-anchor
+  problem that started this document. The lesson recorded there applies
+  unchanged: pin the master key fingerprint
+  `EB4C1BFD4F042F6DDDCCEC917721F63BD38B4796`, which was created
+  2016-04-12 and has no expiry, and fetch the signing material fresh at
+  build time rather than freezing a keyring.
+* The **separate `selenium/standalone-chrome` container** under
+  [Also considered](#also-considered) exists precisely to make this
+  someone else's problem, at the cost of reconfiguring Capybara for a
+  remote driver. It was set aside as solving a coupling that was not
+  hurting; this is the discussion that decides whether it now is.
 
 ## Keeping pins current
 
@@ -451,19 +566,39 @@ a pull request next week", silently and with nothing red.
   answers "does Heroku have this Ruby for this stack", two callers.
 * A dead cron here leaves us stale, not wrong. That is why this may be
   scheduled although the caching check in `prepare-image` may not: the
-  guard test, not the cron, is what keeps an undeployable pin out.
+  guard, not the cron, is what keeps an undeployable pin out.
+* **It opens pull requests, so the token analysis written for Renovate
+  applies to it unchanged**: `contents: write` and
+  `pull-requests: write`, never `workflows: write`, and **not** the
+  default `GITHUB_TOKEN`, or its pull requests would start none of our
+  `pull_request` workflows and be checked less than a stranger's.
+* Being `lib/` code, it falls under the 100% coverage rule. Unit-test
+  the probe with stubbed HTTP; see the guard below, which shares it.
 
 ## Guard: Ruby pins must stay deployable
 
 Only Ruby versions Heroku offers for our stack will deploy, so a pull
 request proposing a newer one, from `propose_ruby_upgrade` or from a
-human editing the file by hand, could pass CI and fail at deploy. Make
-it a test instead.
+human editing the file by hand, could pass CI and fail at deploy. Guard
+it in CI.
 
-The test reads `.ruby-version`, issues one `HEAD` for the corresponding
-tarball, and fails unless the answer is **200**. Skip it when the
-network is unavailable, so offline work is unaffected; CI has a network,
-and CI is where it matters.
+The check reads `.ruby-version`, issues one `HEAD` for the corresponding
+tarball, and fails unless the answer is **200**.
+
+**It must not be a Minitest test.** `test/test_helper.rb:58` calls
+`WebMock.disable_net_connect!(allow_localhost: true, allow: driver_urls)`,
+so the suite is hermetic on purpose and a real request to S3 would be
+refused. Worse, that refusal is not a network error, so any
+"skip when the network is unavailable" logic would read it as an offline
+developer, skip silently, and go on skipping forever. A guard that never
+guards is more dangerous than no guard, because it is also reassuring.
+
+So make it a **rake task that CI runs**, one that needs no Rails and
+therefore lives in `lib/tasks/standalone/`; see [Deploying without a
+development environment](#deploying-without-a-development-environment).
+There the skip is honest, because a real connection failure is a real
+connection failure. Skip when offline so local work is unaffected; CI
+has a network, and CI is where it matters.
 
 * **Compare the exact version.** It answers precisely the question we
   care about, with no version arithmetic. Looser schemes, such as
@@ -474,6 +609,10 @@ and CI is where it matters.
   so a stack upgrade cannot change one and forget the other.
 * **Assert "must be 200"**, never "must not be 404", for the S3 reason
   above.
+* **The probe itself is ordinary `lib/` code** shared with
+  `propose_ruby_upgrade`, so it falls under the 100% coverage rule.
+  Unit-test it with stubbed HTTP covering 200, 403 and a connection
+  failure. The rake task is the thin part that CI runs live.
 
 Because `.ruby-version` is also an input to the test image, a pull
 request bumping it changes the cache key, so `prepare-image` builds an
@@ -627,8 +766,9 @@ build's log to confirm it reports 24.19.0.
 
 **Consequence for the new test image.** `license_finder` activates its
 NPM scanner on the presence of `package.json`, so it now shells out to
-`npm`. It passes here, having nothing to find, but the image built in
-step 2 must carry Node and npm or that check breaks.
+`npm`. It passes here, having nothing to find, but the new test image
+must carry Node and npm or that check breaks. It should carry *this*
+Node; see [The image](#the-image).
 
 ## The plan
 
@@ -637,32 +777,45 @@ step 2 must carry Node and npm or that check breaks.
    `heroku/nodejs` buildpack ahead of `heroku/ruby` and pin the version.
    See [Pinning Node](#pinning-node-for-the-production-build); the
    repository half is done.
-2. **Write the new test image**: `FROM heroku/heroku:24-build`, Heroku's
-   prebuilt Ruby, Chrome, chromedriver. Confirm the suite passes on it
-   before anything depends on it.
-3. **Add `prepare-image`** with the halt-early caching above, and point
-   the `build` job at `badgeapp-test:current`.
-4. **Delete `dockerfiles/3.4.1-browsers/`, `dockerfiles/3.3.6-browsers/`
-   and `how-to-create-image.md`**, and the DockerHub image they
-   describe, once nothing references them.
-5. **Add the Heroku-availability probe and the guard test** that uses
-   it, so step 6 cannot silently regress.
-6. **Take Ruby to 3.4.10** (finding 3), which under this design is a
+2. **Check that `heroku/heroku:24-build` has `libpq`, its headers and a
+   C toolchain**, before writing anything that depends on the answer.
+3. **Add the `Dockerfile` and the `prepare-image` job together, leaving
+   the `build` job on the old image.** `prepare-image` then builds and
+   publishes on the very first pipeline, so the image exists, has been
+   produced by the mechanism that will keep producing it, and can be
+   pulled and tried, with nothing yet depending on it. This replaces an
+   earlier plan to build one by hand first: there is no reason to
+   bootstrap with a procedure we are trying to abolish.
+4. **Point the `build` job at `badgeapp-test:current`.** A one-line
+   change, and the first pipeline whose tests genuinely run on the new
+   image. Keep it a separate pull request so a failure here cannot be
+   confused with a failure in step 3.
+5. **Delete `dockerfiles/3.4.1-browsers/`, `dockerfiles/3.3.6-browsers/`
+   and `how-to-create-image.md`** once nothing references them. Leave
+   the DockerHub image itself in place for a while: branches and open
+   pull requests older than step 4 still pin it by digest, and deleting
+   it breaks their pipelines for no gain.
+6. **Add the Heroku-availability probe and the guard** that uses it, so
+   step 7 cannot silently regress.
+7. **Take Ruby to 3.4.10** (finding 3), which under this design is a
    one-line change plus an automatic rebuild.
-7. **Add `propose_ruby_upgrade`**, sharing the probe from step 5, so
+8. **Add `propose_ruby_upgrade`**, sharing the probe from step 6, so
    nobody has to remember to look.
-8. **Add Renovate**, self-hosted, scoped to `circleci` and permissioned
+9. **Add Renovate**, self-hosted, scoped to `circleci` and permissioned
    as above.
-9. **Then upgrade production to Heroku-26**, test environment first, so
-   the stack move is exercised somewhere before it reaches production.
+10. **Then upgrade production to Heroku-26**, test environment first, so
+    the stack move is exercised somewhere before it reaches production.
 
 Independent of the above, and in no particular order with it:
 
-10. **Stop booting Rails for every rake task**, then make the deploys a
+11. **Stop booting Rails for every rake task**, then make the deploys a
     `workflow_dispatch` button. See [Deploying without a development
     environment](#deploying-without-a-development-environment).
 
-Findings 1, 2 and 4 have no separate step: steps 2 to 4 remove their
+Settle [Open question: Chrome](#open-question-chrome) before step 3,
+since it decides part of what the `Dockerfile` contains.
+
+Findings 1, 2 and 4 have no separate step: steps 2 to 5 remove their
 cause.
 
 ## Facts worth not re-deriving
@@ -691,9 +844,13 @@ cause.
 * `deploy_production` uses no Heroku credential; it is git only.
   `deploy_staging` also runs `production_to_staging`, which restores
   production's latest *existing* backup over staging.
-* `CLAUDE.md` is out of date where it says there is no
-  `config.load_defaults`: `config/application.rb:39` sets
-  `config.load_defaults 8.1`.
+* A CircleCI job's executor image must come from a registry. Its cache
+  cannot supply one, because `restore_cache` is a step and steps run
+  inside the executor that is already running.
+* `test/test_helper.rb:58` calls `WebMock.disable_net_connect!`, so no
+  Minitest test may reach the network. Live checks belong in rake tasks.
+* The test image lives at `ghcr.io`, public, under the `ossf`
+  organisation.
 * CircleCI docs are rendered client-side, so plain `curl` returns
   navigation rather than content. Two things were therefore *not*
   verified and should be before use: how parameterized executors behave
