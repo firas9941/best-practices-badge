@@ -773,15 +773,31 @@ class Project < ApplicationRecord
         if notify_losses
           record_pending_losses(project, old_metal_level, old_baseline_level)
         end
-        # Ask before saving; afterward the record reports no changes.
-        # Rails skips the UPDATE entirely when nothing differs, so most
-        # projects in a typical recalculation are untouched and need no
-        # purge at all.  Bookkeeping columns do not count: nothing
+        # Ask before writing; afterward the record reports no changes.
+        # Most projects in a typical recalculation are untouched, and
+        # writing nothing is both faster and one less CDN purge.
+        # Bookkeeping columns do not count toward "modified": nothing
         # cached shows them, so a project whose only change was a
         # pending-notification flag has nothing stale to purge.
+        pending_changes = project.changes.transform_values(&:last)
         modified =
           project.changed.any? { |c| BOOKKEEPING_FIELDS.exclude?(c) }
-        project.save(validate: false, touch: false)
+        # Everything we write here we computed ourselves; none of it came
+        # from the owner.  So write it as bookkeeping rather than with
+        # save, which would bump lock_version and make an owner who has
+        # the edit form open fail with "changed since you started
+        # editing".  Nothing is lost by not blocking them: their save
+        # recomputes these same percentages from their own answers.
+        #
+        # This also means no paper_trail version, which is what we want.
+        # A version records who changed an entry; a recalculation is not
+        # a person, and on a wide projects row each version stores a copy
+        # of the old record, so a large criteria change would have
+        # written thousands of them.  send_reminders already suppressed
+        # versioning for the same reason.
+        unless pending_changes.empty?
+          write_bookkeeping_columns(project, pending_changes)
+        end
       end
       # Only once with_lock has committed.  Purging while the old value
       # is still the one a reader would get invites the CDN to cache it
@@ -1195,9 +1211,17 @@ class Project < ApplicationRecord
   end
   private_class_method :projects_with_pending_loss_notifications
 
-  # Write the notification bookkeeping columns for one project: clearing
-  # a pending flag, stamping a delivery, counting a failed attempt, or
-  # any combination the caller names.
+  # Write bookkeeping columns for one project: clearing a pending
+  # notification flag, stamping a delivery, counting a failed attempt,
+  # recording when we last sent a reminder, storing a recalculated
+  # percentage, or any combination the caller names.
+  #
+  # Use this for anything that is *our* record of what the application
+  # did, as opposed to what the project's owner told us.  Owner content
+  # must go through a normal save, so that optimistic locking can catch
+  # two people editing the same entry.  Bookkeeping must not, because
+  # bumping lock_version tells an owner in mid-edit that their entry
+  # "changed since you started editing" when nothing of theirs did.
   #
   # This issues plain parameterized SQL rather than going through the ORM,
   # deliberately.  Both ORM paths carry hidden behavior that has already
@@ -1229,18 +1253,17 @@ class Project < ApplicationRecord
   # This is a command that reports whether it succeeded, not a predicate;
   # a trailing "?" would wrongly suggest it has no side effects.
   # rubocop:disable Naming/PredicateMethod
-  def self.write_notification_columns(project, columns)
+  def self.write_bookkeeping_columns(project, columns)
     rows_updated = update_one_project(project.id, columns)
     return true if rows_updated == 1
 
-    report_failed_notification_write(project, columns, rows_updated)
+    report_failed_bookkeeping_write(project, columns, rows_updated)
     false
   end
   # rubocop:enable Naming/PredicateMethod
-  private_class_method :write_notification_columns
 
   # Set the given columns on exactly one project, by parameterized SQL.
-  # See write_notification_columns for why this does not use the ORM.
+  # See write_bookkeeping_columns for why this does not use the ORM.
   # @param id [Integer] project id
   # @param columns [Hash] columns and values to write
   # @return [Integer] number of rows updated
@@ -1268,16 +1291,17 @@ class Project < ApplicationRecord
   # @param columns [Hash] the columns we tried to write
   # @param rows_updated [Integer] how many rows actually changed
   # @return [void]
-  def self.report_failed_notification_write(project, columns, rows_updated)
+  def self.report_failed_bookkeeping_write(project, columns, rows_updated)
     message =
-      "Notification bookkeeping write affected #{rows_updated} rows " \
-      "(expected 1) for project #{project.id}, columns " \
-      "#{columns.keys.join(', ')}. Notifications may repeat."
+      "Bookkeeping write affected #{rows_updated} rows (expected 1) " \
+      "for project #{project.id}, columns #{columns.keys.join(', ')}. " \
+      'Whatever this recorded did not get recorded, so a task that ' \
+      'depends on it may repeat work it has already done.'
     Rails.logger.error(message)
     # No-op unless Sentry is configured (SENTRY_DSN set).
     Sentry.capture_message(message)
   end
-  private_class_method :report_failed_notification_write
+  private_class_method :report_failed_bookkeeping_write
 
   # Everything that differs between the four notification kinds: two
   # series, loss and warning, each with a metal kind and a baseline kind.
@@ -1432,7 +1456,7 @@ class Project < ApplicationRecord
     when :sent, :not_relevant
       columns = { kind[:flag] => 0 }
       columns[series[:sent_at]] = now if outcome == :sent
-      write_notification_columns(project, columns)
+      write_bookkeeping_columns(project, columns)
       false
     when :transient_failure, :permanent_failure
       handle_send_failure(project, kind, series, outcome)
@@ -1462,7 +1486,7 @@ class Project < ApplicationRecord
     if outcome == :transient_failure &&
        attempts < MAX_NOTIFICATION_ATTEMPTS
       # Leave the flag set so that a later run tries again.
-      write_notification_columns(project, series[:attempts] => attempts)
+      write_bookkeeping_columns(project, series[:attempts] => attempts)
       true
     else
       abandon_notification(project, kind, series, outcome, attempts)
@@ -1490,7 +1514,7 @@ class Project < ApplicationRecord
     Rails.logger.error(message)
     # No-op unless Sentry is configured (SENTRY_DSN set).
     Sentry.capture_message(message)
-    write_notification_columns(
+    write_bookkeeping_columns(
       project, kind[:flag] => 0, series[:attempts] => attempts
     )
   end

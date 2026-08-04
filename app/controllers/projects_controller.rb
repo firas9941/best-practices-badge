@@ -923,14 +923,18 @@ class ProjectsController < ApplicationController
     end
     projects.each do |inactive_project| # Send actual reminders
       ReportMailer.email_reminder_owner(inactive_project).deliver_now
-      # Save datetime while disabling paper_trail's versioning through self.
-      # Use "touch: false" to also prevent changing the updated_at value;
-      # we interpret the updated_at value as being an update of the
-      # project badge status information by users and admins.
-      PaperTrail.request(enabled: false) do
-        inactive_project.last_reminder_at = Time.now.utc
-        inactive_project.save!(touch: false)
-      end
+      # Record when we sent the reminder.  This is our bookkeeping, not
+      # the owner's content, so write it with parameterized SQL instead
+      # of save!.  A save! bumps lock_version, and an owner who happened
+      # to have the edit form open would then be told their entry
+      # "changed since you started editing" because *we* sent them a
+      # reminder.  Going around ActiveRecord also means no paper_trail
+      # version and no change to updated_at, which we interpret as an
+      # update of badge status by a user or admin, so neither needs
+      # suppressing any more.
+      Project.write_bookkeeping_columns(
+        inactive_project, last_reminder_at: Time.now.utc
+      )
       # No CDN purge here, deliberately.  This writes only
       # last_reminder_at, which Project::BOOKKEEPING_FIELDS withholds
       # from the project JSON, and no cached page shows it; the admin
