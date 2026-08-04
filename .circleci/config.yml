@@ -141,6 +141,16 @@ jobs:
   # so that a failure here cannot be confused with a failure there.
   # See docs/build-environment-staleness.md, "The plan", steps 3 and 4.
   #
+  # To turn it on, three things are needed:
+  #   1. a ghcr.io/ossf/badgeapp-test package, public
+  #   2. a CircleCI context holding GHCR_USER and GHCR_TOKEN
+  #   3. an entry in the workflow below, WITH that context, e.g.
+  #        - prepare-image:
+  #            context: <the context name>
+  #      and then "requires: [prepare-image]" on the build job.
+  # Without the context the login step fails immediately and says so,
+  # rather than failing obscurely later at the push.
+  #
   # Why a separate job at all: a CircleCI job cannot run inside an image
   # it just built, because the executor's image is resolved from static
   # configuration before any step runs.
@@ -210,6 +220,30 @@ jobs:
           name: Log in to the registry
           command: |
             set -euo pipefail
+            # GHCR_USER and GHCR_TOKEN come from a CircleCI context,
+            # declared on this job in the workflow, exactly as the deploy
+            # job gets HEROKU_API_KEY from "bestpractices-heroku-deploy".
+            # The secret lives in CircleCI's store, never in this
+            # repository, and is injected only into the jobs that ask for
+            # that context.
+            #
+            # GHCR_USER is a machine account owned by the organisation,
+            # not a person, so this keeps working when any individual
+            # moves on. GHCR_TOKEN is a classic personal access token on
+            # that account with write:packages and nothing else: ghcr.io
+            # does not accept fine-grained tokens, and GITHUB_TOKEN
+            # exists only inside GitHub Actions.
+            #
+            # Note what this token cannot do. It cannot push code, merge
+            # anything, or deploy: it can push container images. That is
+            # a good deal narrower than HEROKU_API_KEY, which this same
+            # CI system already holds and which can reach production.
+            # Only this job needs it; the build job pulls a public image
+            # and needs no credential at all.
+            test -n "${GHCR_USER:-}" || {
+              echo 'ERROR: GHCR_USER unset. Is the context declared?'; exit 1; }
+            test -n "${GHCR_TOKEN:-}" || {
+              echo 'ERROR: GHCR_TOKEN unset. Is the context declared?'; exit 1; }
             echo "$GHCR_TOKEN" | docker login ghcr.io \
               -u "$GHCR_USER" --password-stdin
       - run:
