@@ -501,19 +501,67 @@ one bot handles both the image references and the orb versions in that
 file, by pull request, with our own CI proving each bump before it
 merges.
 
-They are complementary rather than competing, and using both is
-reasonable:
+**Renovate can also propose Ruby upgrades**, which nothing currently
+does. It ships a `ruby-version` manager whose source declares
+`displayName = '.ruby-version'`, a file pattern of
+`/(^|/)\.ruby-version$/`, and the Ruby version datasource. It reads the
+trimmed contents of the file as the current version and offers newer
+releases. Our `Gemfile` reads `.ruby-version`, and under approach D the
+image build will too, so that one file stays the single place Ruby is
+named.
+
+**Dependabot does not do this, which is worth stating carefully because
+it is not for want of Ruby knowledge.** Dependabot reads our Ruby
+version already. It has to: it parses `required_ruby_version`
+constraints and the version we declare in order to choose gem versions
+that will actually run, and its issue tracker is full of the resulting
+subtleties. What it does not do is propose an upgrade to that version.
+`dependabot-core` issue 2254, "Update ruby version in Gemfile", asks for
+precisely `Gemfile`, `Gemfile.lock` and `.ruby-version`; it was opened
+2018-06-28 and is still open, labelled as a feature request and a new
+ecosystem. So this is a known gap rather than a setting we have failed
+to find.
+
+One related item is worth a look at some point, though it is not this
+document's problem. Issue 14617 concerns Dependabot handling a Ruby
+version specified indirectly by file rather than as a literal. Our
+`Gemfile` says `ruby File.read('.ruby-version').strip`, which Bundler
+evaluates but a static parser may not. If Dependabot cannot resolve it,
+it may be assuming some other Ruby version when it picks gem updates.
+Worth checking against a Dependabot pull request's logs rather than
+guessing.
+
+That leaves the three tools covering distinct ground:
 
 | Tool | Covers here |
 | ---- | ----------- |
-| Dependabot | `Gemfile`, npm, GitHub Actions workflows, `dockerfiles/*/Dockerfile` |
-| Renovate | `.circleci/config.yml`: executor images and orb versions |
+| Dependabot | `Gemfile`, npm, GitHub Actions workflows |
+| Renovate | `.circleci/config.yml` images and orbs, and `.ruby-version` |
+| `prepare-image` | the test image itself, rebuilt when its base moves |
 
-One practical caution: run Renovate with `enabledManagers` limited to
-`circleci`. Left at its defaults it will also read the Gemfile and the
-Dockerfiles, and open pull requests competing with Dependabot's for the
-same upgrades. Keeping each tool in its own lane is what makes running
-two of them pleasant rather than noisy.
+Run Renovate with `enabledManagers` limited to `circleci` and
+`ruby-version`. Left at its defaults it will also read the Gemfile and
+the Dockerfiles and open pull requests competing with Dependabot's for
+the same upgrades. Keeping each tool in its own lane is what makes
+running two of them pleasant rather than noisy. Renovate also has a
+`custom` manager, a regular expression matcher, if we later pin
+something version-like in a file no built-in manager knows.
+
+**One caution specific to Ruby: a green build does not prove Heroku
+can run it.** Under approach D our image installs Ruby itself, so any
+released version will build and test fine, while production's Ruby comes
+from Heroku's buildpack and only the versions it supports on our stack
+will deploy. A Renovate pull request proposing a Ruby that Heroku does
+not yet offer would pass CI and then fail at deploy. Restricting Ruby
+proposals to patch updates, and treating a minor or major move as a
+deliberate piece of work that checks Heroku's supported versions first,
+avoids that.
+
+There is a pleasing consequence of the design in the other direction.
+Because `.ruby-version` is an input to the test image, a pull request
+bumping it changes the cache key, so `prepare-image` builds an image for
+that Ruby and the tests actually run on it. The bot's proposal gets
+genuinely exercised rather than merely reviewed.
 
 Note that under approach D the test image's own tag needs no bot at
 all, because `prepare-image` maintains it on every pipeline. Renovate's
