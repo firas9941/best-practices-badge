@@ -238,12 +238,41 @@ scanner on the presence of `package.json`, so `rake default` now shells
 out to `npm`. Read the version from `package.json` rather than repeating
 it, so the two cannot drift.
 
-**Verify before building anything else** that
-`heroku/heroku:24-build` carries `libpq` and its headers, and a working
-C toolchain, since the `pg` gem and several others compile against them.
-It ought to, being the image Heroku's own buildpacks compile in, but it
-is a five-minute check that would sink this approach if it failed, so do
-it first rather than discover it at the end.
+**The base was checked before anything was built on it**, 2026-08-05,
+because a missing toolchain would have sunk this approach and it is
+cheaper to learn that first than last. `heroku/heroku:24-build`, 1.03 GB,
+digest `sha256:a6e743f5…` at the time of checking:
+
+| Wanted | Found |
+| ------ | ----- |
+| the same OS as production | **Ubuntu 24.04.4 LTS** |
+| C toolchain | `gcc`, `g++`, `make`, `pkg-config`, `patch` |
+| `libpq` for the `pg` gem | `libpq-fe.h` and `libpq.so`, present |
+| common gem headers | `zlib.h`, `openssl/ssl.h`, `yaml.h`, present |
+| `cmake` | **already present** |
+| Node | absent, so we install it |
+| Java | absent, and it stays that way |
+
+`ffi.h` is the one thing missing, and it does not matter: `Gemfile.lock`
+carries `ffi (1.17.4-x86_64-linux-gnu)` precompiled, so nothing builds
+libffi from source.
+
+Note `cmake`. It was one of the three things our custom image existed to
+add, and the stack image has it, which removes that reason too.
+
+**Heroku's prebuilt Ruby was then run in that image**, which is the
+premise of this whole approach rather than a detail:
+
+```text
+heroku-24/amd64/ruby-3.4.1.tgz  ->  29,717,118 bytes
+ruby 3.4.1 (2024-12-25 revision 48d4efcb85) +PRISM [x86_64-linux]
+gem 3.6.2 | OpenSSL 3.0.13 | zlib ok | psych ok
+```
+
+So the interpreter, its OpenSSL, its zlib and its YAML all work as
+downloaded, with no compilation at all. What remains untested is a full
+`bundle install` against this base, which is the natural first act of
+step 3.
 
 **No browser goes in this image.** Chrome runs as a second container;
 see [Chrome: a second container](#chrome-a-second-container).
@@ -1214,8 +1243,8 @@ Node; see [The image](#the-image).
    `heroku/nodejs` buildpack ahead of `heroku/ruby` and pin the version.
    See [Pinning Node](#pinning-node-for-the-production-build); the
    repository half is done.
-2. **Check that `heroku/heroku:24-build` has `libpq`, its headers and a
-   C toolchain**, before writing anything that depends on the answer.
+2. **DONE 2026-08-05: checked `heroku/heroku:24-build`** for `libpq`,
+   its headers and a C toolchain. All present; see [The image](#the-image).
 3. **Add the `Dockerfile` and the `prepare-image` job together, leaving
    the `build` job on the old image.** `prepare-image` then builds and
    publishes on the very first pipeline, so the image exists, has been
