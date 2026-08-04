@@ -1122,7 +1122,7 @@ Three consequences to accept deliberately, none of them objections:
 3. **Verify that `pg:backups:restore` survives the running dyno.**
    Maintenance mode stops web traffic but the dyno keeps running, and
    solid_queue runs inside Puma, so connections stay open. Check whether
-   the restore terminates them or fails; do not pre-emptively add a
+   the restore terminates them or fails; do not preemptively add a
    `ps:scale web=0` that may not be needed.
 
 **Hardcode both application names in the restore step.** The
