@@ -33,8 +33,10 @@ order given under [Pinning Node](#pinning-node-for-the-production-build).
 **Decided, not yet built:** steps 2 to 11 of
 [The plan](#the-plan).
 
-**Chrome:** decided 2026-08-05, a second container; see
-[Chrome: a second container](#chrome-a-second-container).
+**Chrome:** decided *and built* 2026-08-05, a second container; see
+[Chrome: a second container](#chrome-a-second-container). Landed ahead
+of the new test image on purpose, so that it changes one thing against a
+known-good baseline instead of arriving mixed in with a new image.
 
 ## Finding 1: a frozen image freezes its trust anchors too
 
@@ -527,6 +529,55 @@ then five times clean in a row, and the message was never captured.
 Headed mode is the only path needing a real X display, which is the
 fragile part of that environment. Watch for it on a real desktop before
 concluding anything.
+
+### A green suite is not evidence, so we made it evidence
+
+The false pass above was not a one-off risk; while the old test image
+still carries a Chrome, *any* mistake in wiring up the remote browser
+fails silently into a local one, and the suite goes green. CI would have
+told us nothing.
+
+So `test/system/system_test_configuration_test.rb` now carries a guard:
+if `SELENIUM_REMOTE_URL` is set, the driver must actually be using it.
+It asserts twice on purpose, once that we asked for the right thing and
+once that asking worked, since reading `page.driver.browser` forces a
+real session to exist.
+
+It was tested by breaking the thing it guards. With the configuration
+deliberately reverted to ignore `SELENIUM_REMOTE_URL`, exactly
+reproducing the earlier bug, the guard failed as it should:
+
+```text
+Minitest::Assertion: Expected: "http://127.0.0.1:4444"
+3 tests, 5 assertions, 1 failures, 0 errors, 0 skips
+```
+
+It skips when the variable is unset, so local work is unaffected. A
+guard that has never been seen to fail is a guess.
+
+### What went into the pipeline
+
+* A third container in the `ruby-postgres` executor,
+  `selenium/standalone-chrome:150.0.7871.124@sha256:95690147…`, and
+  `SELENIUM_REMOTE_URL: http://127.0.0.1:4444` in the primary
+  container's environment.
+* **A readiness wait.** CircleCI starts secondary containers but does
+  not wait for what is *inside* them, and the grid takes a few seconds,
+  so the first system test would otherwise race the browser's startup.
+  The step polls `/status` and fails loudly after 60 seconds. Both its
+  patterns were checked against real output rather than guessed.
+* **The `browser-tools` orb is gone**, and with it the last orb, so the
+  `orbs` key no longer exists. Chrome's own container carries a matched
+  chromedriver.
+* `google-chrome --version` dropped from the version banner. The Chrome
+  that matters is in the other container, and the wait step prints it.
+  Any Chrome in the test image is not the one under test.
+
+Still unverified, because it cannot be tested from here: **whether
+`resource_class: medium` is enough**. That is 2 vCPU and 4 GB, now
+shared by Ruby, PostgreSQL and a Java-plus-Chrome container. If the
+grid never becomes ready, or a container is killed, try `large` before
+suspecting the design.
 
 ### Two dead fragments found while doing this
 
@@ -1108,8 +1159,8 @@ Prerequisite: [a pin must carry its own
 tag](#prerequisite-a-pin-must-carry-its-own-tag) is done, ahead of
 the rest, because Renovate proposes the wrong upgrades without it.
 
-[Chrome: a second container](#chrome-a-second-container) lands with
-step 4, since it changes the same executor the `build` job uses.
+[Chrome: a second container](#chrome-a-second-container) is done,
+ahead of step 3, against the old image as a known-good baseline.
 
 Findings 1, 2 and 4 have no separate step: steps 2 to 5 remove their
 cause.

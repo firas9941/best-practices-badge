@@ -24,17 +24,18 @@ version: 2.1
 # Tags are listed at https://hub.docker.com/r/cimg/postgres/tags and
 # https://circleci.com/developer/images/image/cimg/postgres
 #
-# We deliberately use ONLY CircleCI-certified orbs here (the "circleci/*"
-# namespace). The previous codecov/codecov and naokikimura/dscar-brakeman
-# orbs are uncertified public orbs: loading them would require enabling the
-# org-wide "Allow uncertified public orbs" setting, which lets ANY community
-# orb run in ANY pipeline across the org -- a supply-chain risk we decline to
-# accept. Instead, Codecov upload is run natively below (pinned + hash-verified
-# CLI), and Brakeman now runs as a GitHub Actions check gating the main branch
-# (see .github/workflows/brakeman.yml). Because staging and production are only
-# ever advanced from main, gating main is sufficient for this static analyzer.
-orbs:
-  browser-tools: circleci/browser-tools@1.4.9
+# We now use NO orbs at all, and if one is ever added it must be
+# CircleCI-certified (the "circleci/*" namespace). The previous
+# codecov/codecov and naokikimura/dscar-brakeman orbs are uncertified
+# public orbs: loading them would require enabling the org-wide "Allow
+# uncertified public orbs" setting, which lets ANY community orb run in
+# ANY pipeline across the org -- a supply-chain risk we decline to
+# accept. Instead, Codecov upload is run natively below (pinned +
+# hash-verified CLI), and Brakeman now runs as a GitHub Actions check
+# gating the main branch (see .github/workflows/brakeman.yml). Because
+# staging and production are only ever advanced from main, gating main
+# is sufficient for this static analyzer. The last orb,
+# circleci/browser-tools, went when Chrome moved into its own container.
 
 # Cache version is AUTOMATICALLY managed via checksums:
 # - {{ checksum ".ruby-version" }} invalidates cache when Ruby version changes
@@ -55,11 +56,29 @@ executors:
           PG_USER: ubuntu
           RAILS_ENV: test
           RACK_ENV: test
+          # Drive Chrome in the selenium container below rather than a
+          # Chrome installed beside the tests. Secondary containers share
+          # this container's network, which is the same fact that lets
+          # PG_HOST be "localhost". See docs/testing.md for the other
+          # ways to run system tests, and
+          # docs/build-environment-staleness.md for why.
+          SELENIUM_REMOTE_URL: http://127.0.0.1:4444
       # Secondary image - PostgreSQL for database
       - image: cimg/postgres:16.4@sha256:2e4f1a965bdd9ba77aa6a0a7b93968c07576ba2a8a7cf86d5eb7b31483db1378
         environment:
           POSTGRES_USER: ubuntu
           POSTGRES_DB: circle_ruby_test
+      # Secondary image - Chrome, for system tests.
+      #
+      # The tag names the Chrome version, and chromedriver inside the
+      # image is matched to it by construction, so the pair can never
+      # drift the way a separately-installed driver can. Because this is
+      # an image pinned in this file, Renovate proposes Chrome upgrades
+      # as ordinary pull requests, with no mechanism of our own.
+      #
+      # One session at a time is enough: system tests run serially, see
+      # the "test:optimized" comment in lib/tasks/default.rake.
+      - image: selenium/standalone-chrome:150.0.7871.124@sha256:9569014786466376d3e5cf8a7758562368cd9637f783dcd3abdb2eaf3a0d5cd7
 
   deploy-only:
     docker:
@@ -119,14 +138,30 @@ jobs:
     # - run:
     #     name: Update apt package lists
     #     command: sudo apt-get update
-    # For more on browser-tools integration with the main image, see:
-    # https://circleci.com/developer/images/image/cimg/ruby
-    # https://circleci.com/developer/orbs/orb/circleci/browser-tools
-    # https://github.com/CircleCI-Public/browser-tools-orb
-    # Chromedriver is finicky. browser-tools-orb version 1.4.2 fixed problems:
-    # https://github.com/CircleCI-Public/browser-tools-orb/issues/75
-    # https://github.com/CircleCI-Public/browser-tools-orb/releases/tag/v1.4.2
-    - browser-tools/install-chromedriver
+    # The browser-tools orb used to install chromedriver here. It is gone
+    # because Chrome now runs in its own container, which carries a
+    # chromedriver matched to it. The orb was in any case redundant:
+    # selenium-webdriver 4.6+ resolves a driver by itself, which is why
+    # a developer machine with no chromedriver on PATH still works.
+    #
+    # CircleCI starts secondary containers but does not wait for what is
+    # inside them to be ready, and the grid takes a few seconds. Without
+    # this, the first system test can race the browser's startup.
+    - run:
+        name: Wait for the Chrome container
+        command: |
+          for i in $(seq 1 60); do
+            if curl -sf --max-time 3 http://127.0.0.1:4444/status |
+                 grep -q '"ready": *true'; then
+              echo "Selenium grid ready after ${i}s"
+              curl -sf --max-time 3 http://127.0.0.1:4444/status |
+                grep -o '"browserVersion": *"[^"]*"' | head -1
+              exit 0
+            fi
+            sleep 1
+          done
+          echo 'ERROR: Selenium grid never became ready'
+          exit 1
     # Implement OSPS-BR-01.02: Validate branch name before use in pipeline
     # Protect against malicious branch names that could cause cache poisoning
     # or command injection attacks. Branch names are used in cache keys below.
@@ -135,11 +170,13 @@ jobs:
         command: script/validate_branch_name "$CIRCLE_BRANCH"
     - run: pwd
     - run: ls -l
+    # Chrome is deliberately not listed: the Chrome that matters is the
+    # one in the selenium container, and the wait step above prints its
+    # version. Any Chrome in this image is not the one under test.
     - run: |
         ruby --version
         node --version
         java --version
-        google-chrome --version
     # Prepare for artifact and test results
     - run: mkdir -p $CIRCLE_ARTIFACTS $CIRCLE_TEST_REPORTS
     # Force cleanup to make deterministic.
