@@ -110,6 +110,12 @@ executors:
           SE_START_XVFB: "false"
           SE_START_VNC: "false"
 
+  image-builder:
+    docker:
+      # prepare-image needs an HTTPS client and the Docker CLI, and
+      # nothing else: it does not run Ruby, Node or any of our code.
+      - image: cimg/base:2026.03@sha256:fdfacc6ce19a878cdacd7af20adf2b7a6dd0c0965b453c73844409bfbe882377
+
   deploy-only:
     docker:
       # The deploy job needs git, node, npm, wget, and openssl, and
@@ -128,6 +134,115 @@ executors:
       - image: cimg/node:24.19.0@sha256:8966565f07189a67d64d6808a2b127f31dafae566508e3547f55640e1070bfad
 
 jobs:
+  # Build the test image, but only when it does not already exist.
+  #
+  # NOT YET WIRED IN. The build job below still uses the old DockerHub
+  # image; pointing it at what this job publishes is a separate change,
+  # so that a failure here cannot be confused with a failure there.
+  # See docs/build-environment-staleness.md, "The plan", steps 3 and 4.
+  #
+  # Why a separate job at all: a CircleCI job cannot run inside an image
+  # it just built, because the executor's image is resolved from static
+  # configuration before any step runs.
+  prepare-image:
+    executor: image-builder
+    environment:
+      # Public, so the build job needs no pull credential at all and the
+      # only secret anywhere is this job's push token. Under the ossf
+      # organisation rather than a personal account, which was the real
+      # complaint about the image this replaces.
+      IMAGE_REPO: ghcr.io/ossf/badgeapp-test
+      # "docker manifest" is still gated behind this on some CLI
+      # versions, and silently absent without it.
+      DOCKER_CLI_EXPERIMENTAL: enabled
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Work out what the image should be
+          command: |
+            set -euo pipefail
+            RUBY_VERSION="$(tr -d '[:space:]' < .ruby-version)"
+            NODE_VERSION="$(sed -n 's/.*"node": *"\([^"]*\)".*/\1/p' \
+                            package.json | head -1)"
+            test -n "$RUBY_VERSION" && test -n "$NODE_VERSION"
+
+            # Resolve what heroku/heroku:24-build points at *now*, so the
+            # build is pinned to an exact digest and records which one.
+            # The policy is "pin whatever was current at build time and
+            # record it", not "freeze a digest until someone edits it".
+            TOKEN="$(curl -sf --retry 5 --retry-delay 5 --retry-all-errors \
+              "https://auth.docker.io/token?service=registry.docker.io&scope=repository:heroku/heroku:pull" \
+              | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')"
+            BASE_DIGEST="$(curl -sfI --retry 5 --retry-delay 5 --retry-all-errors \
+              -H "Authorization: Bearer $TOKEN" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json' \
+              -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+              "https://registry-1.docker.io/v2/heroku/heroku/manifests/24-build" \
+              | tr -d '\r' | sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: //p')"
+            test -n "$BASE_DIGEST"
+
+            # The cache key needs BOTH halves. The base digest alone
+            # keeps us current with nobody deciding anything, because
+            # when Heroku rebuilds the stack image the key changes by
+            # itself, but it cannot notice that *we* changed the recipe.
+            # The recipe hash alone would cache too well, because an
+            # operating system security update changes nothing we wrote.
+            RECIPE_HASH="$(cat dockerfiles/badgeapp-test/Dockerfile \
+                               .ruby-version package.json \
+                           | sha256sum | cut -c1-12)"
+            TAG="heroku24-ruby${RUBY_VERSION}-node${NODE_VERSION}"
+            TAG="${TAG}-b$(echo "$BASE_DIGEST" | cut -c8-19)-r${RECIPE_HASH}"
+
+            echo "export RUBY_VERSION='$RUBY_VERSION'" >> "$BASH_ENV"
+            echo "export NODE_VERSION='$NODE_VERSION'" >> "$BASH_ENV"
+            echo "export BASE_DIGEST='$BASE_DIGEST'"   >> "$BASH_ENV"
+            echo "export TAG='$TAG'"                   >> "$BASH_ENV"
+            echo "Base:  heroku/heroku:24-build@$BASE_DIGEST"
+            echo "Image: $IMAGE_REPO:$TAG"
+      - run:
+          name: Log in to the registry
+          command: |
+            set -euo pipefail
+            echo "$GHCR_TOKEN" | docker login ghcr.io \
+              -u "$GHCR_USER" --password-stdin
+      - run:
+          name: Point "current" at that image, building it if it is new
+          command: |
+            set -euo pipefail
+            # Ask whether the tag exists. Note this runs BEFORE any
+            # decision to build, so the common path is two registry
+            # reads and one registry write, and no build at all.
+            if docker manifest inspect "$IMAGE_REPO:$TAG" >/dev/null 2>&1
+            then
+              echo "Cache hit: $TAG already exists, not rebuilding."
+            else
+              echo "Cache miss: building $TAG."
+              docker build \
+                --build-arg BASE_IMAGE="heroku/heroku:24-build@${BASE_DIGEST}" \
+                --build-arg RUBY_VERSION="$RUBY_VERSION" \
+                --build-arg NODE_VERSION="$NODE_VERSION" \
+                -t "$IMAGE_REPO:$TAG" \
+                -f dockerfiles/badgeapp-test/Dockerfile \
+                dockerfiles/badgeapp-test
+              docker push "$IMAGE_REPO:$TAG"
+            fi
+
+            # Repoint "current" on BOTH paths, which is the whole point.
+            # An earlier design halted before this on a cache hit, which
+            # left "current" wherever the last cache *miss* had put it.
+            # That is silently wrong as soon as two Ruby versions are in
+            # flight, which is exactly what a Ruby upgrade proposal
+            # produces: two branches would alternate cache hits, neither
+            # repointing, and each would run its tests on the other's
+            # interpreter without saying so.
+            #
+            # imagetools copies registry-side, so this does not pull the
+            # image just to retag it.
+            docker buildx imagetools create \
+              -t "$IMAGE_REPO:current" "$IMAGE_REPO:$TAG"
+            echo "current -> $TAG"
+
   build:
     executor: ruby-postgres
     working_directory: ~/ossf/best-practices-badge

@@ -865,6 +865,109 @@ any case, since it is a separate binary run as a subprocess and WebMock
 patches Ruby HTTP libraries. Harmless, but they describe a mechanism
 that no longer exists, which is worse than saying nothing.
 
+## Step 3 as built
+
+Written 2026-08-05: `dockerfiles/badgeapp-test/Dockerfile` and the
+`prepare-image` job. The image builds and behaves; the job is written
+but **not yet in the workflow**, for the reason under
+[What is still needed](#what-is-still-needed-to-turn-it-on).
+
+### The image, verified from outside
+
+```text
+user: heroku (1000)   LANG: C.UTF-8   encoding: UTF-8
+ruby: 3.4.1           node: v24.19.0  gem: 3.6.2
+browser: absent       java: absent    size: 1.28GB
+```
+
+Three things it does that were learned the hard way rather than
+designed in:
+
+* **`USER root` to install, `chown` to `heroku`, then back down.**
+  Forced by the base being uid 1000 with `/usr/local` unwritable, and by
+  there being no `sudo`, so the Ruby tree must be *owned* by the CI user
+  rather than reachable by elevation. Confirmed afterwards that
+  `gem install bundler -v 2.7.2 --force` succeeds unelevated, which is
+  the operation CI actually needs.
+* **`ENV LANG=C.UTF-8`, asserted at build time.** The base leaves `LANG`
+  unset, giving `LC_CTYPE=POSIX` and a US-ASCII default external
+  encoding. For an application serving six languages that corrupts
+  non-ASCII text far from the cause. The build now *fails* rather than
+  ship without it:
+  `raise unless Encoding.default_external == Encoding::UTF_8`.
+* **Node verified against `nodejs.org`'s `SHASUMS256.txt`.** That is
+  integrity and not provenance, since tarball and checksums come from
+  the same host; it catches a corrupted download, not a compromised
+  nodejs.org. Said plainly in the file so nobody reads more into it.
+
+It deliberately contains no browser, no JDK, and **no gems**. A cold
+`bundle install` is 328 seconds and CI restores a 115 MiB dependency
+cache anyway; baking gems would rebuild the image on every
+`Gemfile.lock` change for nothing.
+
+Checked, not assumed: `db/schema.rb` is Ruby-format with no
+`structure.sql`, and nothing in CI shells out to `psql`, so no
+PostgreSQL client is needed.
+
+### The cache key, tested rather than reasoned about
+
+The tag is 58 characters, well inside Docker's limit, and readable:
+
+```text
+heroku24-ruby3.4.1-node24.19.0-ba6e743f508a2-r2c2d83d5d58c
+```
+
+Its two halves were each tested by changing one input and watching the
+key move:
+
+| Change | Key |
+| ------ | --- |
+| nothing | `2c2d83d5d58c` |
+| one comment added to the `Dockerfile` | `a08a0e28eb81` |
+| `.ruby-version` bumped to 3.4.10 | `ad0e4b548bdb` |
+
+The first row against the second is the fix for the design error
+recorded earlier, where a pull request editing the `Dockerfile` would
+have scored a cache hit and tested the image it had just replaced.
+
+The base-digest resolution was run locally too, and returned exactly the
+digest the image was actually built from, so the job is reading the
+registry correctly rather than plausibly.
+
+### What is still needed to turn it on
+
+`prepare-image` is defined but not referenced by any workflow, so it
+does not run. That is deliberate: it needs two things that do not exist
+yet, and adding it before they do would simply turn CI red.
+
+1. **A `ghcr.io/ossf/badgeapp-test` package**, public, so the `build`
+   job needs no pull credential.
+2. **A CircleCI context** supplying `GHCR_USER` and `GHCR_TOKEN`, the
+   token being a GitHub App installation token or fine-grained personal
+   access token with `packages: write` and nothing else, restricted to
+   the people who may hold it.
+
+Then adding it to the workflow is a few lines, and step 4 points the
+`build` job at `badgeapp-test:current`.
+
+**Two things in the job could not be tested from here** and should be
+watched on its first run: whether `cimg/base` carries `docker buildx`,
+which the registry-side retag needs, and whether `docker manifest
+inspect` works with the experimental flag the job sets. Both fail
+loudly rather than silently if absent.
+
+### What step 4 must change in the CI configuration
+
+Not done yet, and listed here so it is not rediscovered:
+
+* **Drop `sudo`** from the bundler install step; there is none.
+* **Add `--force`** to that `gem install`, and drop the `yes |`, which
+  cannot answer an error. This applies to any gem whose binstub
+  collides with Heroku's tarball; `rake` behaves the same way as
+  `bundler`.
+* **Remove `java --version`** from the version banner if it is still
+  there; the new image has no JVM.
+
 ## Keeping pins current
 
 The organising principle, decided 2026-08-04: **the pull request list is
