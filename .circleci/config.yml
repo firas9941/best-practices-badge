@@ -78,9 +78,31 @@ jobs:
     # Ubuntu mirrors occasionally return 404 for stale package versions
     # that have been replaced by a newer release; apt-get update fetches
     # current metadata so subsequent installs find the right URLs.
-    - run:
-        name: Update apt package lists
-        command: sudo apt-get update
+    #
+    # DISABLED 2026-08-04. Nothing in this job uses apt, so all this did
+    # was print an error on every build. It could not verify Google's
+    # Chrome apt repository: our test image's base
+    # (cimg/ruby:3.4.1-browsers) was built 2025-01-06, and Google created
+    # the signing subkey FD533C07C264648F, which signs that repository
+    # today, on 2025-01-07. Pinning an image by digest freezes its copy
+    # of the keyring too, so that key can never arrive; apt then reports
+    # "NO_PUBKEY FD533C07C264648F". Rebuilding the image would fix it
+    # only until Google rotates the subkey again, which they do about
+    # once a year.
+    #
+    # We checked before disabling this, not just assumed: there is no
+    # "apt-get install" anywhere in this file; browser-tools/install-
+    # chromedriver fetches chromedriver with curl and only apt-installs
+    # on yum-based systems; and nothing "rake default" runs uses apt.
+    #
+    # Restore it if a step is ever added that installs a package with
+    # apt. If you do, restrict it to Ubuntu's own repositories:
+    #     sudo apt-get update -o Dir::Etc::sourceparts=/dev/null
+    # which ignores /etc/apt/sources.list.d, so a third-party repository
+    # we never install from cannot make the step fail.
+    # - run:
+    #     name: Update apt package lists
+    #     command: sudo apt-get update
     # For more on browser-tools integration with the main image, see:
     # https://circleci.com/developer/images/image/cimg/ruby
     # https://circleci.com/developer/orbs/orb/circleci/browser-tools
