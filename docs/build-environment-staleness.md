@@ -602,6 +602,51 @@ guard that has never been seen to fail is a guess.
   that matters is in the other container, and the wait step prints it.
   Any Chrome in the test image is not the one under test.
 
+### What the green run actually reported
+
+Measured in CI 2026-08-05, from the first pipeline with the browser in
+its own container:
+
+```text
+ruby 3.4.1 (2024-12-25 revision 48d4efcb85) +PRISM [x86_64-linux]
+v22.12.0
+CPUs visible: 36
+memory limit (cgroup v2): 4294967296
+Mem: 4096 total   Swap: 0
+```
+
+So `resource_class: medium` is **exactly 4 GiB and no swap**, which we
+had never confirmed. Against that, the browser container's measured 719
+MB peak is comfortable.
+
+**But 36 CPUs are visible, and that is not a guarantee, it is the host's
+count.** The cgroup constrains memory and not the processor count, so
+every program in the job that sizes itself from `/proc` sizes itself for
+a machine we do not have. CircleCI's own reference warns about this for
+Java, and Selenium Grid is Java: its log line `Detected N available
+processors` is worth reading in the CI output.
+
+**The bigger instance is ours, not Selenium's.** `test/test_helper.rb`
+says `parallelize(workers: :number_of_processors, with: :processes)`,
+and `:number_of_processors` is `Etc.nprocessors`, which reports that
+same 36. So CI forks **36 Rails test worker processes**, each with its
+own test database, inside 4 GiB with no swap.
+
+This is not new and not currently breaking: it predates all of this work
+and the suite passes. It is recorded because it is almost certainly
+wasteful, and because a browser container now shares that budget.
+`ENV["PARALLEL_WORKERS"]` overrides the count, so the fix is one
+variable, but the right value is a measurement rather than a guess:
+fewer workers may well be *faster* here, since the guaranteed CPU is far
+below 36 and 36 processes contend for it. Try a value, compare wall
+time, keep the winner. Do not simply assume lower is better.
+
+**Node in the test image is v22.12.0.** That is a third version in play,
+against the 24.19.0 that `package.json` pins for production and that the
+`deploy` job's image carries. One more reason the new image should
+install the Node `package.json` names, and evidence that the current
+image drifted from production in more ways than Ruby and Ubuntu.
+
 ### The resource budget, now measured rather than assumed
 
 `.circleci/config.yml:105` sets `resource_class: medium` on the `build`
@@ -610,15 +655,15 @@ CircleCI's reference says the default "is subject to change" and that
 specifying one explicitly is preferred. The `deploy` job sets none and
 so takes that changeable default.
 
-**What `medium` actually grants was not verified.** CircleCI's docs are
-rendered client-side and the figures live in a partial that could not be
-retrieved, so the familiar "2 vCPU, 4 GB" is repeated here by nobody.
-Rather than guess, the version-banner step now prints `nproc` and the
-cgroup memory limit, which is the method CircleCI's own reference
-recommends. Read those numbers from the next run before touching
-`resource_class` in either direction. The block handles cgroup v1 and
-v2, since v2 replaced `hierarchical_memory_limit` with `memory.max`,
-and says so plainly rather than failing if neither is readable.
+**What `medium` grants is now measured**, and the memory half of the
+familiar "2 vCPU, 4 GB" is confirmed exactly: 4294967296 bytes, no swap.
+The CPU half is not confirmed and cannot be read from inside, because
+`nproc` reports the host's 36; see the run above. The version-banner
+step keeps printing both, which is the method CircleCI's own reference
+recommends, so a future stack or plan change shows up as data rather
+than as a surprise. The block handles cgroup v1 and v2, since v2
+replaced `hierarchical_memory_limit` with `memory.max`, and says so
+plainly rather than failing if neither is readable.
 
 The budget is shared by every container in the job, and adding a
 Java-plus-Chrome container made it tighter without anyone measuring it.
