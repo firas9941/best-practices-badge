@@ -1656,10 +1656,13 @@ receives.
    classify it is a gap in those two lists and deserves a human sooner
    than that.
 
-   `clear_notification_flag` became `write_notification_columns`. It
-   now counts attempts and stamps deliveries as well as clearing, and a
-   method named for one of the three things it does invites the reader
-   to assume the others do not happen.
+   `clear_notification_flag` was renamed, because it now counts
+   attempts and stamps deliveries as well as clearing, and a method
+   named for one of the three things it does invites the reader to
+   assume the others do not happen. It is called
+   `write_bookkeeping_columns` today; the reminder task and the
+   recalculation write through it too, so it is no longer only about
+   notifications.
 
    **Only `:sent` writes the sent-at column now.** Previously a
    no-longer-relevant notification stamped it too. Since step 3b those
@@ -1794,7 +1797,7 @@ everything, every bookkeeping write changed a CDN-cached response, which
 made *every* write a write that must purge. That is how
 `send_reminders` came to leave stale cached JSON for ten days at a time
 without anyone noticing, and the same was true of
-`write_notification_columns` and `save_warning_columns` in this very
+`write_bookkeeping_columns` and `save_warning_columns` in this very
 branch. Withholding these columns removes the reason those writes
 invalidate anything, which is a better answer than adding a purge to
 each of them and accepting nightly CDN churn for fields nobody reads.

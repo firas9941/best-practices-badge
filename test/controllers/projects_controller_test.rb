@@ -1765,6 +1765,25 @@ class ProjectsControllerTest < ActionDispatch::IntegrationTest
     # assert_equal late_project.id, result[0]
   end
 
+  # Sending a reminder is our bookkeeping, not the owner's edit, so it
+  # must not bump lock_version.  If it did, an owner who happened to have
+  # the edit form open would be told their entry "changed since you
+  # started editing" because we mailed them a reminder.
+  test 'sending reminders leaves lock_version alone' do
+    late_project = Project.find_by(name: 'Pathfinder OS')
+    late_project.last_reminder_at = nil
+    late_project.lost_passing_at = nil
+    late_project.save!(touch: false)
+    before = Project.where(id: late_project.id).pick(:lock_version)
+    assert_predicate before, :positive?, 'fixture must exercise a real lock'
+
+    ProjectsController.send :send_reminders
+
+    fresh = Project.find(late_project.id)
+    assert_not_nil fresh.last_reminder_at, 'reminder was not recorded'
+    assert_equal before, fresh.lock_version
+  end
+
   # Sending a reminder writes only last_reminder_at, which is withheld
   # from the project JSON and shown on no cached page, so it must not
   # cost a CDN purge.  Purging for a field nobody can see is the waste

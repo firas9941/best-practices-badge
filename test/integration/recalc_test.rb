@@ -166,6 +166,26 @@ class RecalcTest < ActionDispatch::IntegrationTest
     assert_equal 0, Project.find(project.id).warning_send_attempts
   end
 
+  # A recalculation writes values we computed ourselves, so it must not
+  # bump lock_version.  If it did, every owner with an edit form open
+  # when criteria change would be told their entry "changed since you
+  # started editing", for a change that was none of their doing.  Their
+  # own save recomputes these percentages anyway, so blocking them
+  # protects nothing.
+  test 'update_all_badge_percentages leaves lock_version alone' do
+    project = projects(:one)
+    project.update_column(:badge_percentage_0, 100)
+    before = Project.where(id: project.id).pick(:lock_version)
+    assert_predicate before, :positive?, 'fixture must exercise a real lock'
+
+    Project.update_all_badge_percentages(['0'])
+
+    fresh = Project.find(project.id)
+    assert_not_equal 100, fresh.badge_percentage_0,
+                     'recalculation should have rewritten this'
+    assert_equal before, fresh.lock_version
+  end
+
   # --- CDN purge tests ---
 
   # A project that actually changed must have its cached badge and JSON
@@ -375,22 +395,22 @@ class RecalcTest < ActionDispatch::IntegrationTest
 
   # Column names are interpolated into the UPDATE, so anything that is not
   # a real column must be refused rather than reaching the database.
-  test 'write_notification_columns refuses a name that is not a column' do
+  test 'write_bookkeeping_columns refuses a name that is not a column' do
     assert_raises(ArgumentError) do
       Project.send(
-        :write_notification_columns, projects(:one),
+        :write_bookkeeping_columns, projects(:one),
         'unreported_badge_loss = 0; DROP TABLE projects; --' => 1
       )
     end
     assert_raises(ArgumentError) do
-      Project.send(:write_notification_columns, projects(:one), no_such_column: 1)
+      Project.send(:write_bookkeeping_columns, projects(:one), no_such_column: 1)
     end
   end
 
   # The failure path must be noisy.  A bookkeeping write that quietly
   # changed nothing is exactly what let the same emails go out night after
   # night; see docs/warning_failures.md.
-  test 'write_notification_columns reports a write that matches no rows' do
+  test 'write_bookkeeping_columns reports a write that matches no rows' do
     missing = Project.new
     missing.id = -1 # no such row, so the update matches nothing
     logged = StringIO.new
@@ -398,7 +418,7 @@ class RecalcTest < ActionDispatch::IntegrationTest
     Rails.logger = ActiveSupport::Logger.new(logged)
     begin
       assert_not Project.send(
-        :write_notification_columns, missing, unreported_badge_loss: 0
+        :write_bookkeeping_columns, missing, unreported_badge_loss: 0
       )
     ensure
       Rails.logger = original_logger
