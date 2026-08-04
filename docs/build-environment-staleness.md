@@ -339,12 +339,28 @@ they are not an abandoned artifact we would be pinning to.
 * **Con.** More to install than a stock image gives us: Ruby, Chrome,
   and chromedriver, plus whatever the browser needs. That is a real
   amount of Dockerfile to get right once.
-* **Con.** Our Ruby would not be Heroku's exact binary. Heroku's
-  buildpack fetches prebuilt Ruby tarballs that are not publicly
-  readable; the obvious S3 paths return HTTP 403. We would build or
-  install Ruby ourselves. The operating system and its libraries would
-  match, which is the part that matters for native extensions; the Ruby
-  build itself would not be byte-identical.
+* **Pro, found late and worth the most.** We can install *Heroku's own
+  Ruby binary*, so the Ruby matches too, not merely the operating
+  system. Their prebuilt tarballs are publicly readable at
+  `https://heroku-buildpack-ruby.s3.us-east-1.amazonaws.com/`. The path
+  differs by stack, which is easy to get wrong: Heroku-24 takes an
+  architecture segment and Heroku-22 does not.
+
+  ```text
+  heroku-24/amd64/ruby-3.4.10.tgz   -> 200
+  heroku-24/ruby-3.4.1.tgz          -> 403   (no arch segment)
+  heroku-22/ruby-3.4.1.tgz          -> 200
+  ```
+
+  An earlier draft of this document said these were not publicly
+  readable, on the strength of a 403 from the path without the
+  architecture segment. That was wrong: S3 answers 403 rather than 404
+  when listing is denied, so a missing object and a forbidden one look
+  identical, and it is only safe to conclude anything from a **200**.
+
+  Installing that tarball rather than compiling makes the image build
+  minutes faster and removes the last difference between the test Ruby
+  and the production Ruby.
 
 #### Making approach D automatic: build in the pipeline, cache on the base
 
@@ -427,12 +443,13 @@ the Dockerfile at the same moment could both push `current`. It is
 unlikely, and the loser's next pipeline corrects it, so it does not
 justify the machinery that would prevent it.
 
-**A miss takes minutes, and that is fine.** Ruby has to be compiled,
-because Heroku's prebuilt tarballs are not publicly readable. That work
-has to happen somewhere for us to stay current; until now it happened
-by hand, or more accurately did not happen. Paying it occasionally, in
-the pipeline, when the base image has genuinely moved, is the point
-rather than the cost.
+**A miss takes a few minutes, and that is fine.** It fetches Heroku's
+prebuilt Ruby and installs Chrome rather than compiling anything, so it
+is a download and an unpack, not a build from source. That work has to
+happen somewhere for us to stay current; until now it happened by hand,
+or more accurately did not happen. Paying it occasionally, in the
+pipeline, when the base image has genuinely moved, is the point rather
+than the cost.
 
 Keying on the base digest is what makes this stay current without
 anyone deciding to update it. When Heroku rebuilds the stack image, and
@@ -567,15 +584,44 @@ running two of them pleasant rather than noisy. Renovate also has a
 `custom` manager, a regular expression matcher, if we later pin
 something version-like in a file no built-in manager knows.
 
-**One caution specific to Ruby: a green build does not prove Heroku
-can run it.** Under approach D our image installs Ruby itself, so any
-released version will build and test fine, while production's Ruby comes
-from Heroku's buildpack and only the versions it supports on our stack
-will deploy. A Renovate pull request proposing a Ruby that Heroku does
-not yet offer would pass CI and then fail at deploy. Restricting Ruby
-proposals to patch updates, and treating a minor or major move as a
-deliberate piece of work that checks Heroku's supported versions first,
-avoids that.
+**One caution specific to Ruby, and a way to enforce it.** Only the Ruby
+versions Heroku offers for our stack will deploy. A Renovate pull
+request proposing a newer one could otherwise pass CI and fail at
+deploy, which is the worst place to find out.
+
+Make it a test. Heroku's prebuilt Ruby tarballs are publicly readable,
+so asking whether a version exists is one HTTP request:
+
+```text
+https://heroku-buildpack-ruby.s3.us-east-1.amazonaws.com/
+  heroku-24/amd64/ruby-<version>.tgz
+```
+
+A test reads `.ruby-version`, issues a `HEAD` for that URL, and fails if
+the answer is not 200. Skip it when the network is unavailable, so it
+does not break offline work; CI has a network, and CI is where it
+matters, because that is what turns "Renovate proposed an impossible
+Ruby" into a red pull request instead of a failed deploy.
+
+Two details decide how strict it is.
+
+*What to compare.* Asking for the exact version is the strictest and the
+simplest: it answers precisely the question we care about, "can Heroku
+run the Ruby we have pinned", with no version arithmetic at all. Looser
+schemes, such as accepting any patch release within our X.Y series, need
+the bucket listed rather than probed, and answer a weaker question. Take
+the exact match unless a reason appears not to.
+
+*Which stack to ask about.* The path depends on it, and the two forms
+differ. Read the stack from a constant that the test image build also
+uses, so a stack upgrade cannot update one and forget the other. A
+mismatch here fails safe, since the wrong path returns 403 and the test
+fails, but failing for the wrong reason wastes an afternoon.
+
+Note that 403 does not distinguish "no such version" from "not allowed
+to look", because S3 hides the difference. Only a 200 means anything
+definite, so write the assertion as "must be 200" rather than "must not
+be 404".
 
 There is a pleasing consequence of the design in the other direction.
 Because `.ruby-version` is an input to the test image, a pull request
