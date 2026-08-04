@@ -33,8 +33,8 @@ order given under [Pinning Node](#pinning-node-for-the-production-build).
 **Decided, not yet built:** steps 2 to 11 of
 [The plan](#the-plan).
 
-**Still open:** [Chrome](#open-question-chrome), which decides part of
-what the new `Dockerfile` contains.
+**Chrome:** decided 2026-08-05, a second container; see
+[Chrome: a second container](#chrome-a-second-container).
 
 ## Finding 1: a frozen image freezes its trust anchors too
 
@@ -243,8 +243,8 @@ It ought to, being the image Heroku's own buildpacks compile in, but it
 is a five-minute check that would sink this approach if it failed, so do
 it first rather than discover it at the end.
 
-**Chrome and chromedriver are not settled**; see
-[Open question: Chrome](#open-question-chrome).
+**No browser goes in this image.** Chrome runs as a second container;
+see [Chrome: a second container](#chrome-a-second-container).
 
 ### Pinning
 
@@ -375,34 +375,114 @@ is a transient condition with a known cure, and the cure is patience.
 Log each retry, so a limit we are actually living inside shows up as
 something visible rather than as a slow build nobody can explain.
 
-## Open question: Chrome
+## Chrome: a second container
 
-Deferred deliberately on 2026-08-05, to be settled on its own rather
-than folded into the image work. Recorded here so the discussion starts
-from what is already known.
+Decided 2026-08-05. Chrome leaves our image entirely and runs as a
+second container, `selenium/standalone-chrome`, beside `cimg/postgres`
+in the `ruby-postgres` executor. Capybara talks to it over a URL.
 
-* **The two mechanisms disagree today.** `.circleci/config.yml` runs
-  `browser-tools/install-chromedriver` at test time, while this design
-  says the image carries Chrome and chromedriver. Pick one. The orb
-  matches chromedriver to whatever Chrome it finds, which is its whole
-  purpose, so it is not obviously the part to drop.
-* **Chrome is the next thing that will go stale.** Its version appears
-  nowhere in the cache key, so an image is rebuilt for a new base or a
-  new recipe, never for a new Chrome. Installing "latest" at build time
-  means Chrome tracks whatever the rebuilds happen to catch, and the tag
-  therefore does not identify the contents.
-* **Installing Chrome reintroduces finding 1.** It means adding Google's
-  apt repository to our own `Dockerfile`, which is the trust-anchor
-  problem that started this document. The lesson recorded there applies
-  unchanged: pin the master key fingerprint
-  `EB4C1BFD4F042F6DDDCCEC917721F63BD38B4796`, which was created
-  2016-04-12 and has no expiry, and fetch the signing material fresh at
-  build time rather than freezing a keyring.
-* The **separate `selenium/standalone-chrome` container** under
-  [Also considered](#also-considered) exists precisely to make this
-  someone else's problem, at the cost of reconfiguring Capybara for a
-  remote driver. It was set aside as solving a coupling that was not
-  hurting; this is the discussion that decides whether it now is.
+**The deciding reason is upgrades, not decoupling.** As an image pinned
+in `.circleci/config.yml`, Chrome falls under Renovate's `circleci`
+manager, which we are adding anyway. A new Chrome then arrives as an
+ordinary pull request, which is the whole interface described under
+[Keeping pins current](#keeping-pins-current), with no bespoke
+mechanism. Every other option needs something built to keep Chrome
+fresh, which is the exact failure this document exists to end.
+
+**Chrome's own version is pinnable.** The image publishes Chrome-version
+tags, not merely Selenium ones:
+
+```text
+150.0.7871.124
+150.0.7871.124-chromedriver-150.0.7871.124-grid-4.46.0-20260707
+150.0
+```
+
+Pin the plain exact-Chrome tag plus a digest. Chromedriver is matched to
+Chrome by construction inside the image, the Grid version rides along in
+the digest, and a short tag changes when Chrome changes, which is the
+signal worth seeing in a pull request title.
+
+It also **closes finding 1 rather than managing it**: our `Dockerfile`
+never adds Google's apt repository, so there is no keyring to rotate,
+and the `browser-tools` orb goes away with it.
+
+### Why the usual objection does not apply
+
+A single standalone container serves one session at a time
+(`SE_NODE_MAX_SESSIONS=1`), which normally collides with parallel tests.
+We never need more than one. `lib/tasks/default.rake:25` says
+`test:optimized` "runs regular tests (parallelized) then system tests
+(serial)", and `test/test_helper.rb:148` gives the reason: system tests
+are serial because `Capybara.server_port` is fixed at 31337. The scale
+is 22 test cases in 10 files. Parallel system tests are blocked today by
+that fixed port, not by the browser, so this decision forecloses
+nothing.
+
+Checked, and we use none of the APIs a remote browser complicates: no
+`attach_file` and therefore no file-detector problem, no `within_window`
+or `switch_to`, no browser-log reading, no download assertions.
+
+**The driver class does not change.** Selenium dispatches on the browser
+symbol, not on whether a URL was given: `Selenium::WebDriver.for(:chrome,
+url: ...)` still returns a `Chrome::Driver`, and only `browser: :remote`
+returns a `Remote::Driver`. So the Capybara registration,
+`Selenium::WebDriver::Chrome::Options`, the `--headless` argument and
+`driven_by :selenium, using: :headless_chrome` all stand. Only the
+transport differs.
+
+### What has to change, and what to verify
+
+* **Reachability.** The browser container must reach the application at
+  `localhost:31337`. We rely on the reverse direction today, with
+  `PG_HOST: localhost` and `cimg/postgres`, which is evidence but not
+  proof. If it does not hold, set `Capybara.server_host` to `0.0.0.0`
+  and address the host by its bridge address.
+* **`/dev/shm`.** Chrome in a container crashes on the default 64 MB,
+  which is why the Selenium images ask for `--shm-size=2g`, and
+  CircleCI's docker executor gives no control over that for secondary
+  containers. Expect to add `--disable-dev-shm-usage` to the Chrome
+  options. Verify rather than assume.
+* **Delete `driver.browser.download_path = Capybara.save_path`** from
+  the registration. It sends a CDP `Page.setDownloadBehavior` at
+  driver-creation time, so against a Grid it is the call most likely to
+  fail, and it would take every system test with it. Nothing tests
+  downloads, and the path would name a directory inside the browser
+  container anyway.
+* **Delete `browser_options.binary = ENV.fetch('GOOGLE_CHROME_SHIM',
+  nil) if ENV['CI']`.** `GOOGLE_CHROME_SHIM` is a Heroku buildpack
+  convention that CircleCI never sets, while `CI` is always set there,
+  so this assigns nil on every CI run. It is a leftover from when tests
+  ran on Heroku, and it is dead under every option considered.
+* **Gate the remote URL on an environment variable**, so a developer
+  with a local Chrome keeps exactly today's behaviour.
+
+### The orb is redundant, which is why dropping it is safe
+
+Established 2026-08-05 by running Selenium Manager directly, the same
+binary Selenium invokes:
+
+| Situation | What it resolves |
+| --------- | ---------------- |
+| No `chromedriver` on `PATH` | one from `~/.cache/selenium`, downloading on a miss |
+| `chromedriver` on `PATH` | the one on `PATH` |
+
+Nothing in our code sets `driver_path`, so `DriverFinder` runs Selenium
+Manager on every driver creation, and this machine has no `chromedriver`
+on `PATH` at all yet holds cached drivers for Chrome 141 through 150. So
+`browser-tools/install-chromedriver` is used in CI but not needed:
+remove it and Selenium Manager fetches an equivalent driver from the
+same place. Under this decision neither is involved, because the driver
+lives in the Selenium container.
+
+While looking: the WebMock and VCR allowances for
+`chromedriver.storage.googleapis.com/LATEST_RELEASE_*`,
+`googlechromelabs.github.io` and `storage.googleapis.com` in
+`test/test_helper.rb` are stale. They date from the `webdrivers` gem,
+which we no longer use, and they could not affect Selenium Manager in
+any case, since it is a separate binary run as a subprocess and WebMock
+patches Ruby HTTP libraries. Harmless, but they describe a mechanism
+that no longer exists, which is worse than saying nothing.
 
 ## Keeping pins current
 
@@ -451,6 +531,49 @@ the second.
 Run Renovate with `enabledManagers` limited to `circleci`. At its
 defaults it also reads the Gemfile, `.ruby-version` and Dockerfiles, and
 competes with Dependabot and with `propose_ruby_upgrade`.
+
+### Prerequisite: a pin must carry its own tag
+
+**This must be done before Renovate is enabled**, or it will propose the
+wrong thing quietly. Found 2026-08-05 by reading Renovate's source.
+
+We write pins with the tag in a comment:
+
+```yaml
+- image: cimg/postgres@sha256:2e4f1a96… # pin :16.4
+```
+
+`splitImageParts` in Renovate's Dockerfile manager, which its `circleci`
+manager calls for every image, splits on `@` and then on `:`. With no
+tag in the reference itself, `depTagSplit.length === 1`, so it records a
+`depName` and leaves **`currentValue` undefined**. The comment is
+invisible to it. A dependency with a digest and no tag then resolves
+against `latest`:
+
+```ts
+const newTag = isNonEmptyString(newValue) ? newValue : 'latest';
+const newTag = newValue ?? 'latest';
+```
+
+For `cimg/postgres` that means silently crossing PostgreSQL major
+versions; for our own test image it would be simply wrong.
+
+Write the tag where a machine can read it:
+
+```yaml
+- image: cimg/postgres:16.4@sha256:2e4f1a96…
+```
+
+Docker and CircleCI both accept that form, Renovate then updates tag and
+digest together, and the tag stops being an unverifiable comment that a
+human has to keep in step with the digest by hand. That is the
+`AGENTS.md` rule about preferring automated prevention to documentation,
+applied to a comment that is currently the sole record of what a digest
+means.
+
+This is worth doing on its own, ahead of everything else here, and it
+covers `cimg/postgres`, `cimg/node`, the Selenium image and the new test
+image.
 Renovate's `custom` manager, a regular expression matcher, covers
 anything version-like we later pin in a file no built-in manager knows.
 
@@ -873,8 +996,13 @@ Independent of the above, and in no particular order with it:
     `workflow_dispatch` button. See [Deploying without a development
     environment](#deploying-without-a-development-environment).
 
-Settle [Open question: Chrome](#open-question-chrome) before step 3,
-since it decides part of what the `Dockerfile` contains.
+Do [Prerequisite: a pin must carry its own
+tag](#prerequisite-a-pin-must-carry-its-own-tag) first. It is small,
+independent of everything else, and Renovate proposes the wrong
+upgrades without it.
+
+[Chrome: a second container](#chrome-a-second-container) lands with
+step 4, since it changes the same executor the `build` job uses.
 
 Findings 1, 2 and 4 have no separate step: steps 2 to 5 remove their
 cause.
