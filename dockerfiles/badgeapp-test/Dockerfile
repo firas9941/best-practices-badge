@@ -30,7 +30,10 @@ FROM ${BASE_IMAGE}
 # so a repository admin can manage it and set it public. Without it,
 # turning the package public becomes someone else's ticket.
 LABEL org.opencontainers.image.source=https://github.com/ossf/best-practices-badge
-LABEL org.opencontainers.image.description="CI test image: Ubuntu 24.04 (Heroku-24 stack), Heroku's prebuilt Ruby, and the Node package.json pins. No browser, no JDK, no gems."
+# Say what the image *is*, never which versions it happens to hold, so
+# this stays true across every stack, Ruby and Node upgrade. The
+# versions live in .ruby-version, package.json and the tag.
+LABEL org.opencontainers.image.description="CI test image: the same OS as production (Heroku's stack image), Heroku's prebuilt Ruby, and the Node that package.json pins. No browser, no JDK, no gems."
 LABEL org.opencontainers.image.licenses=MIT
 
 # Supplied by prepare-image, read from the files that already govern

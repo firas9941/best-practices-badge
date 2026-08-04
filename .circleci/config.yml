@@ -162,6 +162,11 @@ jobs:
           name: Work out what the image should be
           command: |
             set -euo pipefail
+            # The Heroku stack production builds on. Named ONCE here and
+            # passed to the build, so a stack upgrade cannot change the
+            # image while leaving the tag claiming the old one. Every
+            # other version comes from the file that already governs it.
+            STACK=heroku-24
             RUBY_VERSION="$(tr -d '[:space:]' < .ruby-version)"
             NODE_VERSION="$(sed -n 's/.*"node": *"\([^"]*\)".*/\1/p' \
                             package.json | head -1)"
@@ -178,7 +183,7 @@ jobs:
               -H "Authorization: Bearer $TOKEN" \
               -H 'Accept: application/vnd.oci.image.index.v1+json' \
               -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
-              "https://registry-1.docker.io/v2/heroku/heroku/manifests/24-build" \
+              "https://registry-1.docker.io/v2/heroku/heroku/manifests/${STACK#heroku-}-build" \
               | tr -d '\r' | sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: //p')"
             test -n "$BASE_DIGEST"
 
@@ -191,14 +196,15 @@ jobs:
             RECIPE_HASH="$(cat dockerfiles/badgeapp-test/Dockerfile \
                                .ruby-version package.json \
                            | sha256sum | cut -c1-12)"
-            TAG="heroku24-ruby${RUBY_VERSION}-node${NODE_VERSION}"
+            TAG="${STACK//-/}-ruby${RUBY_VERSION}-node${NODE_VERSION}"
             TAG="${TAG}-b$(echo "$BASE_DIGEST" | cut -c8-19)-r${RECIPE_HASH}"
 
+            echo "export STACK='$STACK'"               >> "$BASH_ENV"
             echo "export RUBY_VERSION='$RUBY_VERSION'" >> "$BASH_ENV"
             echo "export NODE_VERSION='$NODE_VERSION'" >> "$BASH_ENV"
             echo "export BASE_DIGEST='$BASE_DIGEST'"   >> "$BASH_ENV"
             echo "export TAG='$TAG'"                   >> "$BASH_ENV"
-            echo "Base:  heroku/heroku:24-build@$BASE_DIGEST"
+            echo "Base:  heroku/heroku:${STACK#heroku-}-build@$BASE_DIGEST"
             echo "Image: $IMAGE_REPO:$TAG"
       - run:
           name: Log in to the registry
@@ -219,7 +225,8 @@ jobs:
             else
               echo "Cache miss: building $TAG."
               docker build \
-                --build-arg BASE_IMAGE="heroku/heroku:24-build@${BASE_DIGEST}" \
+                --build-arg BASE_IMAGE="heroku/heroku:${STACK#heroku-}-build@${BASE_DIGEST}" \
+                --build-arg STACK="$STACK" \
                 --build-arg RUBY_VERSION="$RUBY_VERSION" \
                 --build-arg NODE_VERSION="$NODE_VERSION" \
                 -t "$IMAGE_REPO:$TAG" \
