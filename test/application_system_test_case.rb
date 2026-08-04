@@ -89,6 +89,12 @@ SELENIUM_OPTIONS =
   end
 
 class ApplicationSystemTestCase < ActionDispatch::SystemTestCase
+  # DRIVER and SELENIUM_REMOTE_URL are independent, and all four
+  # combinations work. DRIVER picks the browser: unset means
+  # :headless_chrome, and DRIVER=chrome runs headed so you can watch,
+  # which is the usual way to debug a failing system test. Rails adds
+  # --headless only for :headless_chrome, so DRIVER=chrome really is
+  # headed, in a container as well as here. See docs/testing.md.
   driver = ENV['DRIVER'].try(:to_sym)
   driven_by :selenium, using: driver || :headless_chrome,
             screen_size: [1400, 1400], options: SELENIUM_OPTIONS do |option|

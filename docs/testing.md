@@ -58,7 +58,7 @@ making actual network calls.
 
 Please review the Rails documentation on [testing](http://guides.rubyonrails.org/testing.html). Pull requests should endeavor to increase, not decrease test coverage, as monitored in [Codecov](https://codecov.io/gh/ossf/best-practices-badge).
 
-Running `rails t test/features/can_access_home_test.rb:4` will execute just the test from line 4. Removing the `:4` will run all tests in that file.
+Running `rails t test/system/access_home_test.rb:4` will execute just the test from line 4. Removing the `:4` will run all tests in that file.
 
 Write regression tests and ensure that they fail without your fix and pass with it. Include a comment in the test with the Github issue # for context.
 
@@ -124,21 +124,51 @@ Here's how a Rails system test normally works, as explained in
  The WebDriver tool automates...
 * A browser, such as Chrome."
 
-## Features
+## Choosing how the browser runs
 
-Features that don't need JavaScript should default to the headless rack-test driver, which is fastest. Features that need JavaScript should set `Capybara.current_driver = Capybara.javascript_driver` as described in this [blog post](http://www.rubytutorial.io/how-to-test-an-autocomplete-with-rails/). To debug features in a browser, preface the test with the driver in an environment variable, like:
+System tests live in `test/system/`. Two independent environment
+variables control the browser, and every combination of them works:
+
+| Variable | Unset | Set |
+| -------- | ----- | --- |
+| `DRIVER` | headless | `DRIVER=chrome` runs headed, so you can watch |
+| `SELENIUM_REMOTE_URL` | Chrome runs on this machine | Chrome runs in a separate container |
+
+So there are four modes, and the two you will use are the first two:
 
 ```bash
-DRIVER=firefox rails t
-DRIVER=chrome rails t test/features/can_access_home_test.rb:4
-DRIVER=poltergeist rails s test/features/can_access_home_test.rb
+# Local and headless.  The default, and what you usually want.
+rails test test/system/access_home_test.rb
+
+# Local and headed: a real Chrome window opens and you can watch it.
+DRIVER=chrome rails test test/system/access_home_test.rb:4
 ```
 
-Note that adding chrome or firefox as a DRIVER will let you observe the test in real time. This slows down the test but can be very helpful in revealing the cause of test problems.
+To pause a headed run so you can poke at the page yourself, put
+`binding.irb` in the test at the point of interest. The browser stays
+open until you leave the prompt.
 
-Selenium tests for Safari require this [file](http://selenium-release.storage.googleapis.com/2.48/SafariDriver.safariextz) but still do not seem to be working currently.
+The other two modes drive Chrome inside a container, which is how CI
+runs it and which needs no browser installed at all:
 
-Write Capybara features to test the happy path of new features. Test the feature both with the default rack-test (or poltergeist, for tests requiring Javascript) and with Selenium `DRIVER=chrome rails test`.
+```bash
+docker run -d --name se --network host \
+  selenium/standalone-chrome:150.0.7871.124
+
+# Remote and headless: what CI does.
+SELENIUM_REMOTE_URL=http://127.0.0.1:4444 rails test test/system/
+
+# Remote and headed: watch it at http://localhost:7900 in a browser.
+DRIVER=chrome SELENIUM_REMOTE_URL=http://127.0.0.1:4444 \
+  rails test test/system/
+```
+
+The container serves one session at a time, which is enough because
+system tests run serially; see `docs/build-environment-staleness.md`.
+
+Note that a headed run is slower than a headless one, but being able to
+see what the test sees is often the fastest way to find out why a test
+is failing.
 
 ## External API testing
 
@@ -146,7 +176,7 @@ We use Webmock and VCR to record external API responses and test against them wi
 
 ```bash
 rm test/vcr_cassettes/github_login.yml
-DRIVER=chrome GITHUB_PASSWORD=real_password rails t test/features/github_login_test.rb
+DRIVER=chrome GITHUB_PASSWORD=real_password rails t test/system/github_login_test.rb
 ```
 
 When re-recording cassettes involving the GitHub login
@@ -263,7 +293,7 @@ and reduce confidence in the entire test suite.
 
 Flapping tests are a challenge, especially with browser automation that requires JavaScript. Examine the `until` loop in the `ensure_choice` method of [login_test.rb](https://github.com/ossf/best-practices-badge/blob/main/test/system/login_test.rb) for one approach to make sure that actions are occurring before testing for their impact.
 
-It's quite helpful to debug a flapping test by running it multiple times. If you're using bash shell, you can run `repeat 10 rails t test/features/can_login_test.rb` by adding the following to your `~/.bash_profile`:
+It's quite helpful to debug a flapping test by running it multiple times. If you're using bash shell, you can run `repeat 10 rails t test/system/login_test.rb` by adding the following to your `~/.bash_profile`:
 
 ```bash
 # http://www.shellhacks.com/en/HowTo-Run-and-Repeat-a-Command-N-Times-in-Bash

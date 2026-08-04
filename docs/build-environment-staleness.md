@@ -495,6 +495,39 @@ container reaches the application on localhost**, and **64 MB of
 `disable-dev-shm-usage` all along. There is no measurable time cost;
 104.1s against 104.3s is noise.
 
+### Keeping a headed browser available
+
+Remote and headless is what CI wants; a person debugging a test wants
+the opposite. Both already work, because `DRIVER` and
+`SELENIUM_REMOTE_URL` are independent and all four combinations are
+valid. Verified 2026-08-05, each one run:
+
+| `DRIVER` | `SELENIUM_REMOTE_URL` | Result |
+| -------- | --------------------- | ------ |
+| unset | unset | local, headless. The local default |
+| unset | set | remote, headless. What CI does |
+| `chrome` | unset | local, headed. A window opens here |
+| `chrome` | set | headed in the container, watchable over noVNC |
+
+Rails adds `--headless` only for `:headless_chrome`, so `DRIVER=chrome`
+is genuinely headed: the container log for the fourth row shows
+`args: [--disable-search-engine-cho…, no-sandbox,
+disable-dev-shm-usage]` with no `--headless`, and the image's noVNC
+answers on port 7900.
+
+**No new knob.** `DRIVER` already existed, is already used by
+`docs/testing.md`, and adding a `HEADED` alias would be a second way to
+say one thing. What was missing was accurate documentation, since
+`docs/testing.md` was still describing `test/features/`, which no longer
+exists, and `poltergeist`, which left the `Gemfile` long ago.
+
+One caveat, unresolved: headed runs failed intermittently in the
+development container used for this work, roughly twice in eight runs,
+then five times clean in a row, and the message was never captured.
+Headed mode is the only path needing a real X display, which is the
+fragile part of that environment. Watch for it on a real desktop before
+concluding anything.
+
 ### Two dead fragments found while doing this
 
 Neither blocks the change, and both should go in a separate cleanup.
