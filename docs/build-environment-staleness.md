@@ -687,43 +687,102 @@ a file sits in, with no list to maintain. Add a test asserting that no
 standalone task shares a name with a task from the full set, so a
 shadowed name cannot silently skip the application it needed.
 
+### Move the database refresh into the deploy job
+
+Decided 2026-08-05, and it does more than tidy up.
+
+`production_to_staging` exists in the `Rakefile` only because that is
+where someone happened to put it. It is work done *to* staging as part
+of deploying to staging, and the job that deploys to staging already
+holds the credential to do it. Move it there, gated on the branch:
+
+```text
+maintenance:on
+  restore production's latest backup over staging   <- staging only
+  git push heroku staging:master
+  heroku run -- rails db:migrate
+maintenance:off
+```
+
+**Restore before the code push, and migrate after.** Then the one
+migration that runs is the new code's migrations against production's
+schema, which is what staging is *for*. Today's order runs migrations
+twice: once from `production_to_staging` against the code staging is
+still running, which achieves nothing, and once from CircleCI after the
+push, which is the one that matters.
+
+What this removes, which is the point:
+
+* **`HEROKU_API_KEY` never has to reach GitHub.** The staging button and
+  the production button become the same operation, advancing a branch,
+  and neither touches Heroku. The credential stays in the one place it
+  already lives, held by the one job that already has it.
+* **`production_to_staging` leaves the `Rakefile`.** `deploy_staging`
+  and `deploy_production` are then the same five git commands differing
+  only in the source branch, so they collapse into one parameterised
+  task.
+* **The deploy tasks stop needing the `heroku` CLI at all.** The local
+  path needs only `git`, which is a stronger result than this section
+  set out to get.
+* **The fire-and-forget migration goes away**, because the surviving
+  migration is CircleCI's existing blocking `heroku run`. That was the
+  first of the four cautions below and it no longer applies.
+* **The restore stops running against a live site.** Today it happens
+  before anything enters maintenance mode. In the deploy job it lands
+  after `maintenance:on`, which is strictly better.
+
+Three consequences to accept deliberately, none of them objections:
+
+1. **Every push to `staging` now refreshes the database**, not only the
+   ones made through the task. That is what staging is for, but it does
+   mean you can no longer test a migration against staging's accumulated
+   state without doing the restore by hand.
+2. **Re-running the staging deploy job becomes destructive.** Today
+   re-running it is safe; afterwards it wipes staging and restores
+   production. Reasonable for staging, but it changes what a familiar
+   button does, so say so where people will read it.
+3. **Verify that `pg:backups:restore` survives the running dyno.**
+   Maintenance mode stops web traffic but the dyno keeps running, and
+   solid_queue runs inside Puma, so connections stay open. Check whether
+   the restore terminates them or fails; do not pre-emptively add a
+   `ps:scale web=0` that may not be needed.
+
+**Hardcode both application names in the restore step.** The
+surrounding job derives `HEROKU_APP` from `$CIRCLE_BRANCH`, but the
+restore's source and target are constants, production to staging. Write
+them as constants, so that no branch name can ever redirect a restore,
+and let the existing branch allowlist be the second lock rather than the
+only one.
+
+Checked, not assumed: `heroku pg:backups` runs with no plugins
+installed on CLI 11.8.1, the version the `deploy` job pins, so the
+`deploy-only` executor needs nothing added.
+
 ### Then the deploy can be a button
 
-With the tasks free of Rails, a `workflow_dispatch` GitHub Actions
-workflow with a `target` input can call exactly the same code, so there
-is one implementation and two ways to run it, and the local path still
-works when GitHub does not.
+With the tasks free of Rails, and free of Heroku, a `workflow_dispatch`
+GitHub Actions workflow with a `target` input can call exactly the same
+code, so there is one implementation and two ways to run it, and the
+local path still works when GitHub does not.
 
-Authorisation becomes GitHub Environments with required reviewers, one
-per target. Note that the `production` button needs **no Heroku
-credential at all**, since `deploy_production` is pure git; only the
-staging button touches Heroku, and its key can be scoped to a `staging`
-environment.
+Both buttons now need **no Heroku credential at all**. What they need is
+the right to push to the protected `staging` and `production` branches:
+a GitHub App token listed as a bypass actor on exactly those two
+branches, not a broadly privileged `GITHUB_TOKEN`. Authorisation is
+GitHub Environments with required reviewers, one per target, which now
+guard an action rather than a secret. That the push starts no
+GitHub-side workflow does not matter here, because CircleCI triggers
+from its own integration.
 
-**Not CircleCI, though `HEROKU_API_KEY` already lives there.** CircleCI
-can push to Heroku today but not to GitHub, so routing the button
-through an API-triggered pipeline would mean *adding* a credential, a
-deploy key or App token, rather than moving one. Pushing to the
-protected `staging` and `production` branches needs a GitHub App token
-listed as a bypass actor on exactly those two branches; not a broadly
-privileged `GITHUB_TOKEN`. That the push starts no GitHub-side workflow
-does not matter here, because CircleCI triggers from its own
-integration.
+The remaining cautions, reduced from four to two by the move above:
 
-Four things to settle before building it:
-
-1. **`production_to_staging` uses `heroku run:detached` for the
-   migration**, which returns immediately. A button using it would
-   report success before the migration had finished. Make it blocking.
-2. **`--confirm staging-bestpractices` stops being a safety check** once
-   it is a constant in a script rather than something a human types. The
-   protection has to move to who may press the button.
-3. **The restore uses production's latest *existing* backup**, which is
+1. **`--confirm staging-bestpractices` stops being a safety check** once
+   it is a constant in a job rather than something a human types. The
+   protection moves to the branch allowlist in the deploy job and to who
+   may push to `staging`, which is enforced where the key actually is.
+2. **The restore uses production's latest *existing* backup**, which is
    deliberate, so as not to disturb production, and means staging can
    come up with data up to a day old. The button should say so.
-4. **`deploy_staging` overwrites the staging database.** That is the
-   point, but it is worth one confirmation step that names the
-   application being overwritten.
 
 ## Pinning Node for the production build
 
@@ -808,7 +867,9 @@ Node; see [The image](#the-image).
 
 Independent of the above, and in no particular order with it:
 
-11. **Stop booting Rails for every rake task**, then make the deploys a
+11. **Move the staging database refresh into the CircleCI deploy job**,
+    which takes Heroku out of the deploy tasks altogether.
+12. **Stop booting Rails for every rake task**, then make the deploys a
     `workflow_dispatch` button. See [Deploying without a development
     environment](#deploying-without-a-development-environment).
 
@@ -843,7 +904,11 @@ cause.
   every gem. `rake -T` costs 4.7 seconds and needs the full bundle.
 * `deploy_production` uses no Heroku credential; it is git only.
   `deploy_staging` also runs `production_to_staging`, which restores
-  production's latest *existing* backup over staging.
+  production's latest *existing* backup over staging. That restore is
+  moving into the CircleCI deploy job, after which neither task touches
+  Heroku.
+* `heroku pg:backups` and `pg:backups:restore` are core CLI commands,
+  needing no plugin install, on CLI 11.8.1.
 * A CircleCI job's executor image must come from a registry. Its cache
   cannot supply one, because `restore_cache` is a step and steps run
   inside the executor that is already running.
