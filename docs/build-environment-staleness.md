@@ -30,8 +30,12 @@ staging 2026-08-04):
 buildpack still has to be added to the two Heroku applications, in the
 order given under [Pinning Node](#pinning-node-for-the-production-build).
 
-**Decided, not yet built:** steps 2 to 11 of
+**Decided, not yet built:** steps 6 to 12 of
 [The plan](#the-plan).
+
+**Steps 3 to 5 are done** on branch `build_env_image`: there is no test
+image at all. See
+[Steps 3 to 5](#steps-3-to-5-and-why-they-turned-into-a-deletion).
 
 **Chrome:** decided, built, and **merged** 2026-08-05 as pull request
 2902, a second container; see
@@ -327,160 +331,36 @@ have surfaced at step 4 as a puzzling red job.
 **No browser goes in this image.** Chrome runs as a second container;
 see [Chrome: a second container](#chrome-a-second-container).
 
-### Pinning
+### Superseded: the image, its registry, and its cache key
 
-The build job resolves what `heroku/heroku:24-build` points at now and
-passes it in, so the Dockerfile reads
-`FROM heroku/heroku:24-build@${BASE_DIGEST}`. Every build is pinned to
-an exact digest and records which one. The policy changes from "a digest
-frozen in a file until someone edits it" to "pin whatever was current at
-build time, and record it".
+Between them, "Pinning", "Caching, and why the check is in the
+pipeline", "Why not CircleCI's own cache" and "Registry rate limits"
+described building a test image in the pipeline, publishing it, and
+keying a cache on the base digest and a recipe hash. **All of that is
+gone**, replaced by installing Ruby and Node into `$HOME` on Heroku's
+own stack image; see
+[Steps 3 to 5](#steps-3-to-5-and-why-they-turned-into-a-deletion).
 
-### Caching, and why the check is in the pipeline
+The reasoning is not preserved here in full, because a design record
+that contradicts the code is worse than one that is merely shorter.
+Three durable facts from it are worth keeping:
 
-The check belongs in the same workflow that builds and tests, not in a
-scheduled job. Correctness that depends on someone noticing a broken
-cron job is not correctness, and a pull request that edits the
-Dockerfile must be tested with the image it just described.
-
-Two jobs in one workflow, because **a CircleCI job cannot run inside an
-image it just built** — the executor's image is resolved from static
-configuration before any step runs:
-
-```text
-prepare-image  ->  build (tests)
-```
-
-Tag each build with everything that determines its contents:
-
-```text
-badgeapp-test:heroku24-ruby3.4.10-<base-digest>-<recipe-hash>
-```
-
-where `<recipe-hash>` is a hash over the `Dockerfile` and every file it
-copies in. **Both halves are needed.** The base digest alone keeps us
-current with nobody deciding anything, because when Heroku rebuilds the
-stack image the key changes by itself; but it cannot notice that *we*
-changed the recipe. The recipe hash alone would cache too well, because
-an operating system security update changes nothing we wrote. An earlier
-version of this design used only the base digest and Ruby, which would
-have let a pull request that edits the `Dockerfile` score a cache hit
-and run its tests against the image it had just replaced.
-
-`prepare-image` then:
-
-1. Resolves what `heroku/heroku:24-build` points at now: one request.
-2. Computes the recipe hash from the working tree.
-3. Asks the registry whether the matching tag exists: one request.
-4. **Points `badgeapp-test:current` at that tag**, whether it was
-   already there or has just been built.
-5. Halts with `circleci-agent step halt` if the tag already existed, so
-   the build is skipped.
-
-**Step 4 happens on both paths, and that is the whole point.** An
-earlier version halted at step 3 on a cache hit, leaving `:current`
-wherever the last cache *miss* had put it. That is silently wrong as
-soon as two Ruby versions are in flight, which is exactly what
-`propose_ruby_upgrade` produces: a branch on 3.4.1 and a branch on
-3.4.10 would alternate cache hits, neither repointing `:current`, and
-each would run its tests on the other's interpreter without saying so.
-
-**Order still matters for the expensive parts.** The `checkout` needed
-for the recipe hash is cheap; the `setup_remote_docker` that provisions
-a Docker environment, and the build itself, come after the halt, so
-neither runs on the common path. The common path is now two registry
-requests and one registry write rather than pure early exit. That is the
-price of a `:current` that is always right, and it is worth paying.
-
-The tests run against `badgeapp-test:current`, so
-`.circleci/config.yml` stays unchanged except when Ruby or the stack
-changes, which is exactly when a human should read it.
-
-**Decisions taken:**
-
-* The comparison is *existence of a tag name*, not reading a label and
-  comparing digest strings. The latter keeps one tag but means walking a
-  manifest to a config blob and handling multi-architecture indexes.
-  Simple wins while both are reliable.
-* The stable tag is mutable, so two branches can still race between
-  step 4 and the `build` job pulling it. Accepted, with eyes open: the
-  window is seconds rather than a whole pipeline, and a mismatch shows
-  up as a test failure on a rerunnable job rather than as a quiet pass.
-  If that judgement ever changes, the fix is the parameterized executor
-  under [Also considered](#also-considered), which removes the shared
-  mutable name entirely.
-* A miss takes a few minutes. Accepted: that work must happen somewhere
-  to stay current, and until now it happened by hand, or rather did not.
-
-### Why not CircleCI's own cache
-
-Asked, and the answer is no, for a structural reason rather than a
-preference. **`save_cache` and `restore_cache` are steps, and steps run
-inside the executor.** By the time any cache could be restored, the
-container we wanted to restore is already the one we are running in.
-This is the same fact recorded above, that a job cannot run inside an
-image it just built, seen from another angle: the executor's image is
-resolved from static configuration before any step exists to consult a
-cache. Workspaces have the same shape and the additional limit of
-living only within one workflow run.
-
-So with the **docker executor**, the image must come from a registry.
-CircleCI's caching is still useful *within* `prepare-image`, for Docker
-layers on the rare miss, and that is where to apply it.
-
-**That is a statement about the docker executor, not about CI in
-general**, and an earlier version of this section overstated it. On a
-**machine executor**, a VM with Docker, you can restore a cached image
-tarball, `docker load` it, and run the tests inside it with
-`docker run`; no registry is involved at all. The same is true of a
-plain GitHub Actions runner.
-
-It was not chosen because it restructures a working pipeline rather
-than extending it:
-
-* PostgreSQL and Chrome are secondary containers reachable on
-  `localhost`, which is what makes `PG_HOST` and `SELENIUM_REMOTE_URL`
-  work. They would have to be started by hand on a docker network.
-* Every step runs natively in the executor today; each would have to go
-  through `docker run`, with the workspace mounted, and
-  `store_test_results` and `store_artifacts` reading host paths.
-* Machine executors start more slowly and cost more per minute.
-* A cache miss still builds the image inside the job, which is the
-  "spends the test time we are protecting" objection already recorded
-  against building in-job.
-
-So the trade is: a registry costs one push credential forever; a machine
-executor costs a one-off restructuring and slower jobs, and no
-credential. Worth revisiting if the credential ever becomes the
-sticking point.
-
-**Use `ghcr.io` under the `ossf` organisation, and make the image
-public.** That answers the complaint in finding 2, which was not about
-DockerHub as such but about push access to one person's personal
-account. Public means the `build` job needs no pull credential at all,
-so the only secret is `prepare-image`'s push token: a GitHub App
-installation token or fine-grained personal access token with
-`packages: write` and nothing else, in a CircleCI context restricted to
-the people who may hold it.
-
-Making it public also removes most of the rate-limit exposure below,
-since `ghcr.io` does not meter anonymous pulls the way DockerHub does.
-
-### Registry rate limits
-
-DockerHub meters anonymous pulls, and we would rather not trade rights
-for headroom by authenticating a pull that needs no authentication.
-
-With the image on `ghcr.io`, what remains is the pull of
-`heroku/heroku:24-build`, which happens only on a cache miss, and the
-`cimg/postgres` and `cimg/node` pulls we already do today. So the
-exposure is small and mostly unchanged.
-
-Handle it by waiting rather than by escalating privilege: retry the base
-image pull with exponential backoff and a generous ceiling. A rate limit
-is a transient condition with a known cure, and the cure is patience.
-Log each retry, so a limit we are actually living inside shows up as
-something visible rather than as a slow build nobody can explain.
+* **A CircleCI docker executor's image must come from a registry.** Its
+  image is resolved from static configuration before any step runs, so
+  `restore_cache`, which is a step, can never supply it. This is what
+  forced a registry for as long as we had an image to publish, and it is
+  why the answer was to stop having one.
+* **That is a fact about the docker executor, not about CI.** A machine
+  executor can `docker load` a cached tarball and run tests inside it.
+  It was not chosen because it restructures a working pipeline: our
+  PostgreSQL and Chrome containers work *because* they are secondary
+  containers sharing localhost, every step runs natively, and machine
+  executors start more slowly and cost more.
+* **A cache key over an image needs both the base digest and a hash of
+  the recipe.** The base alone cannot notice that we changed the
+  recipe; the recipe alone caches through an operating system security
+  update. This mattered enough to be a recorded design error, and is
+  recorded here in case an image ever returns.
 
 ## Chrome: a second container
 
@@ -891,277 +771,108 @@ any case, since it is a separate binary run as a subprocess and WebMock
 patches Ruby HTTP libraries. Harmless, but they describe a mechanism
 that no longer exists, which is worse than saying nothing.
 
-## Step 3 as built
+## Steps 3 to 5, and why they turned into a deletion
 
-Written 2026-08-05: `dockerfiles/badgeapp-test/Dockerfile` and the
-`prepare-image` job. The image builds and behaves; the job is written
-but **not yet in the workflow**, for the reason under
-[What is still needed](#what-is-still-needed-to-turn-it-on).
+**Done 2026-08-05.** There is no test image. The `build` job runs
+directly on `heroku/heroku:24-build`, Heroku's own published stack
+image, and installs Ruby and Node into `$HOME` in about fourteen
+seconds. No `Dockerfile`, no registry, no credential, no
+`prepare-image`, no cache key, no mutable tag, no waiting.
 
-### The image, verified from outside
+That is the answer to findings 1, 2 and 4 together, and it is a smaller
+answer than the one this document spent a day designing.
 
-```text
-user: heroku (1000)   LANG: C.UTF-8   encoding: UTF-8
-ruby: 3.4.1           node: v24.19.0  gem: 3.6.2
-browser: absent       java: absent    size: 1.28GB
-```
+### How it got there, because the route matters
 
-Three things it does that were learned the hard way rather than
-designed in:
+Approach D was right that CI should run on the same stack as
+production. It was wrong to assume that meant *building an image*. The
+question "can we cache the image instead of publishing it?" led to a
+better one: **does the image have to carry the tools at all?**
 
-* **`USER root` to install, `chown` to `heroku`, then back down.**
-  Forced by the base being uid 1000 with `/usr/local` unwritable, and by
-  there being no `sudo`, so the Ruby tree must be *owned* by the CI user
-  rather than reachable by elevation. Confirmed afterwards that
-  `gem install bundler -v 2.7.2 --force` succeeds unelevated, which is
-  the operation CI actually needs.
-* **`ENV LANG=C.UTF-8`, asserted at build time.** The base leaves `LANG`
-  unset, giving `LC_CTYPE=POSIX` and a US-ASCII default external
-  encoding. For an application serving six languages that corrupts
-  non-ASCII text far from the cause. The build now *fails* rather than
-  ship without it:
-  `raise unless Encoding.default_external == Encoding::UTF_8`.
-* **Node verified against `nodejs.org`'s `SHASUMS256.txt`.** That is
-  integrity and not provenance, since tarball and checksums come from
-  the same host; it catches a corrupted download, not a compromised
-  nodejs.org. Said plainly in the file so nobody reads more into it.
-
-It deliberately contains no browser, no JDK, and **no gems**. A cold
-`bundle install` is 328 seconds and CI restores a 115 MiB dependency
-cache anyway; baking gems would rebuild the image on every
-`Gemfile.lock` change for nothing.
-
-Checked, not assumed: `db/schema.rb` is Ruby-format with no
-`structure.sql`, and nothing in CI shells out to `psql`, so no
-PostgreSQL client is needed.
-
-### The cache key, tested rather than reasoned about
-
-The tag is 58 characters, well inside Docker's limit, and readable:
+It does not. Measured on the stack image, unelevated:
 
 ```text
-heroku24-ruby3.4.1-node24.19.0-ba6e743f508a2-r2c2d83d5d58c
+Ruby 3.4.1 from Heroku's tarball ->  5.6s
+Node 24.19.0 from nodejs.org     ->  8.7s
 ```
 
-Its two halves were each tested by changing one input and watching the
-key move:
+Fourteen seconds, against a custom image 250 MB larger than the base
+precisely because it contained those two things. Pulling them as layers
+or fetching them directly is roughly a wash, and the fetch costs no
+registry.
 
-| Change | Key |
-| ------ | --- |
-| nothing | `2c2d83d5d58c` |
-| one comment added to the `Dockerfile` | `a08a0e28eb81` |
-| `.ruby-version` bumped to 3.4.10 | `ad0e4b548bdb` |
+`bundle install` then works exactly as it did in the built image: 84
+dependencies, 215 gems, 20 native extensions, frozen mode satisfied. It
+was in fact **faster in the job than in the image build**, 139 seconds
+against 328.
 
-The first row against the second is the fix for the design error
-recorded earlier, where a pull request editing the `Dockerfile` would
-have scored a cache hit and tested the image it had just replaced.
+### What this deletes
 
-The base-digest resolution was run locally too, and returned exactly the
-digest the image was actually built from, so the job is reading the
-registry correctly rather than plausibly.
+* The `Dockerfile`, and any procedure for rebuilding it. Finding 2 was
+  never really about the image being stale; it was about a manual chore
+  that therefore did not happen. The way to end a chore is to remove the
+  thing it maintains.
+* The registry, and with it the GHCR package, the organisation
+  permissions, the machine account, the classic token that would have
+  expired at inconvenient times, and the CircleCI context to hold it.
+* `prepare-image`, the two-part cache key, the `current` tag and its
+  race, and the parameterized-executor escape hatch that race would
+  eventually have needed.
+* The GitHub Actions publishing workflow considered as an alternative,
+  and the polling job that would have waited for it.
 
-### What is still needed to turn it on
+The only secret CircleCI holds remains `HEROKU_API_KEY`, in the deploy
+job, which is the one that genuinely must exist.
 
-`prepare-image` is defined but not referenced by any workflow, so it
-does not run. That is deliberate: it needs a published image and a push
-credential, and wiring it in first would simply turn CI red.
+### What survives, because it was never about the image
 
-It needs a registry, a repository in it, and a CircleCI context holding
-the push credential. **Which registry is not yet decided**, and the job
-takes it from one environment variable, `IMAGE_REPO`, so the choice is
-a one-line change either way.
+Every finding from building the image still applies, since the same
+base is now the executor:
 
-**`ghcr.io/ossf/badgeapp-test`** is the better long-term home: owned by
-the organisation rather than a person, which was the real complaint in
-finding 2, and its public pulls are not metered as DockerHub's are.
-Its permissions, checked 2026-08-05:
+* **It runs as uid 1000 `heroku` with no `sudo`**, so every step must
+  work unelevated. Ruby goes in `$HOME` for exactly this reason.
+* **`LANG` is unset**, giving `LC_CTYPE=POSIX` and a US-ASCII default
+  encoding. Set in the executor's environment, and a step now asserts
+  `Encoding.default_external == Encoding::UTF_8` so this fails with a
+  sentence rather than as a mangled character in some later test.
+* **`gem install bundler` needs `--force`, and `yes |` cannot help.**
+  Heroku's tarball ships a `bundle` binstub owned by no gem, so RubyGems
+  raises rather than prompting. The old `sudo sh -c 'yes | gem install'`
+  is now an unelevated `gem install --force`.
+* **No JDK, no browser, no `psql`.** Nothing we test uses a JVM, Chrome
+  is a separate container, and `db/schema.rb` is Ruby-format.
 
-* **Creating public packages** is governed by an organisation setting,
-  `Settings > Packages > Package Creation`, which only an organisation
-  **owner** can change. It may already permit them.
-* **Making a package public** needs *package* admin. A package pushed
-  with a personal access token is **not linked to a repository by
-  default**, and an unlinked package must be administered at the
-  package level, which is again owner territory.
-* That second gate is why the `Dockerfile` now carries
-  `LABEL org.opencontainers.image.source`. It links the package to this
-  repository at publication, after which the package **inherits the
-  repository's permissions**, so a repository admin can manage it and
-  set it public without an organisation owner.
+### Staleness, which is the whole point
 
-**The credential must be a classic token on a machine account, not a
-person's.** Correcting an earlier note here that said "fine-grained
-personal access token with `packages: write`": GitHub's own
-documentation says **"GitHub Packages only supports authentication
-using a personal access token (classic)"**, so a fine-grained token is
-not an option for `ghcr.io` at all. `GITHUB_TOKEN` works, but only
-inside GitHub Actions, and publishing from Actions loses the race that
-[the caching design](#caching-and-why-the-check-is-in-the-pipeline)
-exists to prevent: a pull request editing the `Dockerfile` could have
-CircleCI pull `current` before Actions had published the image it just
-described.
+`heroku/heroku:24-build` is pinned by tag and digest in
+`.circleci/config.yml`, beside PostgreSQL and Chrome. So **Renovate
+proposes its upgrades with no mechanism of our own**, exactly as it will
+for the other two. That is the same argument that decided Chrome, and it
+is what the elaborate cache-key design was reinventing by hand.
 
-A classic token is user-wide, so `write:packages` on a person's account
-grants push to every package that person can reach. Bound it by putting
-it on a **machine account owned by the organisation**, a member of
-`ossf` with only the access this needs. That also answers the durability
-question directly: nothing depends on one individual still being here.
+The Ruby and Node versions come from `.ruby-version` and
+`package.json`, the files that already govern them, so there is no third
+place to forget.
 
-Two costs to accept with open eyes. Classic tokens expire, so this needs
-rotating, which is itself the kind of chore this document is about; and
-**making a package public is a one-way door**, per GitHub's
-documentation. Neither changes the decision, but neither should be
-discovered later.
+### Costs, stated plainly
 
-A **DockerHub repository under a personal account** would need nobody's
-permission and would work today, but it fails the durability test that
-motivated moving off the current image in the first place, so it is
-recorded here as rejected rather than as a fallback.
-
-Then adding the job to the workflow is a few lines, and step 4 points
-the `build` job at `badgeapp-test:current`.
-
-**Two things in the job could not be tested from here** and should be
-watched on its first run: whether `cimg/base` carries `docker buildx`,
-which the registry-side retag needs, and whether `docker manifest
-inspect` works with the experimental flag the job sets. Both fail
-loudly rather than silently if absent.
-
-### Alternative: GitHub Actions publishes, CircleCI consumes
-
-Written 2026-08-05 for comparison, after the objection that a classic
-token in CircleCI is "yet another key to manage, one that is likely to
-repeatedly expire at inconvenient times". That objection is correct, and
-this design answers it by having **no long-lived credential anywhere**.
-
-**The two designs differ in exactly one thing: who holds a secret.**
-Everything else is shared, including the `Dockerfile`, the cache key,
-the stable tag and its race. So this is a narrow decision, not a rewrite.
-
-| Property | CircleCI pushes | Actions publishes |
-| -------- | --------------- | ----------------- |
-| Secret in CircleCI | `GHCR_USER` + classic PAT | **none** |
-| Secret anywhere | classic PAT, expires | **none**; `GITHUB_TOKEN` is minted per run and dies with the job |
-| Rotation chore | yes, unless set never to expire | **none** |
-| Package auto-links to the repo | no, needs the `source` label | **yes**, inherently |
-| Systems involved | one | two |
-| Waiting | none | CircleCI may wait for a publish |
-
-Checked, not assumed: **a public `ghcr.io` package can be read with no
-credentials at all.** `docker manifest inspect` on a public package
-succeeds after `docker logout`, and the anonymous token endpoint returns
-a token for the asking. So the consuming side genuinely needs nothing.
-
-#### The workflow
-
-```yaml
-name: Test image
-on: [push, pull_request]
-permissions:
-  contents: read
-  packages: write        # the whole permission budget
-jobs:
-  publish:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@<pinned>
-      - name: Work out what the image should be
-        run: |          # identical logic to prepare-image
-          ...           # STACK, RUBY_VERSION, NODE_VERSION,
-          ...           # BASE_DIGEST, RECIPE_HASH -> TAG
-      - name: Log in
-        run: echo '${{ secrets.GITHUB_TOKEN }}' | \
-             docker login ghcr.io -u '${{ github.actor }}' --password-stdin
-      - name: Build if new, then point current at it
-        run: |
-          docker manifest inspect "$REPO:$TAG" >/dev/null 2>&1 || {
-            docker build ... -t "$REPO:$TAG" ...
-            docker push "$REPO:$TAG"
-          }
-          docker buildx imagetools create -t "$REPO:current" "$REPO:$TAG"
-```
-
-`GITHUB_TOKEN` is minted for the run and expires when it ends, so there
-is nothing to store, nothing to rotate, and nothing to leak past the
-job. `packages: write` is the entire privilege: it cannot push code,
-merge, or deploy.
-
-#### The wait, on the CircleCI side
-
-```yaml
-  await-image:
-    executor: image-builder
-    steps:
-      - checkout
-      - run:
-          name: Wait for the image this tree describes
-          command: |
-            # Same computation as the workflow, then poll the PUBLIC
-            # registry until "current" resolves to our tag. No login:
-            # anonymous read of a public package is enough.
-            for i in $(seq 1 60); do
-              want="$(digest_of "$REPO:$TAG")"
-              have="$(digest_of "$REPO:current")"
-              [ -n "$want" ] && [ "$want" = "$have" ] && exit 0
-              sleep 10
-            done
-            echo 'ERROR: image never appeared; is the Actions run green?'
-            exit 1
-```
-
-with `requires: [await-image]` on `build`. A job's executor image is
-resolved when that job *starts*, so by the time `build` boots, the right
-image is published and `current` points at it. Ten minutes of patience
-is plenty and costs nothing on the common path, where the image already
-exists and the first poll succeeds.
-
-#### The assertion, which both designs should have
-
-Bake the recipe hash into the image and check it from inside the job
-that booted it:
-
-```yaml
-      - run:
-          name: Confirm we booted the image this tree describes
-          command: |
-            want="$(compute_recipe_hash)"
-            got="$(cat /etc/badgeapp-recipe-hash)"
-            [ "$want" = "$got" ] || {
-              echo "ERROR: booted an image built from recipe $got,"
-              echo "but this tree describes $want."
-              exit 1; }
-```
-
-This is worth having **whichever design wins**, because it is strictly
-stronger than what either offers alone: it converts "silently tested the
-wrong image" into a failure that names both hashes.
-
-#### The one thing neither design fixes
-
-`current` is a shared mutable name, so two branches that change the
-recipe at once can still repoint it under each other. The assertion
-above makes that loud rather than silent, which is the important part,
-but it can still fail a pull request for something another branch did.
-
-The clean fix is the **parameterized executor fed by dynamic
-configuration** already listed under
-[Also considered](#also-considered): each pipeline would use its own
-exact tag and there would be no shared name at all. That remains
-untested and is more machinery than the race currently justifies, but it
-is the end state if the flapping ever becomes real rather than
-theoretical.
-
-### What step 4 must change in the CI configuration
-
-Not done yet, and listed here so it is not rediscovered:
-
-* **Drop `sudo`** from the bundler install step; there is none.
-* **Add `--force`** to that `gem install`, and drop the `yes |`, which
-  cannot answer an error. This applies to any gem whose binstub
-  collides with Heroku's tarball; `rake` behaves the same way as
-  `bundler`.
-* **Remove `java --version`** from the version banner if it is still
-  there; the new image has no JVM.
+* **Fourteen seconds per build**, unavoidable and uncached; caching 269
+  MB would likely cost more than re-fetching 60 MB compressed.
+* **Two more hosts must be up during a build**, S3 and `nodejs.org`,
+  where before only the registry had to be. Not a new category, since
+  `bundle install` already needs rubygems.org, but it is more surface.
+* **Less integrity than a digest-pinned image.** Node is verified
+  against `SHASUMS256.txt`. Heroku publishes no checksum for its Ruby
+  tarball, so that download is trusted on the strength of HTTPS and a
+  version-specific URL. Recording our own SHA-256, as the Heroku CLI pin
+  does, is possible and would need updating on each Ruby bump; not done,
+  and worth revisiting if the exposure ever matters.
+* **DockerHub rate limits** are not a concern today: CircleCI's own
+  documentation says that since 2020-11-01 pulls through CircleCI are
+  not rate limited, by arrangement with Docker. If that changes, the fix
+  is an `auth:` block with a read-only token, and only then. This also
+  corrects an argument made earlier for `ghcr.io` on metering grounds,
+  which does not apply through CircleCI.
 
 ## Keeping pins current
 
@@ -1175,14 +886,13 @@ It follows that a proposal must always be one we could actually accept.
 A pull request that cannot be merged is not a decision waiting for a
 human, it is a chore, and chores are what we are removing.
 
-Four tools, distinct ground:
+Three tools, distinct ground:
 
 | Tool | Covers |
 | ---- | ------ |
 | Dependabot | `Gemfile`, npm, GitHub Actions workflows |
 | Renovate | `.circleci/config.yml` images and orbs |
 | `propose_ruby_upgrade` | `.ruby-version`, from what Heroku has |
-| `prepare-image` | the test image, rebuilt when its base moves |
 
 Renovate does **not** manage `.ruby-version`, though it can; see
 [Proposing Ruby upgrades](#proposing-ruby-upgrades-heroku-can-build)
@@ -1387,9 +1097,8 @@ a pull request next week", silently and with nothing red.
   does not require an opinion about the major upgrade sitting beside it.
 * **Share the probe with the guard test below.** One piece of code that
   answers "does Heroku have this Ruby for this stack", two callers.
-* A dead cron here leaves us stale, not wrong. That is why this may be
-  scheduled although the caching check in `prepare-image` may not: the
-  guard, not the cron, is what keeps an undeployable pin out.
+* A dead cron here leaves us stale, not wrong, and the guard rather
+  than the cron is what keeps an undeployable pin out.
 * **It opens pull requests, so the token analysis written for Renovate
   applies to it unchanged**: `contents: write` and
   `pull-requests: write`, never `workflows: write`, and **not** the
@@ -1437,9 +1146,9 @@ has a network, and CI is where it matters.
   Unit-test it with stubbed HTTP covering 200, 403 and a connection
   failure. The rake task is the thin part that CI runs live.
 
-Because `.ruby-version` is also an input to the test image, a pull
-request bumping it changes the cache key, so `prepare-image` builds an
-image for that Ruby and the tests genuinely run on it.
+A pull request bumping `.ruby-version` needs no other change: the
+`build` job reads that file and downloads the matching interpreter, so
+the tests genuinely run on the Ruby being proposed.
 
 ## Deploying without a development environment
 
@@ -1661,26 +1370,20 @@ Node; see [The image](#the-image).
    repository half is done.
 2. **DONE 2026-08-05: checked `heroku/heroku:24-build`** for `libpq`,
    its headers and a C toolchain. All present; see [The image](#the-image).
-3. **Add the `Dockerfile` and the `prepare-image` job together, leaving
-   the `build` job on the old image.** `prepare-image` then builds and
-   publishes on the very first pipeline, so the image exists, has been
-   produced by the mechanism that will keep producing it, and can be
-   pulled and tried, with nothing yet depending on it. This replaces an
-   earlier plan to build one by hand first: there is no reason to
-   bootstrap with a procedure we are trying to abolish.
-4. **Point the `build` job at `badgeapp-test:current`.** A one-line
-   change, and the first pipeline whose tests genuinely run on the new
-   image. Keep it a separate pull request so a failure here cannot be
-   confused with a failure in step 3.
-5. **Delete `dockerfiles/3.4.1-browsers/`, `dockerfiles/3.3.6-browsers/`
+3. **DONE 2026-08-05: run the `build` job on `heroku/heroku:24-build`
+   directly**, installing Ruby and Node into `$HOME`. No image, no
+   registry, no credential. See
+   [Steps 3 to 5](#steps-3-to-5-and-why-they-turned-into-a-deletion).
+4. **Delete `dockerfiles/3.4.1-browsers/`, `dockerfiles/3.3.6-browsers/`
    and `how-to-create-image.md`** once nothing references them. Leave
    the DockerHub image itself in place for a while: branches and open
-   pull requests older than step 4 still pin it by digest, and deleting
+   pull requests older than step 3 still pin it by digest, and deleting
    it breaks their pipelines for no gain.
+5. **Retire the DockerHub image** once no live branch pins it.
 6. **Add the Heroku-availability probe and the guard** that uses it, so
    step 7 cannot silently regress.
 7. **Take Ruby to 3.4.10** (finding 3), which under this design is a
-   one-line change plus an automatic rebuild.
+   one-line change to `.ruby-version` and nothing else.
 8. **Add `propose_ruby_upgrade`**, sharing the probe from step 6, so
    nobody has to remember to look.
 9. **Add Renovate**, self-hosted, scoped to `circleci` and permissioned
@@ -1741,8 +1444,10 @@ cause.
   inside the executor that is already running.
 * `test/test_helper.rb:58` calls `WebMock.disable_net_connect!`, so no
   Minitest test may reach the network. Live checks belong in rake tasks.
-* The test image lives at `ghcr.io`, public, under the `ossf`
-  organisation.
+* There is no test image. The `build` job runs on Heroku's stack image
+  and installs Ruby and Node into `$HOME` in about fourteen seconds.
+* DockerHub pulls through CircleCI are not rate limited, by arrangement
+  with Docker since 2020-11-01, per CircleCI's own documentation.
 * CircleCI docs are rendered client-side, so plain `curl` returns
   navigation rather than content. Two things were therefore *not*
   verified and should be before use: how parameterized executors behave
