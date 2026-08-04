@@ -25,7 +25,12 @@ staging 2026-08-04):
   because 10.17.0 declared `engines: node 20.x` and Node 20 is end of
   life.
 
-**Decided, not yet built:** everything in
+**In progress** (branch `build_env_staleness`): step 1 of
+[the plan](#the-plan), pinning Node. The repository side is done; the
+buildpack still has to be added to the two Heroku applications, in the
+order given under [Pinning Node](#pinning-node-for-the-production-build).
+
+**Decided, not yet built:** steps 2 to 10 of
 [The plan](#the-plan).
 
 ## Finding 1: a frozen image freezes its trust anchors too
@@ -286,13 +291,28 @@ which is exactly when a human should read it.
 
 ## Keeping pins current
 
-Three tools, distinct ground:
+The organising principle, decided 2026-08-04: **the pull request list is
+the set of decisions waiting for a human.** Nothing should require
+anyone to remember to check whether an upgrade is available. Look at the
+open pull requests, accept one, and it takes effect. That is the whole
+interface.
+
+It follows that a proposal must always be one we could actually accept.
+A pull request that cannot be merged is not a decision waiting for a
+human, it is a chore, and chores are what we are removing.
+
+Four tools, distinct ground:
 
 | Tool | Covers |
 | ---- | ------ |
 | Dependabot | `Gemfile`, npm, GitHub Actions workflows |
-| Renovate | `.circleci/config.yml` images and orbs, and `.ruby-version` |
+| Renovate | `.circleci/config.yml` images and orbs |
+| `propose_ruby_upgrade` | `.ruby-version`, from what Heroku has |
 | `prepare-image` | the test image, rebuilt when its base moves |
+
+Renovate does **not** manage `.ruby-version`, though it can; see
+[Proposing Ruby upgrades](#proposing-ruby-upgrades-heroku-can-build)
+for why we took that job away from it.
 
 **Dependabot cannot read `.circleci/config.yml`.** It has no CircleCI
 support: `dependabot/dependabot-core` carries one directory per
@@ -310,11 +330,12 @@ ruby version in Gemfile", asks for exactly `Gemfile`, `Gemfile.lock` and
 `orb` datasources. Its `ruby-version` manager declares
 `displayName = '.ruby-version'`, a file pattern of
 `/(^|/)\.ruby-version$/`, and the Ruby version datasource, reading the
-trimmed file contents as the current version.
+trimmed file contents as the current version. We use the first and not
+the second.
 
-Run Renovate with `enabledManagers` limited to `circleci` and
-`ruby-version`. At its defaults it also reads the Gemfile and
-Dockerfiles and competes with Dependabot for the same upgrades.
+Run Renovate with `enabledManagers` limited to `circleci`. At its
+defaults it also reads the Gemfile, `.ruby-version` and Dockerfiles, and
+competes with Dependabot and with `propose_ruby_upgrade`.
 Renovate's `custom` manager, a regular expression matcher, covers
 anything version-like we later pin in a file no built-in manager knows.
 
@@ -378,11 +399,66 @@ else's, so:
   with the two permissions above. CircleCI is unaffected either way,
   since it triggers from its own integration.
 
+## Proposing Ruby upgrades Heroku can build
+
+Decided 2026-08-04, after finding that Renovate cannot be made safe for
+this job.
+
+**The problem.** Renovate's Ruby datasource is ruby-lang.org, which
+announces a release the day it happens. Heroku builds its own binary
+some unknown time later. So Renovate would open a pull request we cannot
+merge, the deployability guard below would correctly turn it red, and it
+would sit there. Red pull requests that are merely early are worse than
+useless: they teach people to disregard red, and they turn the pull
+request list into a to-do list of things to keep re-checking, which is
+exactly the habit we are trying to retire.
+
+**No list exists, and this is not an oversight.** Checked by reading
+Heroku's own buildpack, 2026-08-04.
+`lib/language_pack/helpers/download_presence.rb` and
+`outdated_ruby_version.rb` discover what exists by **issuing `HEAD`
+requests against S3 for versions they guess**. `OutdatedRubyVersion`
+carries `DEFAULT_RANGE = 1..5`: from the current version it probes the
+next five patch releases in parallel, and if the last of them exists it
+enqueues a further range and keeps going. It probes upward across minor
+lines the same way. That is how our staging deploy knew to suggest
+3.4.10.
+
+`DownloadPresence` declares
+`STACKS = ["heroku-22", "heroku-24", "heroku-26"]` above the comment
+that those three "have identical ruby versions supported", which is
+useful: our stack upgrade will not narrow what Ruby we may run.
+
+The devcenter reference page lists supported versions in prose, 3.3.12,
+3.4.10 and 4.0.6 as of 2026-08-04, but not per stack and not
+machine-readably. So probing is not a workaround for a missing API; it
+is the only method available, and it is what the vendor does.
+
+**The design: propose only what exists.** A scheduled job,
+`propose_ruby_upgrade`, probes forward exactly as Heroku does, and opens
+a pull request bumping `.ruby-version` to what it finds. It cannot
+propose an undeployable version, so there is nothing to retry, and the
+schedule *is* the retry: a Heroku lag means "no pull request this week,
+a pull request next week", silently and with nothing red.
+
+* **Probe every line above ours, not just our own patch line.** A move
+  from 3.4 to 3.5, or to 4.0, is a decision we want *offered*. Offering
+  it is not committing to it. The point of the pull request list is that
+  choices arrive on their own and wait to be judged.
+* **One pull request per line**, so accepting the routine patch bump
+  does not require an opinion about the major upgrade sitting beside it.
+* **Share the probe with the guard test below.** One piece of code that
+  answers "does Heroku have this Ruby for this stack", two callers.
+* A dead cron here leaves us stale, not wrong. That is why this may be
+  scheduled although the caching check in `prepare-image` may not: the
+  guard test, not the cron, is what keeps an undeployable pin out.
+
 ## Guard: Ruby pins must stay deployable
 
-Only Ruby versions Heroku offers for our stack will deploy, so a
-Renovate pull request proposing a newer one could pass CI and fail at
-deploy. Make it a test instead.
+Only Ruby versions Heroku offers for our stack will deploy, so a pull
+request proposing a newer one, from `propose_ruby_upgrade` or from a
+human editing the file by hand, could pass CI and fail at deploy. Make
+it a test instead.
 
 The test reads `.ruby-version`, issues one `HEAD` for the corresponding
 tarball, and fails unless the answer is **200**. Skip it when the
@@ -403,11 +479,164 @@ Because `.ruby-version` is also an input to the test image, a pull
 request bumping it changes the cache key, so `prepare-image` builds an
 image for that Ruby and the tests genuinely run on it.
 
+## Deploying without a development environment
+
+Investigated 2026-08-04. `rake deploy_staging` and `rake deploy_production`
+currently require a working development environment. Nothing they do
+needs one; the requirement is an accident of how Rake starts.
+
+### Every rake task boots the whole application
+
+`Rakefile:7` reads:
+
+```ruby
+require File.expand_path('config/application', __dir__)
+```
+
+`config/application.rb` then does `require 'rails/all'` and
+`Bundler.require(*Rails.groups)`, so **every** invocation of `rake`, for
+any task, loads every gem in the `Gemfile` including the test-only ones.
+Measured: `rake -T` takes **4.7 seconds**, and it cannot run at all
+unless the full bundle is installed at the right Ruby. That, and not
+anything about deploying, is why deploying needs a development
+environment.
+
+It is not that the tasks need the application. `deploy_production` is
+pure git, with no Heroku credential of any kind:
+
+```text
+git checkout production && git pull &&
+  git merge --ff-only origin/staging && git push && git checkout main
+```
+
+`deploy_staging` is the same fast-forward from `origin/main`, preceded
+by `production_to_staging`, which is two `heroku` CLI calls.
+
+### The fix: boot only when the requested task needs it
+
+Rake sets `Rake.application.top_level_tasks` from the command line
+*before* it loads the `Rakefile`, so the `Rakefile` can see what was
+asked for and decide. Put the tasks that need no application in
+`lib/tasks/standalone/`, load those first, and boot only if something
+unrecognised was requested:
+
+```ruby
+Dir.glob(File.expand_path('lib/tasks/standalone/*.rake', __dir__))
+   .sort.each { |f| load f }
+
+wanted = Rake.application.top_level_tasks.map { |t| t.split('[').first }
+unless wanted.all? { |t| Rake::Task.task_defined?(t) }
+  require File.expand_path('config/application', __dir__)
+  Rails.application.load_tasks
+end
+```
+
+Verified as a working prototype 2026-08-04, including the cases that
+matter: `rake deploy_production` skips the boot; `rake` with no
+arguments, `rake -T` and any unknown task still boot, because Rake
+substitutes `default` when no task is named, and `default` is not a
+standalone task. `rake foo[bar]` is why the name is split on `[`.
+
+**Use `lib/tasks/standalone/`, not `rakelib/`.** Rake auto-imports
+`rakelib/*.rake`, but *after* the `Rakefile`, so the names are not
+defined in time to test. Loading them explicitly as well defines every
+task twice, and a task defined twice runs both bodies. The first
+prototype did exactly that and deployed twice in one command.
+
+The set of tasks that skip the boot is then expressed by which directory
+a file sits in, with no list to maintain. Add a test asserting that no
+standalone task shares a name with a task from the full set, so a
+shadowed name cannot silently skip the application it needed.
+
+### Then the deploy can be a button
+
+With the tasks free of Rails, a `workflow_dispatch` GitHub Actions
+workflow with a `target` input can call exactly the same code, so there
+is one implementation and two ways to run it, and the local path still
+works when GitHub does not.
+
+Authorisation becomes GitHub Environments with required reviewers, one
+per target. Note that the `production` button needs **no Heroku
+credential at all**, since `deploy_production` is pure git; only the
+staging button touches Heroku, and its key can be scoped to a `staging`
+environment.
+
+**Not CircleCI, though `HEROKU_API_KEY` already lives there.** CircleCI
+can push to Heroku today but not to GitHub, so routing the button
+through an API-triggered pipeline would mean *adding* a credential, a
+deploy key or App token, rather than moving one. Pushing to the
+protected `staging` and `production` branches needs a GitHub App token
+listed as a bypass actor on exactly those two branches; not a broadly
+privileged `GITHUB_TOKEN`. That the push starts no GitHub-side workflow
+does not matter here, because CircleCI triggers from its own
+integration.
+
+Four things to settle before building it:
+
+1. **`production_to_staging` uses `heroku run:detached` for the
+   migration**, which returns immediately. A button using it would
+   report success before the migration had finished. Make it blocking.
+2. **`--confirm staging-bestpractices` stops being a safety check** once
+   it is a constant in a script rather than something a human types. The
+   protection has to move to who may press the button.
+3. **The restore uses production's latest *existing* backup**, which is
+   deliberate, so as not to disturb production, and means staging can
+   come up with data up to a day old. The button should say so.
+4. **`deploy_staging` overwrites the staging database.** That is the
+   point, but it is worth one confirmation step that names the
+   application being overwritten.
+
+## Pinning Node for the production build
+
+The fix for finding 5, in two halves. Checked 2026-08-04.
+
+**The repository half, done.** A root `package.json` whose only
+substantive content is `engines.node`, pinned to an exact **24.19.0**.
+That is the newest release of the 24 line, which is the current LTS, and
+it is the version the `deploy` job's `cimg/node` image already carries,
+so the Node that minifies our JavaScript and the Node that runs the
+Heroku CLI are now the same. Heroku publishes it: the buildpack's
+`inventory/node.toml` at release `v361`, published 2026-08-03, lists
+24.19.0 with a SHA-256 and fetches it from `nodejs.org`.
+
+We pin the exact version rather than the `24.x` range Heroku's README
+suggests. A range is the problem restated: the build changes and nobody
+decided it should.
+
+There is no `package-lock.json`, because there is nothing to lock. The
+buildpack reads `package-lock.json` only to choose between `npm ci` and
+`npm install`, and takes the latter without complaint.
+
+**The application half, not done.** `heroku/nodejs` must be configured
+on both applications, between the mimalloc buildpack and `heroku/ruby`:
+
+```text
+heroku buildpacks:add --index 2 heroku/nodejs --app staging-bestpractices
+```
+
+Until then this pin does nothing. `heroku/ruby` does not read
+`engines.node`; it installs a Node of its own whenever it sees `execjs`
+in `Gemfile.lock`, which it does.
+
+**Order matters, and getting it wrong rejects a deploy.**
+`heroku/nodejs` `bin/detect` *requires* `package.json` in the root, and a
+classic buildpack whose detect fails fails the whole build. So the
+`package.json` must reach the application first, and only then may the
+buildpack be added. Deploy, add, deploy again, and read the second
+build's log to confirm it reports 24.19.0.
+
+**Consequence for the new test image.** `license_finder` activates its
+NPM scanner on the presence of `package.json`, so it now shells out to
+`npm`. It passes here, having nothing to find, but the image built in
+step 2 must carry Node and npm or that check breaks.
+
 ## The plan
 
 1. **Pin Node for the production build** (finding 5). Independent,
    cheap, and the only finding that can break a deploy. Add the
    `heroku/nodejs` buildpack ahead of `heroku/ruby` and pin the version.
+   See [Pinning Node](#pinning-node-for-the-production-build); the
+   repository half is done.
 2. **Write the new test image**: `FROM heroku/heroku:24-build`, Heroku's
    prebuilt Ruby, Chrome, chromedriver. Confirm the suite passes on it
    before anything depends on it.
@@ -416,13 +645,22 @@ image for that Ruby and the tests genuinely run on it.
 4. **Delete `dockerfiles/3.4.1-browsers/`, `dockerfiles/3.3.6-browsers/`
    and `how-to-create-image.md`**, and the DockerHub image they
    describe, once nothing references them.
-5. **Take Ruby to 3.4.10** (finding 3), which under this design is a
+5. **Add the Heroku-availability probe and the guard test** that uses
+   it, so step 6 cannot silently regress.
+6. **Take Ruby to 3.4.10** (finding 3), which under this design is a
    one-line change plus an automatic rebuild.
-6. **Add the Heroku-availability test** so step 5 cannot silently
-   regress.
-7. **Add Renovate**, self-hosted, scoped and permissioned as above.
-8. **Then upgrade production to Heroku-26**, test environment first, so
+7. **Add `propose_ruby_upgrade`**, sharing the probe from step 5, so
+   nobody has to remember to look.
+8. **Add Renovate**, self-hosted, scoped to `circleci` and permissioned
+   as above.
+9. **Then upgrade production to Heroku-26**, test environment first, so
    the stack move is exercised somewhere before it reaches production.
+
+Independent of the above, and in no particular order with it:
+
+10. **Stop booting Rails for every rake task**, then make the deploys a
+    `workflow_dispatch` button. See [Deploying without a development
+    environment](#deploying-without-a-development-environment).
 
 Findings 1, 2 and 4 have no separate step: steps 2 to 4 remove their
 cause.
@@ -441,6 +679,21 @@ cause.
   rebuilt regularly.
 * Heroku Ruby tarballs: `heroku-24/amd64/ruby-X.Y.Z.tgz`,
   `heroku-22/ruby-X.Y.Z.tgz`, under the S3 host named above.
+* There is **no list** of the Ruby versions Heroku has, for anyone.
+  Heroku's own buildpack probes with `HEAD` requests, guessing versions.
+  heroku-22, heroku-24 and heroku-26 support the same set, per the
+  comment on `DownloadPresence::STACKS`.
+* Buildpacks on both applications, in order:
+  `deadmanssnitch/buildpack-mimalloc`, then `heroku/ruby`. `heroku/ruby`
+  installs a Node of its own because `execjs` is in `Gemfile.lock`.
+* `Rakefile:7` requires `config/application`, so *every* rake task loads
+  every gem. `rake -T` costs 4.7 seconds and needs the full bundle.
+* `deploy_production` uses no Heroku credential; it is git only.
+  `deploy_staging` also runs `production_to_staging`, which restores
+  production's latest *existing* backup over staging.
+* `CLAUDE.md` is out of date where it says there is no
+  `config.load_defaults`: `config/application.rb:39` sets
+  `config.load_defaults 8.1`.
 * CircleCI docs are rendered client-side, so plain `curl` returns
   navigation rather than content. Two things were therefore *not*
   verified and should be before use: how parameterized executors behave
