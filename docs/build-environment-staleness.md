@@ -423,39 +423,93 @@ Checked, and we use none of the APIs a remote browser complicates: no
 `attach_file` and therefore no file-detector problem, no `within_window`
 or `switch_to`, no browser-log reading, no download assertions.
 
-**The driver class does not change.** Selenium dispatches on the browser
-symbol, not on whether a URL was given: `Selenium::WebDriver.for(:chrome,
-url: ...)` still returns a `Chrome::Driver`, and only `browser: :remote`
-returns a `Remote::Driver`. So the Capybara registration,
-`Selenium::WebDriver::Chrome::Options`, the `--headless` argument and
-`driven_by :selenium, using: :headless_chrome` all stand. Only the
-transport differs.
+### Where the change goes, which is not where it looks
 
-### What has to change, and what to verify
+**Not in `Capybara.register_driver`.**
+`ActionDispatch::SystemTesting::Driver#register` calls
+`Capybara.register_driver` under its own name, `:selenium`, and makes it
+current, so our `Capybara.register_driver :headless_chrome` block is not
+what system tests run. Rails builds the driver from
+`driven_by`, and passes `options:` straight through to
+`Capybara::Selenium::Driver.new`:
 
-* **Reachability.** The browser container must reach the application at
-  `localhost:31337`. We rely on the reverse direction today, with
-  `PG_HOST: localhost` and `cimg/postgres`, which is evidence but not
-  proof. If it does not hold, set `Capybara.server_host` to `0.0.0.0`
-  and address the host by its bridge address.
-* **`/dev/shm`.** Chrome in a container crashes on the default 64 MB,
-  which is why the Selenium images ask for `--shm-size=2g`, and
-  CircleCI's docker executor gives no control over that for secondary
-  containers. Expect to add `--disable-dev-shm-usage` to the Chrome
-  options. Verify rather than assume.
-* **Delete `driver.browser.download_path = Capybara.save_path`** from
-  the registration. It sends a CDP `Page.setDownloadBehavior` at
-  driver-creation time, so against a Grid it is the call most likely to
-  fail, and it would take every system test with it. Nothing tests
-  downloads, and the path would name a directory inside the browser
-  container anyway.
-* **Delete `browser_options.binary = ENV.fetch('GOOGLE_CHROME_SHIM',
-  nil) if ENV['CI']`.** `GOOGLE_CHROME_SHIM` is a Heroku buildpack
-  convention that CircleCI never sets, while `CI` is always set there,
-  so this assigns nil on every CI run. It is a leftover from when tests
-  ran on Heroku, and it is dead under every option considered.
-* **Gate the remote URL on an environment variable**, so a developer
-  with a local Chrome keeps exactly today's behaviour.
+```ruby
+SELENIUM_REMOTE_URL = ENV.fetch('SELENIUM_REMOTE_URL', nil)
+SELENIUM_OPTIONS =
+  if SELENIUM_REMOTE_URL
+    { browser: :remote, url: SELENIUM_REMOTE_URL }
+  else
+    {}
+  end
+
+driven_by :selenium, using: driver || :headless_chrome,
+          screen_size: [1400, 1400], options: SELENIUM_OPTIONS do |option|
+```
+
+**`browser: :remote` is load-bearing, not cosmetic.**
+`Driver#initialize` reads
+`@browser.preload unless @options[:browser] == :remote`, and `preload`
+is what resolves a *local* chromedriver through Selenium Manager. Pass
+only `url:` and a machine with no browser still tries to download one,
+which is the cost we are removing. This does mean the driver becomes a
+`Remote::Driver` rather than a `Chrome::Driver`, correcting an earlier
+claim here that the class would not change. Nothing we do needs the
+Chrome subclass, and the `driven_by` block still configures Chrome
+options, which the run below confirms.
+
+**Everything else stands.** The block's `no-sandbox` and
+`disable-dev-shm-usage` arguments, Rails' own `--headless`, and
+`screen_size` all reach the remote browser unchanged.
+
+### The experiment, including how it first lied
+
+Run 2026-08-05 against `selenium/standalone-chrome:150.0.7871.124`
+(digest `sha256:95690147…`) on `--network host`, to match CircleCI's
+shared-localhost topology, with the container's default 64 MB
+`/dev/shm`, because CircleCI gives no way to raise it.
+
+| Run | Result |
+| --- | ------ |
+| Baseline, local Chrome, 22 tests | 197 assertions, 0 failures, 104.3s |
+| Remote, 22 tests | 197 assertions, 0 failures, 104.1s |
+| Negative control, container stopped | `Errno::ECONNREFUSED` on every test |
+
+**The first attempt passed while proving nothing**, because the change
+had been made in the `register_driver` block that Rails does not use.
+The tests were quietly still driving local Chrome. What exposed it was
+asking the container what it had done: `docker logs` showed **zero**
+sessions created. The negative control is now the standing check, since
+a configuration that cannot fail when the browser is absent is not
+testing the browser.
+
+The container log confirms the real run: one session, `browserName
+chrome`, `browserVersion 150.0.7871.124`, `chromedriverVersion
+150.0.7871.124`, matched by construction, with our arguments present as
+`[--disable-search-engine-cho…, --headless, no-sandbox,
+disable-dev-shm-usage]`. No crash, no shared-memory complaint.
+
+Both questions this was meant to settle came out yes: **the browser
+container reaches the application on localhost**, and **64 MB of
+`/dev/shm` is survivable**, the latter because
+`test/application_system_test_case.rb` has passed
+`disable-dev-shm-usage` all along. There is no measurable time cost;
+104.1s against 104.3s is noise.
+
+### Two dead fragments found while doing this
+
+Neither blocks the change, and both should go in a separate cleanup.
+
+* The whole `Capybara.register_driver :headless_chrome` block is
+  unreachable from system tests, per the finding above, and nothing
+  outside `test/system/` uses Capybara. Inside it,
+  `driver.browser.download_path = Capybara.save_path` and
+  `browser_options.binary = ENV.fetch('GOOGLE_CHROME_SHIM', nil) if
+  ENV['CI']` are dead twice over: `GOOGLE_CHROME_SHIM` is a Heroku
+  buildpack convention CircleCI never sets, while `CI` always is, so
+  that line assigns nil on every CI run.
+* Rails' `default_chrome_options` already adds `--headless` for
+  `:headless_chrome`, so the block's own `--headless` is a duplicate of
+  something we no longer reach.
 
 ### The orb is redundant, which is why dropping it is safe
 
