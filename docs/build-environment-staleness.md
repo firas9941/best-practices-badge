@@ -205,44 +205,140 @@ production deploy.
 
 ### For findings 1 to 4, the test image
 
-1. **Rebuild by hand, now.** Bump the base to a current
-   `cimg/ruby:<version>-browsers`, rebuild, push, re-pin. Fixes all four
-   for a while. Does nothing about the procedure, so expect to be back
-   here.
-2. **Automate the rebuild.** A scheduled job that rebuilds the image
-   from a current base and opens a pull request with the new digest.
-   This is the only option that addresses the cause. Cost: somewhere to
-   run it, and credentials to push to a registry.
-3. **Stop maintaining a custom image.** Ours adds only three things to
-   `cimg/ruby:*-browsers`: `cmake`, `shared-mime-info`, and Bundler
-   2.7.
+What we want from the test environment, stated plainly, because these
+pull against each other:
 
-   One of those three is already redundant. `cmake` is installed by
-   `cimg/base` itself, in both the 22.04 and 24.04 variants, so
-   `dockerfiles/3.4.1-browsers/Dockerfile:31` is installing a package
-   the base image already has. That leaves `shared-mime-info`, needed
-   by the `mimemagic` gem, and a specific Bundler version, which recent
-   `cimg/ruby` images may well ship already.
+* Updating it must not be a manual chore. A manual chore does not get
+  done, which is how we arrived here.
+* It must carry a browser and whatever else the tests need, none of
+  which production has.
+* Tests must not get slower. Building an image during a test run trades
+  one problem for a worse one.
+* It should resemble production as closely as practical, and stay
+  resembling it when we move production's Ruby or stack.
 
-   If what remains can be dropped or done in a CI step, the whole
-   maintenance burden disappears and we pin a stock image that CircleCI
-   keeps current. **Check this first**, because it would make options 1
-   and 2 unnecessary.
-4. **Move the pin to something that updates itself.** Dependabot's
-   `docker` ecosystem can bump the `FROM` digest in
-   `dockerfiles/*/Dockerfile`, but it does not parse CircleCI configs,
-   so the pin of our own image in `.circleci/config.yml` would still be
-   manual. Partial at best.
+#### First: our custom image no longer adds anything
 
-Investigate option 3 before choosing. If we do not need a custom image,
-every other option here is wasted effort.
+Everything `dockerfiles/3.4.1-browsers/Dockerfile` puts on top of
+`cimg/ruby:3.4.1-browsers` is redundant or obsolete:
+
+| What it adds | Why it is not needed |
+| ------------ | -------------------- |
+| `cmake` | already installed by `cimg/base`, in both 22.04 and 24.04 |
+| `shared-mime-info` | the comment says it is "for gem mimemagic"; we do not use mimemagic. `Gemfile.lock` has `marcel (1.2.1)`, which carries its MIME data internally |
+| Bundler 2.7 | `.circleci/config.yml` already installs the version named in `Gemfile.lock`, overriding whatever the image ships |
+
+So the custom image, the DockerHub account it lives in, the seven-step
+procedure, and the whole class of problems in findings 1 to 4 exist to
+deliver nothing. That reframes the choice: this is not "how do we keep
+our image fresh" but "why do we have one".
+
+#### Approach A: use a stock image, pinned, and automate the bump
+
+Point `.circleci/config.yml` at `cimg/ruby:<ruby>-browsers` by digest,
+and delete `dockerfiles/`.
+
+* **Pro.** No image to build, so the manual procedure disappears
+  entirely rather than being automated.
+* **Pro.** No effect on test time. CircleCI pulls a prebuilt image
+  either way, and a widely used stock image is more likely to be warm
+  on their infrastructure than a personal one.
+* **Pro.** Keeps the browser, because the `-browsers` variant has it.
+  Nothing has to change about how system tests run.
+* **Pro.** Tracking `.ruby-version` becomes a one-line digest change,
+  which is what makes keeping test and production in step realistic.
+  `cimg/ruby:3.4.10-browsers` already exists, built 2026-06-30.
+* **Pro.** Still fully pinned, so the Scorecard and SLSA position is
+  unchanged.
+* **Con.** We are trusting CircleCI's image contents rather than our
+  own. That was already true; ours is three redundant lines on top of
+  theirs.
+* **Con.** If we ever need a package again, we need somewhere to put
+  it. See approach B.
+
+For the automation half: **Dependabot has no CircleCI ecosystem**, so it
+cannot bump this pin. **Renovate does**: its `circleci` manager supports
+the `docker` and `orb` datasources, so one bot can keep both the image
+digest and the `browser-tools` orb current, by pull request, with CI
+proving each bump before it merges. Adding Renovate is a new tool for
+this project, which is the main cost of this approach.
+
+A smaller alternative is a scheduled GitHub Actions workflow that
+resolves the current digest for the tag and opens a pull request when it
+differs. Less capable than Renovate, but no new service.
+
+#### Approach B: keep a custom image, but build it automatically
+
+If we do need extra packages, do not build the image by hand. A
+scheduled workflow rebuilds from the current base, pushes to a registry,
+and opens a pull request with the new digest.
+
+* **Pro.** Keeps the option of extra packages.
+* **Pro.** Rebuilds pick up base security updates on a cadence rather
+  than when someone remembers.
+* **Con.** Everything approach A deletes, we keep: a registry, push
+  credentials, a Dockerfile, and a pipeline that can itself break.
+* **Con.** Solves a problem we do not currently have, since the image
+  adds nothing.
+
+Worth designing only if approach A turns out to be impossible.
+
+#### Approach C: run the browser as a separate container
+
+CircleCI jobs can declare several images. Keep a plain `cimg/ruby` as
+the primary and add `selenium/standalone-chrome` alongside it, with
+Capybara driving the remote browser.
+
+* **Pro.** The browser stops being a property of the Ruby image, so
+  each updates on its own schedule.
+* **Pro.** The primary image gets smaller, which helps pull time.
+* **Con.** Capybara has to be reconfigured for a remote driver, and the
+  application under test must be reachable from the browser container.
+  Our system tests are a large part of the suite, so a mistake here is
+  expensive.
+* **Con.** Solves a coupling that is not currently hurting us.
+
+Reasonable later; not the first move.
+
+#### Approach D: match production's operating system
+
+Production builds on **Heroku-24**, which is Ubuntu 24.04. Every
+`cimg/ruby` image is still Ubuntu 22.04: `cimg-ruby`'s 3.4 Dockerfile
+reads `FROM cimg/base:2026.03-22.04`. So **no stock CircleCI Ruby image
+closes finding 4 today.**
+
+To match production we would have to build from `heroku/heroku:24` and
+install Ruby and Chrome ourselves, which is a large custom image and
+puts us back in the situation approach A escapes.
+
+* **Pro.** Genuine parity: same distribution, same system libraries.
+* **Con.** The most maintenance of any option here, for the problem we
+  are trying to stop having.
+* **Con.** Would not match production exactly anyway, since Heroku's
+  Ruby comes from its buildpack, not from apt.
+
+The honest position is that OS parity and low maintenance are in
+tension, and low maintenance has been the thing we actually failed at.
+Take the Ruby parity that approach A gives, record the operating system
+gap, and revisit if CircleCI moves `cimg/ruby` to 24.04 or if a bug
+appears that the gap explains.
+
+#### Approach E: build the image inside the test job
+
+Rejected. `setup_remote_docker` with layer caching still builds during
+the run, which is exactly the test time we are trying to protect.
 
 ## Suggested order
 
-1. Pin Node for the production build (finding 5). Independent, cheap,
-   and the only one that can break a deploy.
-2. Determine whether we still need a custom test image at all. If not,
-   pin a stock `cimg/ruby` and delete `dockerfiles/`.
-3. If we do need one, automate its rebuild rather than doing it by hand.
-4. Whichever way that goes, take Ruby to 3.4.10 and the test image to
-   Ubuntu 24.04 in the same change, so CI and production match.
+1. **Pin Node for the production build** (finding 5). Independent,
+   cheap, and the only finding that can break a deploy.
+2. **Delete the custom test image** and point CircleCI at stock
+   `cimg/ruby:3.4.10-browsers`, pinned by digest. This takes Ruby to
+   3.4.10 at the same time, closing finding 3, and removes findings 1
+   and 2 by removing the thing that caused them. Confirm the suite
+   passes before deleting `dockerfiles/`.
+3. **Add automated digest bumps**, by Renovate or a scheduled workflow,
+   so step 2 does not decay the way the current arrangement did.
+4. **Record finding 4 as accepted**, since no stock image closes it,
+   and revisit when `cimg/ruby` moves to Ubuntu 24.04 or when a failure
+   makes the gap matter.
