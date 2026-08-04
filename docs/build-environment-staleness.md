@@ -485,6 +485,74 @@ Note that under approach D the test image's own tag needs no bot at
 all, because the scheduled build maintains it. Renovate's job is the
 third-party pins around it.
 
+#### Due diligence on Renovate
+
+Adding a tool that opens pull requests against this repository deserves
+a look first. Recorded here so the decision can be reviewed later
+against what we actually knew.
+
+**What it is.** `renovatebot/renovate`, started 2016-12-17, licensed
+AGPL-3.0-only, backed commercially by Mend.io. The `renovatebot` GitHub
+organisation gives its location as Israel and its contact as
+`renovate@mend.io`. It comes in two forms: a hosted GitHub App that
+Mend runs, and the same open source program run yourself, as an npm
+package, a container image, or the official `renovatebot/github-action`.
+**We would self-host.** Nothing about updating our own CI configuration
+requires giving a third party access to this repository.
+
+**Evidence gathered 2026-08-04.**
+
+* OpenSSF Scorecard **6.7**, scoring 10 on Contributors, CI-Tests,
+  License, SAST, Binary-Artifacts, Security-Policy, Maintained,
+  Dangerous-Workflow, Dependency-Update-Tool and Code-Review, and 8 on
+  Branch-Protection.
+* npm releases carry **SLSA provenance v1 attestations**, so the
+  published package can be traced to the build that produced it.
+* Actively maintained: last commit and latest npm release both on
+  2026-08-04.
+* Widely used: 22,171 stars, 3,212 forks, about 350,000 npm downloads
+  a week.
+
+Weaknesses, since a one-sided assessment is not an assessment:
+Token-Permissions 0, Signed-Releases 0, Fuzzing 0, and Vulnerabilities
+0, the last meaning Scorecard found known unfixed vulnerabilities,
+which for a large Node project usually means transitive advisories
+without fixes. We have not checked which. Its CII-Best-Practices score
+is 2, which is a low score on our own badge.
+
+**The threat model is smaller than it first appears.** Renovate would
+have no ability to change or deploy code. It proposes; a human reviews
+and merges. That is the same power any stranger on the internet already
+has, since anyone may fork this repository and open a pull request, and
+we have always relied on review plus CI to handle that. A bot doing it
+on a schedule is not a new category of trust, only a more punctual
+contributor.
+
+That argument holds only while its proposals get the same scrutiny as
+anyone else's, which leads to the one wrinkle worth getting right.
+
+**Give it the least permission that works.**
+
+* `contents: write` and `pull-requests: write`, and nothing else.
+* **Not** `workflows: write`. Renovate needs that only to edit files
+  under `.github/workflows/`, and scoped to the `circleci` manager it
+  has no business there. Withholding it means it cannot alter our
+  GitHub Actions even if it wanted to.
+* Nothing for packages, deployments, or actions.
+* Keep branch protection on `staging` and `production`. Those are the
+  branches the deploy job runs from, so protecting them is what makes
+  "it cannot deploy" true rather than merely intended.
+
+**Do not use the default `GITHUB_TOKEN` for this.** GitHub deliberately
+does not start workflow runs for events raised by that token, to stop
+workflows triggering themselves. Our `brakeman`, `codeql`, `codespell`
+and `main` workflows all trigger on `pull_request`, so a Renovate pull
+request opened with `GITHUB_TOKEN` would skip every one of them, and
+receive *less* checking than a stranger's pull request. Use a dedicated
+GitHub App installation token or a fine-grained personal access token
+with the two permissions above. CircleCI is unaffected either way, since
+it triggers from its own integration.
+
 #### Approach E: build the image inside the test job
 
 Rejected. `setup_remote_docker` with layer caching still builds during
