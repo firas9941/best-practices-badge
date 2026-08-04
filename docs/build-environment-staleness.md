@@ -1,29 +1,32 @@
 # Build environment staleness
 
-This document records four problems with the environments we build and
-test in, found on 2026-08-03 and 2026-08-04 while chasing an error in
-CircleCI, together with the evidence for each and the options for fixing
-them.
+Our CircleCI test image is frozen at a base built 2025-01-06, and the
+procedure for updating it is manual enough that it does not get done.
+That single fact produces four of the five problems below. The fifth,
+an unpinned Node in the production build, is unrelated and should be
+fixed first.
 
-Three of the four are the same problem wearing different hats: our
-CircleCI test image is frozen, and the procedure for updating it is
-manual enough that it does not get done. The fourth is unrelated and is
-arguably the most urgent: the production build installs an unpinned
-Node.
+This document is written to be picked up cold. Everything asserted here
+was checked on 2026-08-03 or 2026-08-04; where a claim needs
+re-verifying before it is relied on, it says so.
 
-## Where this stands
+## Status
 
-Nothing here is fixed yet. Two related items already are, on branch
-`apt-get-update` (merged, and deployed to staging on 2026-08-04):
+**Already done and merged** (branch `apt-get-update`, deployed to
+staging 2026-08-04):
 
 * The `apt-get update` step in the CircleCI `build` job is commented
-  out. It served no purpose and printed an error on every build. See
-  [Finding 1](#finding-1-a-frozen-image-freezes-its-trust-anchors-too).
+  out, with the reasoning beside it. It served no purpose and printed an
+  error on every build.
 * The `deploy` job has its own browser-free image,
-  `cimg/node:24.19.0`, instead of sharing the test image. That job holds
-  `HEROKU_API_KEY` and can push to production, so it should carry as
-  little as possible. It also bumped the Heroku CLI to 11.8.1, because
-  10.17.0 declared `engines: node 20.x` and Node 20 is end of life.
+  `cimg/node@sha256:8966565f…` (`:24.19.0`), rather than sharing the
+  test image. That job holds `HEROKU_API_KEY`, so it should carry as
+  little as possible. The Heroku CLI moved to 11.8.1 at the same time,
+  because 10.17.0 declared `engines: node 20.x` and Node 20 is end of
+  life.
+
+**Decided, not yet built:** everything in
+[The plan](#the-plan).
 
 ## Finding 1: a frozen image freezes its trust anchors too
 
@@ -35,698 +38,410 @@ Err:5 https://dl.google.com/linux/chrome/deb stable InRelease
   is not available: NO_PUBKEY FD533C07C264648F
 ```
 
-The cause is exact, and it is nobody's mistake:
-
 | What | When |
 | ---- | ---- |
-| `cimg/ruby:3.4.1-browsers` (our base) built | 2025-01-06 14:20:58Z |
+| `cimg/ruby:3.4.1-browsers`, our base, was built | 2025-01-06 14:20:58Z |
 | Google created signing subkey `FD533C07C264648F` | 2025-01-07 |
 
 The base image was built the day before the key existed, so its copy of
-Google's keyring cannot contain it. Today's `InRelease`, signed
-2026-08-04, verifies as `using RSA key
-0E225917414670F4442C250DFD533C07C264648F`.
+Google's keyring cannot contain it. Today's `InRelease` verifies as
+`using RSA key 0E225917414670F4442C250DFD533C07C264648F`.
 
-Pinning by digest froze the image, and the keyring came along with it.
-That is pinning working as designed, not failing.
+Pinning by digest froze the image, and the keyring came with it. That is
+pinning working as designed.
 
-**The general lesson, which outlives this particular repository.** Two
-different things want pinning, at different layers:
+**The lesson, which outlives this repository.** Two different things
+want pinning, at different layers:
 
 * **Artifacts** (images, actions, gems, CLIs) pin by **digest**.
-  Identity is the content, and freshness comes from a deliberate bump.
+  Identity is the content; freshness comes from a deliberate bump.
 * **Trust anchors** (signing keys) pin by **fingerprint**, and fetch the
   material fresh. Identity is the long-lived master key; the material
   must rotate.
 
 Google's master key `EB4C1BFD4F042F6DDDCCEC917721F63BD38B4796` was
 created 2016-04-12 and has no expiry. Under it are eight signing
-subkeys, rotated roughly annually; the newest, `1D09C015006FEAB8`, was
-created 2026-03-10 and is not yet in use. Pinning that fingerprint would
-be a stronger claim than freezing a keyring, and would not rot.
+subkeys rotated roughly annually; the newest, `1D09C015006FEAB8`, was
+created 2026-03-10 and is not yet in use.
 
-We did not need to do any of that here, because nothing in the job uses
-apt. Checked, not assumed: there is no `apt-get install` anywhere in
+We did not need that here, because nothing in the job uses apt. Checked,
+not assumed: there is no `apt-get install` anywhere in
 `.circleci/config.yml`; `browser-tools/install-chromedriver` fetches
 chromedriver with `curl` and only apt-installs on yum-based systems; and
-nothing `rake default` runs touches apt. The step is commented out with
-that reasoning recorded beside it.
+nothing `rake default` runs touches apt.
 
-The finding still matters, because rebuilding the image will hit the
-same error: `dockerfiles/3.4.1-browsers/Dockerfile:31` runs
-`sudo apt-get update && sudo apt-get install -y cmake shared-mime-info`.
-Rebuilding our layer against the same frozen base changes nothing about
-the key. The base digest has to move too.
+It still matters, because `dockerfiles/3.4.1-browsers/Dockerfile:31`
+runs its own `apt-get update`. Rebuilding our layer against the same
+frozen base would hit the same error.
 
 ## Finding 2: the test image is nineteen months old
 
 `.circleci/config.yml` pins `drdavidawheeler/cii-bestpractices` by
-digest; that pin was introduced in commit `816568f1` on 2025-10-24 and
-has not changed. It is built `FROM cimg/ruby@sha256:a0b57bca…`, built
+digest; that pin arrived in commit `816568f1` on 2025-10-24 and has not
+changed. It is built `FROM cimg/ruby@sha256:a0b57bca…`, built
 2025-01-06.
 
-So the environment our tests run in has had no operating system updates
-for nineteen months. The stale Google key is the visible symptom; the
-invisible one is every unpatched package in that image.
-
 This is not a production exposure. Staging and production do not run our
-Docker images at all: the deploy is `git push heroku`, and Heroku builds
-a slug with its own Ruby buildpack. Our images are used only by
-CircleCI.
+Docker images: the deploy is `git push heroku`, and Heroku builds a slug
+with its own Ruby buildpack. Our images are used by CircleCI only.
 
-**The real problem is the procedure, not the age.**
-`dockerfiles/how-to-create-image.md` describes seven manual steps: get
-the base SHA-256, write the Dockerfile, build, test, push to DockerHub,
-update `.circleci/config.yml`, commit and test. It needs DockerHub push
-access to a personal account. Anything that manual will be out of date
-most of the time, so "rebuild it" is not a fix, only a reprieve.
+**The problem is the procedure, not the age.**
+`dockerfiles/how-to-create-image.md` describes seven manual steps and
+needs DockerHub push access to a personal account. Anything that manual
+is out of date most of the time, so "rebuild it" is a reprieve, not a
+fix.
 
 ## Finding 3: Ruby is nine patch releases behind
 
-From the staging deploy of 2026-08-04:
+The staging deploy of 2026-08-04 reported:
 
 ```text
 ###### WARNING:
        There is a more recent Ruby version available for you to use:
        3.4.10
-       The latest version will include security and bug fixes.
 ```
 
 `.ruby-version` says 3.4.1, and the `Gemfile` reads that file, so it
-governs both production and the test image.
+governs both production and the test image. This is the same problem as
+finding 2: upgrading Ruby means rebuilding the test image.
 
-This is the same problem as Finding 2 rather than a separate one:
-upgrading Ruby means rebuilding the test image, which is the manual
-procedure above. The two staleness problems are locked together.
-
-## Finding 4: CircleCI tests on a different Ubuntu than production runs
+## Finding 4: CI tests on a different Ubuntu than production runs
 
 Production and staging build on the **Heroku-24** stack, which is Ubuntu
-24.04. Our test image is Ubuntu 22.04; the apt output above shows
-`jammy` throughout.
+24.04. Our test image is Ubuntu 22.04, shown by `jammy` throughout the
+apt output. Heroku reports that Heroku-26 is available, so upgrading
+production would put two LTS releases between them.
 
-So we test on one Ubuntu release and run on another. That is the kind of
-gap that produces "worked in CI, failed in production" for anything
-touching native extensions or system libraries.
-
-The deploy job now happens to match production, because
-`cimg/node:24.19.0` is Ubuntu 24.04 based (it reports OpenSSL 3.0.13,
-where 22.04 ships 3.0.2). That was a side effect of choosing a
-browser-free image, not a decision.
-
-Heroku also reports that Heroku-26 is available, so the gap will widen
-if the stack is upgraded before the test image is. Upgrading production
-to Heroku-26 while CI stays where it is would put two LTS releases
-between them.
-
-**This gap cannot be closed with a stock CircleCI image while we are on
-Ruby 3.4.** CircleCI pins an operating system per Ruby line, not per
-image tag:
+**No stock CircleCI image closes this while we are on Ruby 3.4.**
+CircleCI pins an operating system per Ruby line:
 
 | cimg-ruby line | Base | Ubuntu |
 | -------------- | ---- | ------ |
 | 3.4 | `cimg/base:2026.03-22.04` | 22.04 |
 | 4.0 | `cimg/base:2026.03` | 24.04 |
 
-`cimg/base:2026.03` and `cimg/base:2026.03-24.04` have the same digest,
+`cimg/base:2026.03` and `cimg/base:2026.03-24.04` share digest
 `sha256:fdfacc6c…`, so the unsuffixed tag is the 24.04 one. Every
-`cimg/ruby:3.4.x` image, current or not, is Ubuntu 22.04 and will stay
-that way. Ruby 4.0 is where CircleCI moved to 24.04, and nothing they
-publish is on 26.04 at all.
-
-So "use a current stock image" fixes the age of our test environment
-without touching the operating system it runs.
+`cimg/ruby:3.4.x` image is Ubuntu 22.04 and will stay so, and nothing
+CircleCI publishes is on 26.04 at all.
 
 ## Finding 5: the production build installs an unpinned Node
 
-This one is unrelated to the image, and is the one to fix first.
-
-From the same staging deploy:
+Unrelated to the image, and the one that can break a deploy. From the
+same staging deploy:
 
 ```text
 ###### WARNING:
        Default version of Node.js changed (20.9.0 to 24.13.0)
-
-###### WARNING:
-       Installing a default version (24.13.0) of Node.js.
        This version is not pinned and can change over time, causing
        unexpected failures.
 ```
 
-Node is not incidental to the build. `Gemfile:135` has
-`gem 'terser'`, which minifies JavaScript through ExecJS, and ExecJS
-uses Node. The deploy runs `rake assets:precompile`, which completed in
-7.54 seconds. So JavaScript minification for production silently moved
-four major versions, from Node 20.9.0 to 24.13.0.
+Node is not incidental. `Gemfile:135` has `gem 'terser'`, which minifies
+JavaScript through ExecJS, which uses Node, and the deploy runs
+`rake assets:precompile`. So JavaScript minification for production
+silently moved four major versions.
 
-It worked this time. By Heroku's own warning it can change again at any
-time, and the failure would land in the middle of a deploy, with the
-tier in maintenance mode.
+We pin CircleCI images by digest, the Codecov CLI by SHA-256, and the
+Heroku CLI by SHA-512, and then let the platform choose a Node for the
+production build. There is no `package.json` and no `.node-version` to
+constrain it.
 
-The contrast with the rest of our practice is the point. We pin CircleCI
-images by digest, the Codecov CLI by SHA-256, and the Heroku CLI by
-SHA-512, and then let the platform install whatever Node it likes into
-the production build. There is no `package.json` and no `.node-version`
-in the repository, so nothing constrains it.
+Heroku's fix is to place the `heroku/nodejs` buildpack ahead of
+`heroku/ruby` and pin the version there. See their Ruby support
+reference under `devcenter.heroku.com`.
 
-Heroku's recommended fix is to place the `heroku/nodejs` buildpack ahead
-of `heroku/ruby` and pin the version there. See
-<https://devcenter.heroku.com/articles/ruby-support-reference#node-js-and-yarn-support>.
+## The decision
 
-## How these relate
+**Approach D**, decided 2026-08-04: build the test image on the same
+stack image production uses, and build it in the pipeline so no one ever
+builds it by hand.
 
-| Finding | Root cause |
-| ------- | ---------- |
-| 1. Stale Google apt key | test image frozen at 2025-01-06 |
-| 2. Nineteen-month-old image | updating it is a seven-step manual process |
-| 3. Ruby 3.4.1 vs 3.4.10 | upgrading Ruby requires rebuilding that image |
-| 4. CI on 22.04, production on 24.04 | same |
-| 5. Unpinned Node in production build | independent; nothing to do with the image |
+### Why not simply use a stock image
 
-Findings 1 to 4 are one problem. Rebuilding the image fixes them for a
-while and then they return, because the procedure is the thing that is
-broken. Finding 5 is separate, cheaper, and touches production.
-
-## Options
-
-### For finding 5, the unpinned Node
-
-1. **Add the `heroku/nodejs` buildpack ahead of `heroku/ruby`, and pin
-   the Node version.** Heroku's own recommendation. Needs a
-   `package.json` with an `engines.node` field, or a `.node-version`
-   file. Cheap, independent of everything else, and closes an unpinned
-   dependency in the production build path.
-2. **Do nothing and accept the risk.** Defensible only if we decide
-   asset compilation is insensitive to the Node major version, which we
-   have no evidence for either way.
-
-Option 1, and soon. It is the only finding here that can break a
-production deploy.
-
-### For findings 1 to 4, the test image
-
-What we want from the test environment, stated plainly, because these
-pull against each other:
-
-* Updating it must not be a manual chore. A manual chore does not get
-  done, which is how we arrived here.
-* It must carry a browser and whatever else the tests need, none of
-  which production has.
-* Tests must not get slower. Building an image during a test run trades
-  one problem for a worse one.
-* It should resemble production as closely as practical, and stay
-  resembling it when we move production's Ruby or stack.
-
-#### First: our custom image no longer adds anything
-
-Everything `dockerfiles/3.4.1-browsers/Dockerfile` puts on top of
-`cimg/ruby:3.4.1-browsers` is redundant or obsolete:
+Tempting, because our custom image adds nothing that is still needed:
 
 | What it adds | Why it is not needed |
 | ------------ | -------------------- |
-| `cmake` | already installed by `cimg/base`, in both 22.04 and 24.04 |
-| `shared-mime-info` | the comment says it is "for gem mimemagic"; we do not use mimemagic. `Gemfile.lock` has `marcel (1.2.1)`, which carries its MIME data internally |
-| Bundler 2.7 | `.circleci/config.yml` already installs the version named in `Gemfile.lock`, overriding whatever the image ships |
+| `cmake` | already in `cimg/base`, 22.04 and 24.04 |
+| `shared-mime-info` | its comment says "for gem mimemagic"; we use `marcel (1.2.1)`, which carries MIME data internally |
+| Bundler 2.7 | `.circleci/config.yml` already installs the version named in `Gemfile.lock`, overriding the image |
 
-So the custom image, the DockerHub account it lives in, the seven-step
-procedure, and the whole class of problems in findings 1 to 4 exist to
-deliver nothing. That reframes the choice: this is not "how do we keep
-our image fresh" but "why do we have one".
+But a stock `cimg/ruby` locks us to Ubuntu 22.04 while production runs
+24.04 and is heading for 26.04, per finding 4. Ending image maintenance
+and matching production pull against each other, and matching
+production is what we were asked for. Approach D takes the maintenance
+back and removes it a different way, by automating it.
 
-#### Approach A: use a stock image, pinned, and automate the bump
+### Also considered
 
-Point `.circleci/config.yml` at `cimg/ruby:<ruby>-browsers` by digest,
-and delete `dockerfiles/`.
+* **Automated rebuild of the present custom image.** Same automation,
+  none of the parity. Superseded by D.
+* **Browser in a separate `selenium/standalone-chrome` container.**
+  Decouples browser from Ruby image, needs Capybara reconfigured for a
+  remote driver and the app reachable from that container. Reasonable
+  later; solves a coupling that is not hurting now.
+* **Building the image inside the test job.** Rejected: it spends the
+  test time we are protecting.
+* **A parameterized executor fed by dynamic configuration**, instead of
+  a mutable stable tag. Removes the tag race entirely, at the price of
+  dynamic configuration. Not worth it while the race is judged
+  unlikely and self-correcting. Confirm how parameterized executors
+  behave before relying on this if that judgement changes.
 
-* **Pro.** No image to build, so the manual procedure disappears
-  entirely rather than being automated.
-* **Pro.** No effect on test time. CircleCI pulls a prebuilt image
-  either way, and a widely used stock image is more likely to be warm
-  on their infrastructure than a personal one.
-* **Pro.** Keeps the browser, because the `-browsers` variant has it.
-  Nothing has to change about how system tests run.
-* **Pro.** Tracking `.ruby-version` becomes a one-line digest change,
-  which is what makes keeping test and production in step realistic.
-  `cimg/ruby:3.4.10-browsers` already exists, built 2026-06-30.
-* **Pro.** Still fully pinned, so the Scorecard and SLSA position is
-  unchanged.
-* **Con.** We are trusting CircleCI's image contents rather than our
-  own. That was already true; ours is three redundant lines on top of
-  theirs.
-* **Con.** If we ever need a package again, we need somewhere to put
-  it. See approach B.
+## The design
 
-For the automation half, this approach depends entirely on a bot being
-able to bump a digest inside `.circleci/config.yml`, which Dependabot
-cannot do. See
-[Keeping the remaining pins current](#keeping-the-remaining-pins-current-renovate-not-dependabot).
+### The image
 
-#### Approach B: keep a custom image, but build it automatically
+`FROM heroku/heroku:24-build`, pinned by digest resolved at build time,
+plus Ruby, Chrome, and chromedriver.
 
-If we do need extra packages, do not build the image by hand. A
-scheduled workflow rebuilds from the current base, pushes to a registry,
-and opens a pull request with the new digest.
+Heroku maintains those base images: `heroku/heroku:24`, `:26`, and both
+`-build` variants existed and had been rebuilt on 2026-07-29.
 
-* **Pro.** Keeps the option of extra packages.
-* **Pro.** Rebuilds pick up base security updates on a cadence rather
-  than when someone remembers.
-* **Con.** Everything approach A deletes, we keep: a registry, push
-  credentials, a Dockerfile, and a pipeline that can itself break.
-* **Con.** Solves a problem we do not currently have, since the image
-  adds nothing.
-
-Worth designing only if approach A turns out to be impossible.
-
-#### Approach C: run the browser as a separate container
-
-CircleCI jobs can declare several images. Keep a plain `cimg/ruby` as
-the primary and add `selenium/standalone-chrome` alongside it, with
-Capybara driving the remote browser.
-
-* **Pro.** The browser stops being a property of the Ruby image, so
-  each updates on its own schedule.
-* **Pro.** The primary image gets smaller, which helps pull time.
-* **Con.** Capybara has to be reconfigured for a remote driver, and the
-  application under test must be reachable from the browser container.
-  Our system tests are a large part of the suite, so a mistake here is
-  expensive.
-* **Con.** Solves a coupling that is not currently hurting us.
-
-Reasonable later; not the first move.
-
-#### Approach D: build on the same stack image production uses
-
-Build the test image `FROM heroku/heroku:24-build` (or `26-build` when
-production moves), and install Ruby, Chrome, and chromedriver on it.
-Rebuild it automatically, as in approach B.
-
-Heroku publishes and maintains these images. `heroku/heroku:24`, `:26`,
-and both `-build` variants exist and were last rebuilt 2026-07-29, so
-they are not an abandoned artifact we would be pinning to.
-
-* **Pro.** It is the only approach that closes finding 4. The test
-  environment is the same distribution, the same system libraries, and
-  the same OpenSSL as production, which is where "worked in CI, failed
-  in production" actually comes from.
-* **Pro.** It tracks production. Moving to Heroku-26 becomes a one-line
-  change to the Dockerfile plus an automated rebuild, instead of
-  waiting for someone else to publish an image we can use.
-* **Pro.** It decouples our Ruby version from CircleCI's choices. We
-  are not stuck on Ubuntu 22.04 merely because we are on Ruby 3.4.
-* **Con.** It is a custom image, which is the thing we are trying to
-  stop maintaining by hand. Only worth doing together with the
-  automation in approach B; hand-built, it recreates this document.
-* **Con.** More to install than a stock image gives us: Ruby, Chrome,
-  and chromedriver, plus whatever the browser needs. That is a real
-  amount of Dockerfile to get right once.
-* **Pro, found late and worth the most.** We can install *Heroku's own
-  Ruby binary*, so the Ruby matches too, not merely the operating
-  system. Their prebuilt tarballs are publicly readable at
-  `https://heroku-buildpack-ruby.s3.us-east-1.amazonaws.com/`. The path
-  differs by stack, which is easy to get wrong: Heroku-24 takes an
-  architecture segment and Heroku-22 does not.
-
-  ```text
-  heroku-24/amd64/ruby-3.4.10.tgz   -> 200
-  heroku-24/ruby-3.4.1.tgz          -> 403   (no arch segment)
-  heroku-22/ruby-3.4.1.tgz          -> 200
-  ```
-
-  An earlier draft of this document said these were not publicly
-  readable, on the strength of a 403 from the path without the
-  architecture segment. That was wrong: S3 answers 403 rather than 404
-  when listing is denied, so a missing object and a forbidden one look
-  identical, and it is only safe to conclude anything from a **200**.
-
-  Installing that tarball rather than compiling makes the image build
-  minutes faster and removes the last difference between the test Ruby
-  and the production Ruby.
-
-#### Making approach D automatic: build in the pipeline, cache on the base
-
-The objection to a custom image is the manual build, not the image. If
-the pipeline builds it, and almost never actually has to, the objection
-goes away. That is achievable, and the design turns on one choice.
-
-**Key the cache on the base image's current digest.** Resolve what
-`heroku/heroku:24-build` points at right now, and combine that with a
-hash of our Dockerfile and the contents of `.ruby-version`. Use the
-result as the tag of the image we push:
+**Install Heroku's own Ruby binary rather than compiling.** The prebuilt
+tarballs are publicly readable. The path differs by stack, which is easy
+to get wrong:
 
 ```text
-badgeapp-test:<base-digest>-<dockerfile-hash>-<ruby-version>
+heroku-24/amd64/ruby-3.4.10.tgz   -> 200
+heroku-24/ruby-3.4.1.tgz          -> 403   (no arch segment)
+heroku-22/ruby-3.4.1.tgz          -> 200
 ```
 
-**Check in the pipeline, not on a schedule.** Decided 2026-08-04. An
-earlier draft proposed a scheduled job as the only thing that builds,
-so that ordinary pipelines did no extra work at all. That was rejected,
-and rightly: correctness that depends on somebody noticing a broken
-cron job is not correctness. Baking the check into the pipeline that
-builds and tests means the image always matches the inputs, on every
-branch, with no window in which it does not, and a pull request that
-edits the Dockerfile is tested with the image it just described.
+under `https://heroku-buildpack-ruby.s3.us-east-1.amazonaws.com/`.
 
-The shape is two jobs in one workflow, on the same commit:
+**Trap:** S3 answers 403 rather than 404 when listing is denied, so a
+missing object and a forbidden one look identical. Only a **200** means
+anything definite. An earlier version of this document wrongly concluded
+these tarballs were private on the strength of a 403 from the path
+without the architecture segment.
+
+Using Heroku's binary means the interpreter matches production, not just
+the operating system, and the build is a download rather than a compile.
+
+### Pinning
+
+The build job resolves what `heroku/heroku:24-build` points at now and
+passes it in, so the Dockerfile reads
+`FROM heroku/heroku:24-build@${BASE_DIGEST}`. Every build is pinned to
+an exact digest and records which one. The policy changes from "a digest
+frozen in a file until someone edits it" to "pin whatever was current at
+build time, and record it".
+
+### Caching, and why the check is in the pipeline
+
+The check belongs in the same workflow that builds and tests, not in a
+scheduled job. Correctness that depends on someone noticing a broken
+cron job is not correctness, and a pull request that edits the
+Dockerfile must be tested with the image it just described.
+
+Two jobs in one workflow, because **a CircleCI job cannot run inside an
+image it just built** — the executor's image is resolved from static
+configuration before any step runs:
 
 ```text
 prepare-image  ->  build (tests)
 ```
 
-`prepare-image` decides whether anything needs building.
-`build` runs the tests in the resulting image, at ordinary Docker
-executor speed.
-
-Two jobs rather than one because **a CircleCI job cannot run inside an
-image it just built**. The executor's image is resolved from static
-configuration when the job starts, so the container is already running
-by the time any step could build a replacement. The alternative, a
-machine executor that builds or pulls the image and runs the tests in a
-container it controls, avoids the second job but makes every pipeline
-pay machine-executor startup instead of Docker-executor startup, which
-is the more expensive of the two.
-
-**Guard the startup so the hit path does almost nothing.** A job is a
-fresh container, so it is not free, but nearly all of its usual cost can
-be skipped. Tag each build with the base digest it came from:
+Tag each build with the base digest it came from:
 
 ```text
 badgeapp-test:heroku24-ruby3.4.10-<short-base-digest>
 ```
 
-Then `prepare-image` is:
+`prepare-image` then:
 
-1. Resolve what `heroku/heroku:24-build` points at now: one request.
-2. Ask the registry whether our correspondingly named tag exists: one
-   request.
-3. If it does, run `circleci-agent step halt`, which ends the job
+1. Resolves what `heroku/heroku:24-build` points at now: one request.
+2. Asks the registry whether the matching tag exists: one request.
+3. If it does, runs `circleci-agent step halt`, ending the job
    successfully and immediately.
 
-Everything expensive comes after that halt: the `checkout`, the
-`setup_remote_docker` that provisions a Docker environment, and the
-build itself. On the common path none of them runs. Give the job a
-small executor image as well, since its only requirement is an HTTPS
-client.
+**Order matters.** The `checkout`, the `setup_remote_docker` that
+provisions a Docker environment, and the build all come *after* the
+halt, so none runs on the common path. Give the job a small executor
+image; its only requirement is an HTTPS client.
 
-The comparison is deliberately just "does this name exist". It could
-instead read a label off the current image and compare digest strings,
-which keeps everything under one tag, but that means walking a manifest
-to a config blob and handling multi-architecture indexes. Existence of a
-name is simpler and equally reliable, and simple wins here.
+Keying on the base digest is what keeps us current with nobody deciding
+anything: when Heroku rebuilds the stack image, the key changes by
+itself. Keying only on our Dockerfile would cache too well, because an
+operating system security update changes nothing we wrote.
 
-The tests themselves run against a stable tag, `badgeapp-test:current`,
-which `prepare-image` points at whatever it just built. That keeps
+The tests run against a stable tag, `badgeapp-test:current`, which
+`prepare-image` points at whatever it just built. That keeps
 `.circleci/config.yml` unchanged except when Ruby or the stack changes,
-which is exactly when a human should be reading it.
+which is exactly when a human should read it.
 
-**The mutable tag can race, and that is accepted.** Two branches editing
-the Dockerfile at the same moment could both push `current`. It is
-unlikely, and the loser's next pipeline corrects it, so it does not
-justify the machinery that would prevent it.
+**Decisions taken:**
 
-**A miss takes a few minutes, and that is fine.** It fetches Heroku's
-prebuilt Ruby and installs Chrome rather than compiling anything, so it
-is a download and an unpack, not a build from source. That work has to
-happen somewhere for us to stay current; until now it happened by hand,
-or more accurately did not happen. Paying it occasionally, in the
-pipeline, when the base image has genuinely moved, is the point rather
-than the cost.
+* The comparison is *existence of a tag name*, not reading a label and
+  comparing digest strings. The latter keeps one tag but means walking a
+  manifest to a config blob and handling multi-architecture indexes.
+  Simple wins while both are reliable.
+* The stable tag is mutable, so two branches editing the Dockerfile at
+  once could race. Accepted: unlikely, and the loser's next pipeline
+  corrects it.
+* A miss takes a few minutes. Accepted: that work must happen somewhere
+  to stay current, and until now it happened by hand, or rather did not.
 
-Keying on the base digest is what makes this stay current without
-anyone deciding to update it. When Heroku rebuilds the stack image, and
-they do so regularly (`heroku/heroku:24` and `:26` were both rebuilt
-2026-07-29), the key changes by itself and we rebuild once. Keying only
-on our Dockerfile would cache too well: the image would never pick up
-an operating system security update, because nothing we wrote changed.
+## Keeping pins current
 
-**Pinning survives this, and arguably improves.** Have the first job
-resolve the digest and pass it in, so the Dockerfile reads
-`FROM heroku/heroku:24-build@${BASE_DIGEST}`. Every build is then
-pinned to an exact digest, recorded in the tag and in an image label,
-and reproducible. What changes is the policy: instead of a digest
-frozen in a file until someone edits it, we pin to whatever was current
-when the image was built, and record what that was.
+Three tools, distinct ground:
 
-**One alternative was considered and set aside** for referring to the
-image: a parameterized executor fed by CircleCI's dynamic
-configuration, where a setup job computes the exact tag and passes it to
-the continuation. That removes the mutable stable tag and its race
-entirely, at the price of dynamic configuration. Since the race is
-accepted as unlikely and self-correcting, it is not worth the machinery,
-but it is the way to go if that judgement ever turns out to be wrong.
-Confirm how parameterized executors behave in this situation before
-relying on it.
-
-The steady state, then: an ordinary pipeline gains one job that makes
-two HTTPS requests and halts, and nobody builds an image by hand again.
-
-#### Approach A revisited, given approach D
-
-Approach A and approach D optimise for different things, and the choice
-between them is a judgment about which failure we would rather have:
-
-* **A** gives us zero image maintenance and a permanent Ubuntu 22.04
-  test environment while production runs 24.04, moving to 26.04.
-* **D** gives us a matching operating system, at the cost of a custom
-  image that must be built automatically or it will rot exactly as the
-  present one did.
-
-An earlier draft of this document recommended A and proposed recording
-the operating system gap as accepted. That was optimising for the
-problem in front of us, staleness, rather than the one we were asked to
-solve, which is that the test and production environments differ and
-that keeping them together has been too hard. D is the answer to that
-question. A is the answer to a different one.
-
-#### Keeping the remaining pins current: Renovate, not Dependabot
-
-Whichever approach is taken, `.circleci/config.yml` still pins things
-that are not ours and that nothing rebuilds for us: the
-`circleci/browser-tools` orb, the `cimg/postgres` secondary image, and
-the `cimg/node` image the deploy job now uses. Those want a bot.
-
-**Dependabot cannot do it.** It has no CircleCI support at all, so it
-never reads `.circleci/config.yml`. This is checkable rather than a
-matter of opinion: `dependabot/dependabot-core` carries one directory
-per supported ecosystem, 43 of them, including `bundler`, `docker`,
-`github_actions`, and `npm_and_yarn`, and there is no `circleci`
-directory among them. Its `docker` ecosystem reads Dockerfiles, not CI
-configurations, so it can bump a `FROM` line but not an `image:` line.
-
-**Renovate can.** It has a `circleci` manager whose documentation states
-that it "supports extracting the following datasources: docker, orb", so
-one bot handles both the image references and the orb versions in that
-file, by pull request, with our own CI proving each bump before it
-merges.
-
-**Renovate can also propose Ruby upgrades**, which nothing currently
-does. It ships a `ruby-version` manager whose source declares
-`displayName = '.ruby-version'`, a file pattern of
-`/(^|/)\.ruby-version$/`, and the Ruby version datasource. It reads the
-trimmed contents of the file as the current version and offers newer
-releases. Our `Gemfile` reads `.ruby-version`, and under approach D the
-image build will too, so that one file stays the single place Ruby is
-named.
-
-**Dependabot does not do this, which is worth stating carefully because
-it is not for want of Ruby knowledge.** Dependabot reads our Ruby
-version already. It has to: it parses `required_ruby_version`
-constraints and the version we declare in order to choose gem versions
-that will actually run, and its issue tracker is full of the resulting
-subtleties. What it does not do is propose an upgrade to that version.
-`dependabot-core` issue 2254, "Update ruby version in Gemfile", asks for
-precisely `Gemfile`, `Gemfile.lock` and `.ruby-version`; it was opened
-2018-06-28 and is still open, labelled as a feature request and a new
-ecosystem. So this is a known gap rather than a setting we have failed
-to find.
-
-A related worry was raised and then checked, so it is recorded as
-settled rather than left hanging. Dependabot issue 14617 concerns Ruby
-versions specified indirectly by file rather than as a literal. Our
-`Gemfile` says `ruby File.read('.ruby-version').strip`, which Bundler
-evaluates but a static parser might not, so Dependabot could in
-principle be assuming some other Ruby when it chooses gem versions, and
-quietly holding updates back.
-
-It is not. Two of its own proposals require a modern Ruby:
-
-* Pull request 2884 offers `bootstrap_form` 5.6.1, which declares
-  `required_ruby_version >= 3.2`.
-* `dependabot[bot]` merged a bump to `simplecov`, which also declares
-  `>= 3.2`.
-
-Dependabot will not propose a version whose Ruby requirement it believes
-we cannot meet, so it is resolving our Ruby to at least 3.2 and is not
-falling back to some ancient default. Separately, its recent `rubocop`
-pull request offered 1.88.2 on 2026-08-03, which was the newest release
-at that moment; 1.89.0 did not appear until 2026-08-04. So it is not
-holding anything back for any other reason either.
-
-What this cannot show is whether it resolves exactly 3.4.1 or merely
-something at or above 3.2, because nothing in our dependency tree
-demands 3.3 or 3.4 and so nothing discriminates. Settling that precisely
-would mean reading Dependabot's own job logs, under the repository's
-Dependabot page on GitHub, which is worth doing only if a gem update
-ever looks unexpectedly held back.
-
-That leaves the three tools covering distinct ground:
-
-| Tool | Covers here |
-| ---- | ----------- |
+| Tool | Covers |
+| ---- | ------ |
 | Dependabot | `Gemfile`, npm, GitHub Actions workflows |
 | Renovate | `.circleci/config.yml` images and orbs, and `.ruby-version` |
-| `prepare-image` | the test image itself, rebuilt when its base moves |
+| `prepare-image` | the test image, rebuilt when its base moves |
+
+**Dependabot cannot read `.circleci/config.yml`.** It has no CircleCI
+support: `dependabot/dependabot-core` carries one directory per
+ecosystem, 43 of them including `bundler`, `docker`, `github_actions`
+and `npm_and_yarn`, and there is no `circleci` directory. Its `docker`
+ecosystem reads Dockerfiles, not CI configurations.
+
+**Nor does it update Ruby.** Not for want of Ruby knowledge: it reads
+our Ruby version already, because it must, to pick gem versions that
+will run. It just does not propose upgrades to it. Issue 2254, "Update
+ruby version in Gemfile", asks for exactly `Gemfile`, `Gemfile.lock` and
+`.ruby-version`; opened 2018-06-28, still open.
+
+**Renovate does both.** Its `circleci` manager supports the `docker` and
+`orb` datasources. Its `ruby-version` manager declares
+`displayName = '.ruby-version'`, a file pattern of
+`/(^|/)\.ruby-version$/`, and the Ruby version datasource, reading the
+trimmed file contents as the current version.
 
 Run Renovate with `enabledManagers` limited to `circleci` and
-`ruby-version`. Left at its defaults it will also read the Gemfile and
-the Dockerfiles and open pull requests competing with Dependabot's for
-the same upgrades. Keeping each tool in its own lane is what makes
-running two of them pleasant rather than noisy. Renovate also has a
-`custom` manager, a regular expression matcher, if we later pin
-something version-like in a file no built-in manager knows.
+`ruby-version`. At its defaults it also reads the Gemfile and
+Dockerfiles and competes with Dependabot for the same upgrades.
+Renovate's `custom` manager, a regular expression matcher, covers
+anything version-like we later pin in a file no built-in manager knows.
 
-**One caution specific to Ruby, and a way to enforce it.** Only the Ruby
-versions Heroku offers for our stack will deploy. A Renovate pull
-request proposing a newer one could otherwise pass CI and fail at
-deploy, which is the worst place to find out.
+A worry raised and settled: our `Gemfile` says
+`ruby File.read('.ruby-version').strip`, which Bundler evaluates but a
+static parser might not, and Dependabot issue 14617 concerns exactly
+that. It is not biting. Dependabot will not propose a version whose Ruby
+requirement it thinks we cannot meet, and it offered `bootstrap_form`
+5.6.1 and merged a `simplecov` bump, both requiring `ruby >= 3.2`. What
+that cannot show is whether it resolves exactly 3.4.1 or merely
+"at least 3.2", since nothing in our tree requires 3.3 or 3.4. Read
+Dependabot's job logs only if an update ever looks unexpectedly held
+back.
 
-Make it a test. Heroku's prebuilt Ruby tarballs are publicly readable,
-so asking whether a version exists is one HTTP request:
+### Due diligence on Renovate
 
-```text
-https://heroku-buildpack-ruby.s3.us-east-1.amazonaws.com/
-  heroku-24/amd64/ruby-<version>.tgz
-```
+`renovatebot/renovate`, started 2016-12-17, **AGPL-3.0-only**, backed by
+Mend.io; the `renovatebot` GitHub organisation gives its location as
+Israel and its contact as `renovate@mend.io`. It exists as a hosted
+GitHub App and as the same open source program run yourself, via npm, a
+container image, or `renovatebot/github-action`. **Self-host it.**
+Updating our own CI configuration is no reason to give a third party
+access to this repository.
 
-A test reads `.ruby-version`, issues a `HEAD` for that URL, and fails if
-the answer is not 200. Skip it when the network is unavailable, so it
-does not break offline work; CI has a network, and CI is where it
-matters, because that is what turns "Renovate proposed an impossible
-Ruby" into a red pull request instead of a failed deploy.
+Evidence, 2026-08-04: OpenSSF Scorecard **6.7**, scoring 10 on
+Contributors, CI-Tests, License, SAST, Binary-Artifacts,
+Security-Policy, Maintained, Dangerous-Workflow, Dependency-Update-Tool
+and Code-Review, and 8 on Branch-Protection; npm releases carry **SLSA
+provenance v1** attestations; last commit and latest npm release both
+that day; 22,171 stars and about 350,000 npm downloads a week.
 
-Two details decide how strict it is.
-
-*What to compare.* Asking for the exact version is the strictest and the
-simplest: it answers precisely the question we care about, "can Heroku
-run the Ruby we have pinned", with no version arithmetic at all. Looser
-schemes, such as accepting any patch release within our X.Y series, need
-the bucket listed rather than probed, and answer a weaker question. Take
-the exact match unless a reason appears not to.
-
-*Which stack to ask about.* The path depends on it, and the two forms
-differ. Read the stack from a constant that the test image build also
-uses, so a stack upgrade cannot update one and forget the other. A
-mismatch here fails safe, since the wrong path returns 403 and the test
-fails, but failing for the wrong reason wastes an afternoon.
-
-Note that 403 does not distinguish "no such version" from "not allowed
-to look", because S3 hides the difference. Only a 200 means anything
-definite, so write the assertion as "must be 200" rather than "must not
-be 404".
-
-There is a pleasing consequence of the design in the other direction.
-Because `.ruby-version` is an input to the test image, a pull request
-bumping it changes the cache key, so `prepare-image` builds an image for
-that Ruby and the tests actually run on it. The bot's proposal gets
-genuinely exercised rather than merely reviewed.
-
-Note that under approach D the test image's own tag needs no bot at
-all, because `prepare-image` maintains it on every pipeline. Renovate's
-job is the third-party pins around it.
-
-#### Due diligence on Renovate
-
-Adding a tool that opens pull requests against this repository deserves
-a look first. Recorded here so the decision can be reviewed later
-against what we actually knew.
-
-**What it is.** `renovatebot/renovate`, started 2016-12-17, licensed
-AGPL-3.0-only, backed commercially by Mend.io. The `renovatebot` GitHub
-organisation gives its location as Israel and its contact as
-`renovate@mend.io`. It comes in two forms: a hosted GitHub App that
-Mend runs, and the same open source program run yourself, as an npm
-package, a container image, or the official `renovatebot/github-action`.
-**We would self-host.** Nothing about updating our own CI configuration
-requires giving a third party access to this repository.
-
-**Evidence gathered 2026-08-04.**
-
-* OpenSSF Scorecard **6.7**, scoring 10 on Contributors, CI-Tests,
-  License, SAST, Binary-Artifacts, Security-Policy, Maintained,
-  Dangerous-Workflow, Dependency-Update-Tool and Code-Review, and 8 on
-  Branch-Protection.
-* npm releases carry **SLSA provenance v1 attestations**, so the
-  published package can be traced to the build that produced it.
-* Actively maintained: last commit and latest npm release both on
-  2026-08-04.
-* Widely used: 22,171 stars, 3,212 forks, about 350,000 npm downloads
-  a week.
-
-Weaknesses, since a one-sided assessment is not an assessment:
+Weaknesses, because a one-sided assessment is not an assessment:
 Token-Permissions 0, Signed-Releases 0, Fuzzing 0, and Vulnerabilities
-0, the last meaning Scorecard found known unfixed vulnerabilities,
-which for a large Node project usually means transitive advisories
-without fixes. We have not checked which. Its CII-Best-Practices score
-is 2, which is a low score on our own badge.
+0, the last meaning known unfixed vulnerabilities were found, which for
+a large Node project usually means transitive advisories. We have not
+checked which. Its score on our own badge is 2.
 
-**The threat model is smaller than it first appears.** Renovate would
-have no ability to change or deploy code. It proposes; a human reviews
-and merges. That is the same power any stranger on the internet already
-has, since anyone may fork this repository and open a pull request, and
-we have always relied on review plus CI to handle that. A bot doing it
-on a schedule is not a new category of trust, only a more punctual
-contributor.
+**The threat model is smaller than it looks.** Renovate would have no
+ability to change or deploy code. It proposes; a human reviews and
+merges. That is the same power any stranger has, since anyone may fork
+and open a pull request, and we already rely on review plus CI for that.
+A bot doing it on a schedule is not a new category of trust, only a more
+punctual contributor.
 
-That argument holds only while its proposals get the same scrutiny as
-anyone else's, which leads to the one wrinkle worth getting right.
+That holds only while its proposals get the same scrutiny as anyone
+else's, so:
 
-**Give it the least permission that works.**
-
-* `contents: write` and `pull-requests: write`, and nothing else.
-* **Not** `workflows: write`. Renovate needs that only to edit files
-  under `.github/workflows/`, and scoped to the `circleci` manager it
-  has no business there. Withholding it means it cannot alter our
-  GitHub Actions even if it wanted to.
-* Nothing for packages, deployments, or actions.
+* Grant `contents: write` and `pull-requests: write`, nothing else.
+* **Not** `workflows: write`. Scoped to `circleci` and `ruby-version` it
+  has no business under `.github/workflows/`, and withholding it means
+  it cannot alter our GitHub Actions.
 * Keep branch protection on `staging` and `production`. Those are the
   branches the deploy job runs from, so protecting them is what makes
-  "it cannot deploy" true rather than merely intended.
+  "it cannot deploy" true rather than intended.
+* **Do not use the default `GITHUB_TOKEN`.** GitHub does not start
+  workflow runs for events raised by that token. Our `brakeman`,
+  `codeql`, `codespell` and `main` workflows all trigger on
+  `pull_request`, so a Renovate pull request opened with it would skip
+  all four and be checked *less* than a stranger's. Use a dedicated
+  GitHub App installation token or a fine-grained personal access token
+  with the two permissions above. CircleCI is unaffected either way,
+  since it triggers from its own integration.
 
-**Do not use the default `GITHUB_TOKEN` for this.** GitHub deliberately
-does not start workflow runs for events raised by that token, to stop
-workflows triggering themselves. Our `brakeman`, `codeql`, `codespell`
-and `main` workflows all trigger on `pull_request`, so a Renovate pull
-request opened with `GITHUB_TOKEN` would skip every one of them, and
-receive *less* checking than a stranger's pull request. Use a dedicated
-GitHub App installation token or a fine-grained personal access token
-with the two permissions above. CircleCI is unaffected either way, since
-it triggers from its own integration.
+## Guard: Ruby pins must stay deployable
 
-#### Approach E: build the image inside the test job
+Only Ruby versions Heroku offers for our stack will deploy, so a
+Renovate pull request proposing a newer one could pass CI and fail at
+deploy. Make it a test instead.
 
-Rejected. `setup_remote_docker` with layer caching still builds during
-the run, which is exactly the test time we are trying to protect.
+The test reads `.ruby-version`, issues one `HEAD` for the corresponding
+tarball, and fails unless the answer is **200**. Skip it when the
+network is unavailable, so offline work is unaffected; CI has a network,
+and CI is where it matters.
 
-## Suggested order
+* **Compare the exact version.** It answers precisely the question we
+  care about, with no version arithmetic. Looser schemes, such as
+  accepting any patch within our X.Y series, need the bucket listed
+  rather than probed, which is not permitted, and answer a weaker
+  question.
+* **Read the stack name from the same constant the image build uses**,
+  so a stack upgrade cannot change one and forget the other.
+* **Assert "must be 200"**, never "must not be 404", for the S3 reason
+  above.
+
+Because `.ruby-version` is also an input to the test image, a pull
+request bumping it changes the cache key, so `prepare-image` builds an
+image for that Ruby and the tests genuinely run on it.
+
+## The plan
 
 1. **Pin Node for the production build** (finding 5). Independent,
-   cheap, and the only finding that can break a deploy. Do this first
-   regardless of what is decided about the image.
-2. **Approach D**, decided 2026-08-04: build the test image on the same
-   stack image production uses, so we test what we run. Approach A was
-   considered and rejected because no stock CircleCI image can follow
-   production's operating system.
-3. **Build it in the pipeline and cache it on the base digest**, so
-   there is never a manual build. The check is part of the same
-   workflow that tests, not a scheduled job, and it halts before doing
-   anything expensive when the image is already current.
-   The failure this document describes is not that our image is old, it
-   is that keeping it current was manual; this is the part that fixes
-   that, and it should be built before anything depends on it.
-4. **Take Ruby to 3.4.10 in the same change**, closing finding 3. Under
-   A that means pinning `cimg/ruby:3.4.10-browsers`, which exists,
-   built 2026-06-30. Under D it means naming 3.4.10 in our own
-   Dockerfile.
-5. **If D is chosen, upgrade production to Heroku-26 afterwards, not
-   before.** Doing the test environment first means the stack upgrade
-   gets tested somewhere before it reaches production, which is the
-   whole point of having the environments match.
+   cheap, and the only finding that can break a deploy. Add the
+   `heroku/nodejs` buildpack ahead of `heroku/ruby` and pin the version.
+2. **Write the new test image**: `FROM heroku/heroku:24-build`, Heroku's
+   prebuilt Ruby, Chrome, chromedriver. Confirm the suite passes on it
+   before anything depends on it.
+3. **Add `prepare-image`** with the halt-early caching above, and point
+   the `build` job at `badgeapp-test:current`.
+4. **Delete `dockerfiles/3.4.1-browsers/`, `dockerfiles/3.3.6-browsers/`
+   and `how-to-create-image.md`**, and the DockerHub image they
+   describe, once nothing references them.
+5. **Take Ruby to 3.4.10** (finding 3), which under this design is a
+   one-line change plus an automatic rebuild.
+6. **Add the Heroku-availability test** so step 5 cannot silently
+   regress.
+7. **Add Renovate**, self-hosted, scoped and permissioned as above.
+8. **Then upgrade production to Heroku-26**, test environment first, so
+   the stack move is exercised somewhere before it reaches production.
+
+Findings 1, 2 and 4 have no separate step: steps 2 to 4 remove their
+cause.
+
+## Facts worth not re-deriving
+
+* Production stack: **Heroku-24** (Ubuntu 24.04); Heroku-26 available.
+* Production Ruby: from `.ruby-version`, currently **3.4.1**; Heroku
+  reports 3.4.10 available.
+* Deploy is `git push heroku`, no `heroku.yml` or `app.json`, so Heroku
+  builds the slug; our images never run in production.
+* Migrations are not automatic on deploy: the CircleCI `deploy` job runs
+  `heroku run -- bundle exec rails db:migrate`.
+* `cimg/ruby` 3.4 is Ubuntu 22.04; 4.0 is 24.04.
+* `heroku/heroku:24`, `:26`, `:24-build`, `:26-build` all exist and are
+  rebuilt regularly.
+* Heroku Ruby tarballs: `heroku-24/amd64/ruby-X.Y.Z.tgz`,
+  `heroku-22/ruby-X.Y.Z.tgz`, under the S3 host named above.
+* CircleCI docs are rendered client-side, so plain `curl` returns
+  navigation rather than content. Two things were therefore *not*
+  verified and should be before use: how parameterized executors behave
+  in this situation, and what Docker layer caching costs on our plan.
