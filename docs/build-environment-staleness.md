@@ -361,31 +361,78 @@ result as the tag of the image we push:
 badgeapp-test:<base-digest>-<dockerfile-hash>-<ruby-version>
 ```
 
-**On the common path the pipeline should do no extra work at all.** An
-earlier draft of this section proposed a job that checks the registry
-and exits when the tag already exists. The check itself is a single
-registry request, so it costs milliseconds, but a CircleCI job is a
-fresh container: starting one costs seconds whatever it then does. Ten
-seconds added to every pull request, to discover that nothing needs
-doing, is a bad trade.
+**Check in the pipeline, not on a schedule.** Decided 2026-08-04. An
+earlier draft proposed a scheduled job as the only thing that builds,
+so that ordinary pipelines did no extra work at all. That was rejected,
+and rightly: correctness that depends on somebody noticing a broken
+cron job is not correctness. Baking the check into the pipeline that
+builds and tests means the image always matches the inputs, on every
+branch, with no window in which it does not, and a pull request that
+edits the Dockerfile is tested with the image it just described.
 
-So do not check on the common path. Let a **scheduled job** be the only
-thing that builds and pushes, and let ordinary pipelines simply use the
-image. That is zero added time, not a fast check.
+The shape is two jobs in one workflow, on the same commit:
 
-Two triggers are enough:
+```text
+prepare-image  ->  build (tests)
+```
 
-* **On a schedule**, resolve the current base digest and rebuild if the
-  key has changed. This is what keeps us current.
-* **When the inputs change**, that is on a pull request touching
-  `dockerfiles/` or `.ruby-version`, build before testing. Rare, and
-  exactly when someone wants the new image tested.
+`prepare-image` decides whether anything needs building.
+`build` runs the tests in the resulting image, at ordinary Docker
+executor speed.
 
-A rebuild takes minutes, because Ruby has to be compiled. That is
-acceptable and worth saying plainly: it is work that has to happen
-somewhere to stay current, and until now it happened by hand, or more
-accurately did not happen. Minutes of machine time on a schedule is a
-better place for it than a person's afternoon.
+Two jobs rather than one because **a CircleCI job cannot run inside an
+image it just built**. The executor's image is resolved from static
+configuration when the job starts, so the container is already running
+by the time any step could build a replacement. The alternative, a
+machine executor that builds or pulls the image and runs the tests in a
+container it controls, avoids the second job but makes every pipeline
+pay machine-executor startup instead of Docker-executor startup, which
+is the more expensive of the two.
+
+**Guard the startup so the hit path does almost nothing.** A job is a
+fresh container, so it is not free, but nearly all of its usual cost can
+be skipped. Tag each build with the base digest it came from:
+
+```text
+badgeapp-test:heroku24-ruby3.4.10-<short-base-digest>
+```
+
+Then `prepare-image` is:
+
+1. Resolve what `heroku/heroku:24-build` points at now: one request.
+2. Ask the registry whether our correspondingly named tag exists: one
+   request.
+3. If it does, run `circleci-agent step halt`, which ends the job
+   successfully and immediately.
+
+Everything expensive comes after that halt: the `checkout`, the
+`setup_remote_docker` that provisions a Docker environment, and the
+build itself. On the common path none of them runs. Give the job a
+small executor image as well, since its only requirement is an HTTPS
+client.
+
+The comparison is deliberately just "does this name exist". It could
+instead read a label off the current image and compare digest strings,
+which keeps everything under one tag, but that means walking a manifest
+to a config blob and handling multi-architecture indexes. Existence of a
+name is simpler and equally reliable, and simple wins here.
+
+The tests themselves run against a stable tag, `badgeapp-test:current`,
+which `prepare-image` points at whatever it just built. That keeps
+`.circleci/config.yml` unchanged except when Ruby or the stack changes,
+which is exactly when a human should be reading it.
+
+**The mutable tag can race, and that is accepted.** Two branches editing
+the Dockerfile at the same moment could both push `current`. It is
+unlikely, and the loser's next pipeline corrects it, so it does not
+justify the machinery that would prevent it.
+
+**A miss takes minutes, and that is fine.** Ruby has to be compiled,
+because Heroku's prebuilt tarballs are not publicly readable. That work
+has to happen somewhere for us to stay current; until now it happened
+by hand, or more accurately did not happen. Paying it occasionally, in
+the pipeline, when the base image has genuinely moved, is the point
+rather than the cost.
 
 Keying on the base digest is what makes this stay current without
 anyone deciding to update it. When Heroku rebuilds the stack image, and
@@ -402,31 +449,18 @@ and reproducible. What changes is the policy: instead of a digest
 frozen in a file until someone edits it, we pin to whatever was current
 when the image was built, and record what that was.
 
-**The awkward part is CircleCI's Docker executor.** The image a job runs
-in is resolved from static configuration when the job starts, so a job
-cannot run inside an image an earlier job in the same pipeline just
-computed the name of. Three ways around it, in increasing order of
-machinery:
+**One alternative was considered and set aside** for referring to the
+image: a parameterized executor fed by CircleCI's dynamic
+configuration, where a setup job computes the exact tag and passes it to
+the continuation. That removes the mutable stable tag and its race
+entirely, at the price of dynamic configuration. Since the race is
+accepted as unlikely and self-correcting, it is not worth the machinery,
+but it is the way to go if that judgement ever turns out to be wrong.
+Confirm how parameterized executors behave in this situation before
+relying on it.
 
-1. **A semantic tag the build job maintains**, such as
-   `badgeapp-test:ruby-3.4.10-heroku-24`, referenced literally in
-   `.circleci/config.yml`. The build job pushes to it when the inputs
-   change. Simple, and the config only changes when Ruby or the stack
-   changes, which is exactly when we want a human to look. The cost is
-   that the tag is mutable, so two branches changing the Dockerfile at
-   once can race.
-2. **A parameterized executor fed by CircleCI's dynamic
-   configuration**, where a setup job computes the tag and passes it to
-   the continuation. Exact, no races, more moving parts. Confirm how
-   parameterized executors behave here before committing to it.
-3. **A machine executor** that builds or pulls the image and runs the
-   tests inside a container it controls. Full control, but machine
-   executors start more slowly than Docker executors, which spends
-   some of the test time we are protecting.
-
-With the scheduled trigger doing the building, the steady state is that
-ordinary pipelines are unchanged, and we never build an image by hand
-again.
+The steady state, then: an ordinary pipeline gains one job that makes
+two HTTPS requests and halts, and nobody builds an image by hand again.
 
 #### Approach A revisited, given approach D
 
@@ -482,8 +516,8 @@ same upgrades. Keeping each tool in its own lane is what makes running
 two of them pleasant rather than noisy.
 
 Note that under approach D the test image's own tag needs no bot at
-all, because the scheduled build maintains it. Renovate's job is the
-third-party pins around it.
+all, because `prepare-image` maintains it on every pipeline. Renovate's
+job is the third-party pins around it.
 
 #### Due diligence on Renovate
 
@@ -568,8 +602,9 @@ the run, which is exactly the test time we are trying to protect.
    considered and rejected because no stock CircleCI image can follow
    production's operating system.
 3. **Build it in the pipeline and cache it on the base digest**, so
-   there is never a manual build. Warm the cache on a schedule so the
-   occasional real build does not land on a developer's pull request.
+   there is never a manual build. The check is part of the same
+   workflow that tests, not a scheduled job, and it halts before doing
+   anything expensive when the image is already current.
    The failure this document describes is not that our image is old, it
    is that keeping it current was manual; this is the part that fixes
    that, and it should be built before anything depends on it.
