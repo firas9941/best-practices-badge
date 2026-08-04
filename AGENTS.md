@@ -285,21 +285,23 @@ selective upgrades:
   directory structure, extensive use of `Rails.application.config.*`,
   an asset pipeline with a Rails 5+ Sprockets setup, and initializer structure.
 
-* It has some pre-Rails 5 remnants:
-  - No `config.load_defaults` in application.rb (would be Rails 5.1+)
-  - Manual framework defaults instead of version-specific defaults
+* It has some older remnants:
   - Some older asset organization (app/assets/javascripts vs modern
-    app/javascript)
+    app/javascript), still served by `sprockets-rails`
 
 * Some Rails 6+ features in use:
   - Modern gems: E.g., Rails, `solid_queue`, `secure_headers`
   - Security configurations: Advanced CSRF, CSP headers
   - Database setup: Modern PostgreSQL configuration
+  - `config/application.rb` sets `config.load_defaults 8.1`, adopted
+    incrementally rather than all at once, with a comment there listing
+    the key effect of each version from 5.0 onward
 
-We want to slowly move to more recent Rails conventions. However, rapid
-moves like the direct use of `rails app:update` or adding `load_defaults
-8.0` is likely to cause a cascade of many changes, leading to
-many hard-to-fix failures with little obvious external benefit.
+We want to slowly move to more recent Rails conventions. Do that the way
+`load_defaults` was done: one increment at a time, understanding what
+each step changes. Rapid moves such as running `rails app:update`
+directly are likely to cause a cascade of changes, leading to many
+hard-to-fix failures with little obvious external benefit.
 
 ## Simple DRY code
 

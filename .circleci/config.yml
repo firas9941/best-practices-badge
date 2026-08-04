@@ -1,25 +1,41 @@
 version: 2.1
 # This CircleCI config.yml file uses PINNED dependencies as required by
-# OpenSSF Scorecard. You can see the hash pins on the various "image:"
-# values. That prevents downloading of later subversions AND of later
-# updates. When you *DO* want to update, you can easily find out the hash
-# of a given docker container via:
-# https://hub.docker.com/r/cimg/postgres/tags
-# For more info: https://circleci.com/developer/images/image/cimg/postgres
-# You could also run something like:
-# > docker pull circleci/postgres:13.14
+# OpenSSF Scorecard. Every "image:" below is written as
+#     repository:tag@sha256:digest
+# and BOTH halves matter. The digest is what actually gets pulled, and
+# is what makes the pin a pin. The tag is not decoration and not a
+# comment: it is the only part a tool can read to know what the digest
+# is *of*, and so what a newer version would even mean.
 #
-# We deliberately use ONLY CircleCI-certified orbs here (the "circleci/*"
-# namespace). The previous codecov/codecov and naokikimura/dscar-brakeman
-# orbs are uncertified public orbs: loading them would require enabling the
-# org-wide "Allow uncertified public orbs" setting, which lets ANY community
-# orb run in ANY pipeline across the org -- a supply-chain risk we decline to
-# accept. Instead, Codecov upload is run natively below (pinned + hash-verified
-# CLI), and Brakeman now runs as a GitHub Actions check gating the main branch
-# (see .github/workflows/brakeman.yml). Because staging and production are only
-# ever advanced from main, gating main is sufficient for this static analyzer.
-orbs:
-  browser-tools: circleci/browser-tools@1.4.9
+# Do not move the tag into a trailing "# pin :tag" comment, which is how
+# this file used to read. Renovate's circleci manager hands each image
+# string to its Dockerfile parser, which splits on "@" and then on ":".
+# With no tag in the reference itself it records no current version, and
+# a dependency with a digest and no tag is resolved against "latest" --
+# so a comment-only tag would have quietly produced PostgreSQL major
+# version upgrades. See docs/build-environment-staleness.md.
+#
+# Writing both also makes the pair self-checking: Docker verifies the
+# digest against the tag, so a tag and digest that drift apart fail
+# ("manifest verification failed") instead of silently disagreeing.
+#
+# To find the digest for a tag:
+# > docker manifest inspect cimg/postgres:16.4
+# Tags are listed at https://hub.docker.com/r/cimg/postgres/tags and
+# https://circleci.com/developer/images/image/cimg/postgres
+#
+# We now use NO orbs at all, and if one is ever added it must be
+# CircleCI-certified (the "circleci/*" namespace). The previous
+# codecov/codecov and naokikimura/dscar-brakeman orbs are uncertified
+# public orbs: loading them would require enabling the org-wide "Allow
+# uncertified public orbs" setting, which lets ANY community orb run in
+# ANY pipeline across the org -- a supply-chain risk we decline to
+# accept. Instead, Codecov upload is run natively below (pinned +
+# hash-verified CLI), and Brakeman now runs as a GitHub Actions check
+# gating the main branch (see .github/workflows/brakeman.yml). Because
+# staging and production are only ever advanced from main, gating main
+# is sufficient for this static analyzer. The last orb,
+# circleci/browser-tools, went when Chrome moved into its own container.
 
 # Cache version is AUTOMATICALLY managed via checksums:
 # - {{ checksum ".ruby-version" }} invalidates cache when Ruby version changes
@@ -32,18 +48,67 @@ executors:
   ruby-postgres:
     docker:
       # Primary image - Ruby with browsers for testing
-      # When updating Ruby: update SHA256 here, tag comment, and cache version below
-      - image: drdavidawheeler/cii-bestpractices@sha256:97770a22ec2c88bf9fa028cc136446129f33e15df62bb4c0dc65f2c25d22ffe7 # pin :3.4.1-browsers
+      # When updating Ruby: update the tag and SHA256 here, and see the
+      # cache note above (cache versions manage themselves).
+      - image: drdavidawheeler/cii-bestpractices:3.4.1-browsers@sha256:97770a22ec2c88bf9fa028cc136446129f33e15df62bb4c0dc65f2c25d22ffe7
         environment:
           PG_HOST: localhost
           PG_USER: ubuntu
           RAILS_ENV: test
           RACK_ENV: test
+          # Drive Chrome in the selenium container below rather than a
+          # Chrome installed beside the tests. Secondary containers share
+          # this container's network, which is the same fact that lets
+          # PG_HOST be "localhost". See docs/testing.md for the other
+          # ways to run system tests, and
+          # docs/build-environment-staleness.md for why.
+          SELENIUM_REMOTE_URL: http://127.0.0.1:4444
+          # On a system test failure Rails photographs the browser by
+          # itself; this also saves the page's HTML beside the image.
+          # Headless does not mean blind: the screenshot is a full render,
+          # fonts and images and all. But for a selector or layout failure
+          # the DOM usually says more than the picture, and it is the DOM
+          # *after* JavaScript, which the server response cannot show you.
+          # Both land in tmp/capybara, which is already an artifact path
+          # below, so this costs one variable and no plumbing. Rails
+          # requires exactly "1".
+          RAILS_SYSTEM_TESTING_SCREENSHOT_HTML: '1'
       # Secondary image - PostgreSQL for database
-      - image: cimg/postgres@sha256:2e4f1a965bdd9ba77aa6a0a7b93968c07576ba2a8a7cf86d5eb7b31483db1378 # pin :16.4
+      - image: cimg/postgres:16.4@sha256:2e4f1a965bdd9ba77aa6a0a7b93968c07576ba2a8a7cf86d5eb7b31483db1378
         environment:
           POSTGRES_USER: ubuntu
           POSTGRES_DB: circle_ruby_test
+      # Secondary image - Chrome, for system tests.
+      #
+      # The tag names the Chrome version, and chromedriver inside the
+      # image is matched to it by construction, so the pair can never
+      # drift the way a separately-installed driver can. Because this is
+      # an image pinned in this file, Renovate proposes Chrome upgrades
+      # as ordinary pull requests, with no mechanism of our own.
+      #
+      # One session at a time is enough: system tests run serially, see
+      # the "test:optimized" comment in lib/tasks/default.rake.
+      #
+      # The image ships a whole desktop so that a person can watch a test
+      # over VNC: Xvfb, x11vnc, fluxbox, and noVNC. Headless Chrome needs
+      # none of it, and every container in this job shares one memory
+      # budget, so turn it off. Measured, not guessed: idle memory falls
+      # from 233MB to 174MB and the peak during the system tests from
+      # 816MB to 719MB, with the suite passing identically (23 tests, 199
+      # assertions).
+      #
+      # Do NOT also set SE_JAVA_OPTS to cap the heap. -Xmx256m looks
+      # harmless, saves nothing measurable (the JVM's resident size is
+      # about 145MB either way, and its default maximum is a fraction of
+      # container memory, so it is already self-limiting), and produced
+      # 18 errors of Net::ReadTimeout across the suite. Tested.
+      #
+      # To watch a test in a browser instead, run your own container
+      # without these two variables; see docs/testing.md.
+      - image: selenium/standalone-chrome:150.0.7871.124@sha256:9569014786466376d3e5cf8a7758562368cd9637f783dcd3abdb2eaf3a0d5cd7
+        environment:
+          SE_START_XVFB: "false"
+          SE_START_VNC: "false"
 
   deploy-only:
     docker:
@@ -60,7 +125,7 @@ executors:
       #
       # Node 24 is the current LTS. The Heroku CLI we install below
       # requires node >=20.
-      - image: cimg/node@sha256:8966565f07189a67d64d6808a2b127f31dafae566508e3547f55640e1070bfad # pin :24.19.0
+      - image: cimg/node:24.19.0@sha256:8966565f07189a67d64d6808a2b127f31dafae566508e3547f55640e1070bfad
 
 jobs:
   build:
@@ -103,14 +168,30 @@ jobs:
     # - run:
     #     name: Update apt package lists
     #     command: sudo apt-get update
-    # For more on browser-tools integration with the main image, see:
-    # https://circleci.com/developer/images/image/cimg/ruby
-    # https://circleci.com/developer/orbs/orb/circleci/browser-tools
-    # https://github.com/CircleCI-Public/browser-tools-orb
-    # Chromedriver is finicky. browser-tools-orb version 1.4.2 fixed problems:
-    # https://github.com/CircleCI-Public/browser-tools-orb/issues/75
-    # https://github.com/CircleCI-Public/browser-tools-orb/releases/tag/v1.4.2
-    - browser-tools/install-chromedriver
+    # The browser-tools orb used to install chromedriver here. It is gone
+    # because Chrome now runs in its own container, which carries a
+    # chromedriver matched to it. The orb was in any case redundant:
+    # selenium-webdriver 4.6+ resolves a driver by itself, which is why
+    # a developer machine with no chromedriver on PATH still works.
+    #
+    # CircleCI starts secondary containers but does not wait for what is
+    # inside them to be ready, and the grid takes a few seconds. Without
+    # this, the first system test can race the browser's startup.
+    - run:
+        name: Wait for the Chrome container
+        command: |
+          for i in $(seq 1 60); do
+            if curl -sf --max-time 3 http://127.0.0.1:4444/status |
+                 grep -q '"ready": *true'; then
+              echo "Selenium grid ready after ${i}s"
+              curl -sf --max-time 3 http://127.0.0.1:4444/status |
+                grep -o '"browserVersion": *"[^"]*"' | head -1
+              exit 0
+            fi
+            sleep 1
+          done
+          echo 'ERROR: Selenium grid never became ready'
+          exit 1
     # Implement OSPS-BR-01.02: Validate branch name before use in pipeline
     # Protect against malicious branch names that could cause cache poisoning
     # or command injection attacks. Branch names are used in cache keys below.
@@ -119,11 +200,34 @@ jobs:
         command: script/validate_branch_name "$CIRCLE_BRANCH"
     - run: pwd
     - run: ls -l
+    # Chrome is deliberately not listed: the Chrome that matters is the
+    # one in the selenium container, and the wait step above prints its
+    # version. Any Chrome in this image is not the one under test.
+    #
+    # The memory and CPU lines answer a real question rather than
+    # decorating the log. "resource_class: medium" is shared by every
+    # container in this job, and adding the selenium container (Java plus
+    # Chrome) made that budget tighter without anyone measuring it. Read
+    # these numbers before changing resource_class, in either direction.
+    # The cgroup path is the method CircleCI's own documentation
+    # recommends; v2 replaced memory.stat's hierarchical_memory_limit
+    # with memory.max, so try both and print whichever exists.
+    # Java is not listed either, and that is the point: nothing we build
+    # or test uses a JVM. The only Java that matters is Selenium Grid's,
+    # inside its own image. When the new test image is built it should
+    # not install a JDK at all.
     - run: |
         ruby --version
         node --version
-        java --version
-        google-chrome --version
+        echo "CPUs visible: $(nproc)"
+        if [ -r /sys/fs/cgroup/memory.max ]; then
+          echo "memory limit (cgroup v2): $(cat /sys/fs/cgroup/memory.max)"
+        elif [ -r /sys/fs/cgroup/memory/memory.stat ]; then
+          grep hierarchical_memory_limit /sys/fs/cgroup/memory/memory.stat
+        else
+          echo 'memory limit: could not read a cgroup limit'
+        fi
+        free -m 2>/dev/null || true
     # Prepare for artifact and test results
     - run: mkdir -p $CIRCLE_ARTIFACTS $CIRCLE_TEST_REPORTS
     # Force cleanup to make deterministic.
