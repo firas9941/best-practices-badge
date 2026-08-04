@@ -277,9 +277,52 @@ gem 3.6.2 | OpenSSL 3.0.13 | zlib ok | psych ok
 ```
 
 So the interpreter, its OpenSSL, its zlib and its YAML all work as
-downloaded, with no compilation at all. What remains untested is a full
-`bundle install` against this base, which is the natural first act of
-step 3.
+downloaded, with no compilation at all.
+
+**And the whole bundle installs on it.** Run 2026-08-05, unelevated, in
+frozen mode:
+
+```text
+Bundle complete! 84 Gemfile dependencies, 215 gems now installed.
+The Gemfile's dependencies are satisfied
+20 gems built native extensions, including pg, bcrypt, sassc,
+puma, nio4r, msgpack, prism, racc, json, bootsnap, websocket-driver
+```
+
+328 seconds cold. Two things that proves beyond "it worked": the
+toolchain and `libpq` are real, because twenty gems compiled against
+them; and **frozen mode passing means `Gemfile.lock` is satisfiable as
+written on this platform**, which was a genuine open question, since
+`PLATFORMS` lists `x86_64-linux-gnu` and `x86_64-linux-musl` but no bare
+`x86_64-linux`, and that is what `RUBY_PLATFORM` reports.
+
+The 328 seconds is also the argument for the image *not* carrying our
+gems. CI restores a dependency cache, 115 MiB, and installs into it. The
+image supplies Ruby, Node and a toolchain; the gems stay the job's
+business.
+
+### Three things the base forces on the CI configuration
+
+None of these are guessable from reading `config.yml`, and each would
+have surfaced at step 4 as a puzzling red job.
+
+* **The image is not root.** `Config.User` is `heroku`, uid 1000, and
+  `/usr/local`, `/opt` and `/app` are unwritable by it; only `/tmp` is.
+  So the `Dockerfile` becomes root to install Ruby, `chown`s the tree to
+  `heroku`, and drops back. An earlier smoke test appeared to succeed
+  only because it happened to install into `/tmp`.
+* **There is no `sudo` in the image**, and `.circleci/config.yml` uses
+  it to install bundler. That `sudo` has to go, which is fine, because
+  with the Ruby tree owned by `heroku` nothing needs elevating.
+* **`gem install bundler` needs `--force`, and `yes |` will not do.**
+  Heroku's tarball ships bundler **2.6.2** and its own `bundle`
+  binstub, which belongs to no gem, so RubyGems refuses:
+  `"bundle" from bundler conflicts with /usr/local/ruby/bin/bundle`.
+  That is an error, not a prompt, so the `yes |` in `config.yml` cannot
+  answer it; it works on the present `cimg` image only because there the
+  binstub *is* gem-owned and genuinely prompts. `--force` skips the
+  overwrite check. `Gemfile.lock` wants 2.7.2, so replacing 2.6.2 is
+  required rather than optional.
 
 **No browser goes in this image.** Chrome runs as a second container;
 see [Chrome: a second container](#chrome-a-second-container).
