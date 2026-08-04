@@ -781,7 +781,7 @@ class Project < ApplicationRecord
         # pending-notification flag has nothing stale to purge.
         pending_changes = project.changes.transform_values(&:last)
         modified =
-          project.changed.any? { |c| BOOKKEEPING_FIELDS.exclude?(c) }
+          pending_changes.keys.any? { |c| BOOKKEEPING_FIELDS.exclude?(c) }
         # Everything we write here we computed ourselves; none of it came
         # from the owner.  So write it as bookkeeping rather than with
         # save, which would bump lock_version and make an owner who has
