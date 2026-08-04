@@ -173,6 +173,31 @@ because headless Chrome needs no display and every container in that
 job shares one memory budget. If you copy the CI settings you also lose
 the ability to watch, which is the opposite of why you would be here.
 
+## When a system test fails
+
+**Headless does not mean blind.** Rails photographs the browser by
+itself whenever a system test fails, and it works exactly the same
+against a remote, headless, display-less container: the image is a full
+render, fonts and images and all. Both files land in `tmp/capybara/`:
+
+```text
+tmp/capybara/failures_<test name>.png
+tmp/capybara/failures_<test name>.html
+```
+
+The `.html` file appears because CI sets
+`RAILS_SYSTEM_TESTING_SCREENSHOT_HTML=1`, and it is often the more
+useful of the two, since for a selector or layout failure the DOM says
+more than a picture. Note it is the DOM *after* JavaScript has run,
+which is something the server response cannot show you. Set the same
+variable locally when you want it.
+
+CircleCI already stores `tmp/capybara` as a build artifact, so after a
+failed CI run both files are downloadable from the job page.
+
+One diagnostic worth knowing: a **zero-length** `.png` means the browser
+stopped answering rather than that the page was blank.
+
 Note that a headed run is slower than a headless one, but being able to
 see what the test sees is often the fastest way to find out why a test
 is failing.

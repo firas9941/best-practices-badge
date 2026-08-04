@@ -63,6 +63,16 @@ executors:
           # ways to run system tests, and
           # docs/build-environment-staleness.md for why.
           SELENIUM_REMOTE_URL: http://127.0.0.1:4444
+          # On a system test failure Rails photographs the browser by
+          # itself; this also saves the page's HTML beside the image.
+          # Headless does not mean blind: the screenshot is a full render,
+          # fonts and images and all. But for a selector or layout failure
+          # the DOM usually says more than the picture, and it is the DOM
+          # *after* JavaScript, which the server response cannot show you.
+          # Both land in tmp/capybara, which is already an artifact path
+          # below, so this costs one variable and no plumbing. Rails
+          # requires exactly "1".
+          RAILS_SYSTEM_TESTING_SCREENSHOT_HTML: '1'
       # Secondary image - PostgreSQL for database
       - image: cimg/postgres:16.4@sha256:2e4f1a965bdd9ba77aa6a0a7b93968c07576ba2a8a7cf86d5eb7b31483db1378
         environment:

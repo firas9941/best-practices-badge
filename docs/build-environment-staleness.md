@@ -641,6 +641,32 @@ nothing in `rake default` invokes one. The only Java that matters is
 Selenium Grid's, inside its own image. So `java --version` has left the
 version banner, and the new test image should install no JDK at all.
 
+### Headless does not mean blind
+
+Asked whether a failing headless test can still be photographed,
+expecting no. It can, and the machinery was already there. Verified
+2026-08-05 by failing a test on purpose against the container in its CI
+configuration, headless with no Xvfb, VNC or window manager: Rails'
+`take_failed_screenshot` produced a **1400x1257 PNG showing a fully
+rendered page**, fonts, artwork, sponsor logos and all. The compositor
+still paints; there is simply no X server showing it to anyone.
+
+It lands in `Capybara.save_path`, which is `tmp/capybara`, and
+`.circleci/config.yml` already stored that directory as an artifact. So
+failure screenshots have been uploaded all along and continue to be now
+that the browser is remote.
+
+Added `RAILS_SYSTEM_TESTING_SCREENSHOT_HTML=1`, which saves the page's
+HTML beside the image. For a selector or layout failure the DOM usually
+says more than the picture, and it is the DOM *after* JavaScript, which
+the server response cannot show. Rails compares against exactly the
+string `"1"`, so the value is quoted in the YAML. Confirmed both files
+appear, 390 KB of PNG and 19 KB of HTML.
+
+A diagnostic learned by accident: the failed `-Xmx256m` run left
+**zero-length** PNGs. An empty screenshot means the browser stopped
+answering, not that the page was blank.
+
 **A related trap, from CircleCI's own reference.** Java and other
 runtimes that introspect `/proc` for CPU count "may request 32 CPU
 cores and run slower than they would when requesting one core" under
