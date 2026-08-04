@@ -78,7 +78,27 @@ executors:
       #
       # One session at a time is enough: system tests run serially, see
       # the "test:optimized" comment in lib/tasks/default.rake.
+      #
+      # The image ships a whole desktop so that a person can watch a test
+      # over VNC: Xvfb, x11vnc, fluxbox, and noVNC. Headless Chrome needs
+      # none of it, and every container in this job shares one memory
+      # budget, so turn it off. Measured, not guessed: idle memory falls
+      # from 233MB to 174MB and the peak during the system tests from
+      # 816MB to 719MB, with the suite passing identically (23 tests, 199
+      # assertions).
+      #
+      # Do NOT also set SE_JAVA_OPTS to cap the heap. -Xmx256m looks
+      # harmless, saves nothing measurable (the JVM's resident size is
+      # about 145MB either way, and its default maximum is a fraction of
+      # container memory, so it is already self-limiting), and produced
+      # 18 errors of Net::ReadTimeout across the suite. Tested.
+      #
+      # To watch a test in a browser instead, run your own container
+      # without these two variables; see docs/testing.md.
       - image: selenium/standalone-chrome:150.0.7871.124@sha256:9569014786466376d3e5cf8a7758562368cd9637f783dcd3abdb2eaf3a0d5cd7
+        environment:
+          SE_START_XVFB: "false"
+          SE_START_VNC: "false"
 
   deploy-only:
     docker:
@@ -182,10 +202,13 @@ jobs:
     # The cgroup path is the method CircleCI's own documentation
     # recommends; v2 replaced memory.stat's hierarchical_memory_limit
     # with memory.max, so try both and print whichever exists.
+    # Java is not listed either, and that is the point: nothing we build
+    # or test uses a JVM. The only Java that matters is Selenium Grid's,
+    # inside its own image. When the new test image is built it should
+    # not install a JDK at all.
     - run: |
         ruby --version
         node --version
-        java --version
         echo "CPUs visible: $(nproc)"
         if [ -r /sys/fs/cgroup/memory.max ]; then
           echo "memory limit (cgroup v2): $(cat /sys/fs/cgroup/memory.max)"

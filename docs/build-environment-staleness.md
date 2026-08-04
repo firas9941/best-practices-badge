@@ -596,6 +596,51 @@ Java-plus-Chrome container made it tighter without anyone measuring it.
 If the grid never becomes ready, or a container is killed, that is the
 first place to look, and `large` is the first thing to try.
 
+### Trimming the browser container, measured
+
+Asked 2026-08-05 whether the container could be made cheaper, on the
+reasoning that we run Java but never compile it, so a JRE would do.
+That instinct is right about the image and wrong about the cost. The
+image is a **JDK**, `javac` and all, and 2.12 GB, but a JDK costs disk
+and pull time rather than memory. Selenium publishes no JRE variant,
+and building our own would reintroduce exactly the maintenance this
+whole document exists to remove.
+
+The saving is elsewhere. The image ships a **desktop**, so that a person
+can watch a test over VNC:
+
+```text
+java 149MB   Xvfb 40MB   python3 x4 104MB   supervisord 28MB
+x11vnc 19MB  fluxbox 15MB  pulseaudio 13MB
+```
+
+Headless Chrome needs none of the display half. Setting
+`SE_START_XVFB=false` and `SE_START_VNC=false` removes Xvfb, x11vnc and
+fluxbox:
+
+| Container | Idle | Peak during suite | Result |
+| --------- | ---- | ----------------- | ------ |
+| as shipped | 233 MB | 816 MB | 23 tests, 199 assertions, pass |
+| display off | 174 MB | 719 MB | 23 tests, 199 assertions, pass |
+
+**Do not also cap the JVM heap.** `SE_JAVA_OPTS=-Xmx256m` looks like
+free money and is not: it saves nothing measurable, since the JVM's
+resident size is about 145 MB either way and its default maximum is
+already a fraction of container memory, and combined with the display
+settings it produced **18 errors** of `Net::ReadTimeout` across the
+suite. Isolated by testing each change alone, which is the only reason
+we know which one was at fault: the display settings pass on their own,
+and adding the heap cap to them is what breaks it.
+
+A suspicion worth recording as *disproved*: that Chrome needs `fluxbox`,
+or a window manager at all. It does not, headless. The full suite passes
+with Xvfb, x11vnc and fluxbox all absent.
+
+**Nothing we build or test uses Java.** Checked: no JVM-backed gem, and
+nothing in `rake default` invokes one. The only Java that matters is
+Selenium Grid's, inside its own image. So `java --version` has left the
+version banner, and the new test image should install no JDK at all.
+
 **A related trap, from CircleCI's own reference.** Java and other
 runtimes that introspect `/proc` for CPU count "may request 32 CPU
 cores and run slower than they would when requesting one core" under

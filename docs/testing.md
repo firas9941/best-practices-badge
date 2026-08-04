@@ -166,6 +166,13 @@ DRIVER=chrome SELENIUM_REMOTE_URL=http://127.0.0.1:4444 \
 The container serves one session at a time, which is enough because
 system tests run serially; see `docs/build-environment-staleness.md`.
 
+Note that the `docker run` above deliberately sets no environment
+variables, which is what leaves noVNC available on port 7900. CI runs
+the same image with `SE_START_XVFB=false` and `SE_START_VNC=false`,
+because headless Chrome needs no display and every container in that
+job shares one memory budget. If you copy the CI settings you also lose
+the ability to watch, which is the opposite of why you would be here.
+
 Note that a headed run is slower than a headless one, but being able to
 see what the test sees is often the fastest way to find out why a test
 is failing.
