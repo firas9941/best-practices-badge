@@ -522,14 +522,34 @@ precisely `Gemfile`, `Gemfile.lock` and `.ruby-version`; it was opened
 ecosystem. So this is a known gap rather than a setting we have failed
 to find.
 
-One related item is worth a look at some point, though it is not this
-document's problem. Issue 14617 concerns Dependabot handling a Ruby
-version specified indirectly by file rather than as a literal. Our
+A related worry was raised and then checked, so it is recorded as
+settled rather than left hanging. Dependabot issue 14617 concerns Ruby
+versions specified indirectly by file rather than as a literal. Our
 `Gemfile` says `ruby File.read('.ruby-version').strip`, which Bundler
-evaluates but a static parser may not. If Dependabot cannot resolve it,
-it may be assuming some other Ruby version when it picks gem updates.
-Worth checking against a Dependabot pull request's logs rather than
-guessing.
+evaluates but a static parser might not, so Dependabot could in
+principle be assuming some other Ruby when it chooses gem versions, and
+quietly holding updates back.
+
+It is not. Two of its own proposals require a modern Ruby:
+
+* Pull request 2884 offers `bootstrap_form` 5.6.1, which declares
+  `required_ruby_version >= 3.2`.
+* `dependabot[bot]` merged a bump to `simplecov`, which also declares
+  `>= 3.2`.
+
+Dependabot will not propose a version whose Ruby requirement it believes
+we cannot meet, so it is resolving our Ruby to at least 3.2 and is not
+falling back to some ancient default. Separately, its recent `rubocop`
+pull request offered 1.88.2 on 2026-08-03, which was the newest release
+at that moment; 1.89.0 did not appear until 2026-08-04. So it is not
+holding anything back for any other reason either.
+
+What this cannot show is whether it resolves exactly 3.4.1 or merely
+something at or above 3.2, because nothing in our dependency tree
+demands 3.3 or 3.4 and so nothing discriminates. Settling that precisely
+would mean reading Dependabot's own job logs, under the repository's
+Dependabot page on GitHub, which is worth doing only if a gem update
+ever looks unexpectedly held back.
 
 That leaves the three tools covering distinct ground:
 
