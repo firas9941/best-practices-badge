@@ -989,11 +989,34 @@ Its permissions, checked 2026-08-05:
   repository's permissions**, so a repository admin can manage it and
   set it public without an organisation owner.
 
-**DockerHub under an account we already control** is the interim that
-needs nobody's permission: a new repository, and an access token minted
-by its owner. It fixes what finding 2 actually complained about, which
-was seven manual steps rather than the choice of registry, and leaves
-the ownership question for whenever the organisation side is easy.
+**The credential must be a classic token on a machine account, not a
+person's.** Correcting an earlier note here that said "fine-grained
+personal access token with `packages: write`": GitHub's own
+documentation says **"GitHub Packages only supports authentication
+using a personal access token (classic)"**, so a fine-grained token is
+not an option for `ghcr.io` at all. `GITHUB_TOKEN` works, but only
+inside GitHub Actions, and publishing from Actions loses the race that
+[the caching design](#caching-and-why-the-check-is-in-the-pipeline)
+exists to prevent: a pull request editing the `Dockerfile` could have
+CircleCI pull `current` before Actions had published the image it just
+described.
+
+A classic token is user-wide, so `write:packages` on a person's account
+grants push to every package that person can reach. Bound it by putting
+it on a **machine account owned by the organisation**, a member of
+`ossf` with only the access this needs. That also answers the durability
+question directly: nothing depends on one individual still being here.
+
+Two costs to accept with open eyes. Classic tokens expire, so this needs
+rotating, which is itself the kind of chore this document is about; and
+**making a package public is a one-way door**, per GitHub's
+documentation. Neither changes the decision, but neither should be
+discovered later.
+
+A **DockerHub repository under a personal account** would need nobody's
+permission and would work today, but it fails the durability test that
+motivated moving off the current image in the first place, so it is
+recorded here as rejected rather than as a fallback.
 
 Then adding the job to the workflow is a few lines, and step 4 points
 the `build` job at `badgeapp-test:current`.
