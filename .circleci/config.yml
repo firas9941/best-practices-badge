@@ -1,13 +1,28 @@
 version: 2.1
 # This CircleCI config.yml file uses PINNED dependencies as required by
-# OpenSSF Scorecard. You can see the hash pins on the various "image:"
-# values. That prevents downloading of later subversions AND of later
-# updates. When you *DO* want to update, you can easily find out the hash
-# of a given docker container via:
-# https://hub.docker.com/r/cimg/postgres/tags
-# For more info: https://circleci.com/developer/images/image/cimg/postgres
-# You could also run something like:
-# > docker pull circleci/postgres:13.14
+# OpenSSF Scorecard. Every "image:" below is written as
+#     repository:tag@sha256:digest
+# and BOTH halves matter. The digest is what actually gets pulled, and
+# is what makes the pin a pin. The tag is not decoration and not a
+# comment: it is the only part a tool can read to know what the digest
+# is *of*, and so what a newer version would even mean.
+#
+# Do not move the tag into a trailing "# pin :tag" comment, which is how
+# this file used to read. Renovate's circleci manager hands each image
+# string to its Dockerfile parser, which splits on "@" and then on ":".
+# With no tag in the reference itself it records no current version, and
+# a dependency with a digest and no tag is resolved against "latest" --
+# so a comment-only tag would have quietly produced PostgreSQL major
+# version upgrades. See docs/build-environment-staleness.md.
+#
+# Writing both also makes the pair self-checking: Docker verifies the
+# digest against the tag, so a tag and digest that drift apart fail
+# ("manifest verification failed") instead of silently disagreeing.
+#
+# To find the digest for a tag:
+# > docker manifest inspect cimg/postgres:16.4
+# Tags are listed at https://hub.docker.com/r/cimg/postgres/tags and
+# https://circleci.com/developer/images/image/cimg/postgres
 #
 # We deliberately use ONLY CircleCI-certified orbs here (the "circleci/*"
 # namespace). The previous codecov/codecov and naokikimura/dscar-brakeman
@@ -32,15 +47,16 @@ executors:
   ruby-postgres:
     docker:
       # Primary image - Ruby with browsers for testing
-      # When updating Ruby: update SHA256 here, tag comment, and cache version below
-      - image: drdavidawheeler/cii-bestpractices@sha256:97770a22ec2c88bf9fa028cc136446129f33e15df62bb4c0dc65f2c25d22ffe7 # pin :3.4.1-browsers
+      # When updating Ruby: update the tag and SHA256 here, and see the
+      # cache note above (cache versions manage themselves).
+      - image: drdavidawheeler/cii-bestpractices:3.4.1-browsers@sha256:97770a22ec2c88bf9fa028cc136446129f33e15df62bb4c0dc65f2c25d22ffe7
         environment:
           PG_HOST: localhost
           PG_USER: ubuntu
           RAILS_ENV: test
           RACK_ENV: test
       # Secondary image - PostgreSQL for database
-      - image: cimg/postgres@sha256:2e4f1a965bdd9ba77aa6a0a7b93968c07576ba2a8a7cf86d5eb7b31483db1378 # pin :16.4
+      - image: cimg/postgres:16.4@sha256:2e4f1a965bdd9ba77aa6a0a7b93968c07576ba2a8a7cf86d5eb7b31483db1378
         environment:
           POSTGRES_USER: ubuntu
           POSTGRES_DB: circle_ruby_test
@@ -60,7 +76,7 @@ executors:
       #
       # Node 24 is the current LTS. The Heroku CLI we install below
       # requires node >=20.
-      - image: cimg/node@sha256:8966565f07189a67d64d6808a2b127f31dafae566508e3547f55640e1070bfad # pin :24.19.0
+      - image: cimg/node:24.19.0@sha256:8966565f07189a67d64d6808a2b127f31dafae566508e3547f55640e1070bfad
 
 jobs:
   build:

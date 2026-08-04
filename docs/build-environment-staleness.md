@@ -621,10 +621,11 @@ competes with Dependabot and with `propose_ruby_upgrade`.
 
 ### Prerequisite: a pin must carry its own tag
 
-**This must be done before Renovate is enabled**, or it will propose the
-wrong thing quietly. Found 2026-08-05 by reading Renovate's source.
+**Done 2026-08-05** for all three images in `.circleci/config.yml`, and
+it had to be, or Renovate would have proposed the wrong thing quietly.
+Found by reading Renovate's source.
 
-We write pins with the tag in a comment:
+We used to write pins with the tag in a comment:
 
 ```yaml
 - image: cimg/postgres@sha256:2e4f1a96… # pin :16.4
@@ -651,12 +652,32 @@ Write the tag where a machine can read it:
 - image: cimg/postgres:16.4@sha256:2e4f1a96…
 ```
 
-Docker and CircleCI both accept that form, Renovate then updates tag and
-digest together, and the tag stops being an unverifiable comment that a
-human has to keep in step with the digest by hand. That is the
-`AGENTS.md` rule about preferring automated prevention to documentation,
-applied to a comment that is currently the sole record of what a digest
-means.
+Renovate then updates tag and digest together, and the tag stops being
+an unverifiable comment that a human has to keep in step with the digest
+by hand. That is the `AGENTS.md` rule about preferring automated
+prevention to documentation, applied to a comment that had been the sole
+record of what a digest means.
+
+**The pair is self-checking, which is the part worth knowing.** Verified
+2026-08-05: `docker manifest inspect` on an existing tag paired with
+another tag's digest fails with `manifest verification failed`, while
+each correct pair resolves. So a tag and digest that drift apart become
+an error rather than a silent disagreement, which the old comment form
+could never manage.
+
+Before converting, each comment was checked against the registry rather
+than trusted: all three tags resolved to exactly the digest already
+pinned beside them, so nothing was encoded that was not already true.
+
+**Scope, deliberately.** Only `.circleci/config.yml`, because that is
+what Renovate's `circleci` manager reads. GitHub Actions workflows keep
+`uses: owner/repo@sha  # vX.Y.Z`, which is that ecosystem's own
+convention and which Dependabot parses, comment and all. Do not
+"harmonise" them.
+
+`dockerfiles/how-to-create-image.md` was updated at the same time, since
+otherwise following it would reintroduce exactly the format just
+removed. That file is slated for deletion at step 5 regardless.
 
 This is worth doing on its own, ahead of everything else here, and it
 covers `cimg/postgres`, `cimg/node`, the Selenium image and the new test
@@ -1083,10 +1104,9 @@ Independent of the above, and in no particular order with it:
     `workflow_dispatch` button. See [Deploying without a development
     environment](#deploying-without-a-development-environment).
 
-Do [Prerequisite: a pin must carry its own
-tag](#prerequisite-a-pin-must-carry-its-own-tag) first. It is small,
-independent of everything else, and Renovate proposes the wrong
-upgrades without it.
+Prerequisite: [a pin must carry its own
+tag](#prerequisite-a-pin-must-carry-its-own-tag) is done, ahead of
+the rest, because Renovate proposes the wrong upgrades without it.
 
 [Chrome: a second container](#chrome-a-second-container) lands with
 step 4, since it changes the same executor the `build` job uses.
