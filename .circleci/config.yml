@@ -45,15 +45,22 @@ executors:
           POSTGRES_USER: ubuntu
           POSTGRES_DB: circle_ruby_test
 
-  ruby-only:
+  deploy-only:
     docker:
-      # Single Ruby image for deployment job (doesn't need PostgreSQL)
-      - image: drdavidawheeler/cii-bestpractices@sha256:97770a22ec2c88bf9fa028cc136446129f33e15df62bb4c0dc65f2c25d22ffe7 # pin :3.4.1-browsers
-        environment:
-          PG_HOST: localhost
-          PG_USER: ubuntu
-          RAILS_ENV: test
-          RACK_ENV: test
+      # The deploy job needs git, node, npm, wget, and openssl, and
+      # nothing else. It runs no Ruby at all: validate_branch_name is a
+      # /bin/sh script, and the database migration runs on the Heroku
+      # dyno via "heroku run", not here.
+      #
+      # So it does *not* share the test image. That image carries Chrome,
+      # chromedriver, a full Ruby toolchain, and Google's apt repository,
+      # none of which deploy uses. This is also the one job holding
+      # HEROKU_API_KEY, the one that can push to production, so carrying
+      # less code here is worth having a second image.
+      #
+      # Node 24 is the current LTS. The Heroku CLI we install below
+      # requires node >=20.
+      - image: cimg/node@sha256:8966565f07189a67d64d6808a2b127f31dafae566508e3547f55640e1070bfad # pin :24.19.0
 
 jobs:
   build:
@@ -215,7 +222,7 @@ jobs:
   # so it gets recalculated. This approach still greatly reduces
   # duplication.
   deploy:
-    executor: ruby-only
+    executor: deploy-only
     steps:
       - checkout
       # OSPS-BR-01.02: Validate branch name before use in deployment
@@ -266,11 +273,16 @@ jobs:
             node -v
             echo "** npm version:"
             npm -v
-            HEROKU_VERSION="10.17.0"
+            # Heroku CLI 10.x declared "engines: node 20.x", which would
+            # have tied this job to a Node release that is now end of
+            # life. 11.x declares ">=20", so we can track the current
+            # Node LTS instead. The commands we use here (git:remote,
+            # maintenance:on/off, run) are unchanged across that bump.
+            HEROKU_VERSION="11.8.1"
             HEROKU_TARBALL_URL="https://registry.npmjs.org/heroku/-/heroku-${HEROKU_VERSION}.tgz"
             # SHA-512 integrity hash in SRI format, recorded from the npm registry.
             # Obtain via: npm view heroku@${HEROKU_VERSION} dist.integrity
-            HEROKU_INTEGRITY="sha512-R07TALJrM2JROpvGaGDOf503pAVp/drz4Noep5bG4q1jekwT6d0rZRKsFUEFsg8ygAEBHYCCzlm43hg4PZmPiA=="
+            HEROKU_INTEGRITY="sha512-FgNpd1CvHXrHDQnr59aK7DNY+1UbtX2QFPTMfEBODAk64WtlLX/d+yrbYowSoDfXxxN2zUCzAzgQdGKBEanrxg=="
             # Strip the "sha512-" prefix to get the raw base64-encoded hash.
             HEROKU_EXPECTED_HASH="${HEROKU_INTEGRITY#sha512-}"
             echo "** Downloading Heroku CLI ${HEROKU_VERSION}"
