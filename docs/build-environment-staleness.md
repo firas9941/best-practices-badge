@@ -33,10 +33,17 @@ order given under [Pinning Node](#pinning-node-for-the-production-build).
 **Decided, not yet built:** steps 2 to 11 of
 [The plan](#the-plan).
 
-**Chrome:** decided *and built* 2026-08-05, a second container; see
+**Chrome:** decided, built, and **merged** 2026-08-05 as pull request
+2902, a second container; see
 [Chrome: a second container](#chrome-a-second-container). Landed ahead
 of the new test image on purpose, so that it changes one thing against a
-known-good baseline instead of arriving mixed in with a new image.
+known-good baseline instead of arriving mixed in with a new image. CI
+passed on the branch, and the subsequent staging deploy passed without
+incident, so the browser move is proven twice rather than argued.
+
+Along with it went the Node pin, the pin format change, the remote
+browser support and its guard, and the resource diagnostics. `main`
+therefore now contains steps 1 (repository half) and the Chrome work.
 
 ## Finding 1: a frozen image freezes its trust anchors too
 
@@ -619,27 +626,50 @@ So `resource_class: medium` is **exactly 4 GiB and no swap**, which we
 had never confirmed. Against that, the browser container's measured 719
 MB peak is comfortable.
 
-**But 36 CPUs are visible, and that is not a guarantee, it is the host's
-count.** The cgroup constrains memory and not the processor count, so
-every program in the job that sizes itself from `/proc` sizes itself for
-a machine we do not have. CircleCI's own reference warns about this for
-Java, and Selenium Grid is Java: its log line `Detected N available
-processors` is worth reading in the CI output.
+**36 is not what we are allowed. The real allowance is 2.** The Selenium
+container, in the same job, reported:
 
-**The bigger instance is ours, not Selenium's.** `test/test_helper.rb`
-says `parallelize(workers: :number_of_processors, with: :processes)`,
-and `:number_of_processors` is `Etc.nprocessors`, which reports that
-same 36. So CI forks **36 Rails test worker processes**, each with its
-own test database, inside 4 GiB with no swap.
+```text
+[NodeOptions.getSessionFactories] - Detected 2 available processors
+```
+
+The two numbers are both correct, and the gap between them is the
+finding. **A CPU quota and a CPU affinity mask are different things, and
+different programs read different ones.** Demonstrated locally
+2026-08-05 rather than argued:
+
+| Reader | Sees | Because |
+| ------ | ---- | ------- |
+| `nproc`, and Ruby's `Etc.nprocessors` | the host's count | reads the affinity mask |
+| a container-aware JVM | the real allowance | reads the cgroup quota |
+
+Running a container under `--cpus=2` gives `cpu.max: 200000 100000`, a
+quota of exactly two processors, while `Cpus_allowed_list` stays `0-3`
+and `nproc` still says 4. And under `taskset -c 0,1`,
+`Etc.nprocessors` drops to 2, which is what shows it follows the mask.
+So a quota constrains what we may *use* without changing what we may
+*see*.
+
+**So Java was never the problem here; we are.** CircleCI's warning about
+`/proc`-reading runtimes is real in general, but the JVM has been
+container-aware for years and got this right. Ruby did not.
+`test/test_helper.rb` says
+`parallelize(workers: :number_of_processors, with: :processes)`, and
+`:number_of_processors` is `Etc.nprocessors`. So CI forks **36 Rails
+test worker processes, each with its own test database, for an
+allowance of 2 processors** inside 4 GiB with no swap. Eighteen times
+oversubscribed.
 
 This is not new and not currently breaking: it predates all of this work
-and the suite passes. It is recorded because it is almost certainly
-wasteful, and because a browser container now shares that budget.
-`ENV["PARALLEL_WORKERS"]` overrides the count, so the fix is one
-variable, but the right value is a measurement rather than a guess:
-fewer workers may well be *faster* here, since the guaranteed CPU is far
-below 36 and 36 processes contend for it. Try a value, compare wall
-time, keep the winner. Do not simply assume lower is better.
+and the suite passes. It is recorded, and not yet changed, because the
+right worker count is a measurement and only CI can take it.
+`ENV["PARALLEL_WORKERS"]` overrides the count, so the experiment is one
+variable: try 2, then 4, compare wall time against the present 36, keep
+the winner. Do not assume lower is faster, and do not assume it is
+slower either.
+
+For completeness, Selenium sized itself correctly off that same
+detection: `max-sessions = 1`, which is what serial system tests need.
 
 **Node in the test image is v22.12.0.** That is a third version in play,
 against the 24.19.0 that `package.json` pins for production and that the
