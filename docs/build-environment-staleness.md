@@ -352,6 +352,84 @@ they are not an abandoned artifact we would be pinning to.
   match, which is the part that matters for native extensions; the Ruby
   build itself would not be byte-identical.
 
+#### Making approach D automatic: build in the pipeline, cache on the base
+
+The objection to a custom image is the manual build, not the image. If
+the pipeline builds it, and almost never actually has to, the objection
+goes away. That is achievable, and the design turns on one choice.
+
+**Key the cache on the base image's current digest.** Resolve what
+`heroku/heroku:24-build` points at right now, and combine that with a
+hash of our Dockerfile and the contents of `.ruby-version`. Use the
+result as the tag of the image we push:
+
+```text
+badgeapp-test:<base-digest>-<dockerfile-hash>-<ruby-version>
+```
+
+Then the pipeline's first job asks the registry whether that tag exists.
+If it does, which is nearly always, the job ends in seconds and the test
+job pulls the image exactly as it does today. If it does not, the job
+builds and pushes it, and every later run hits it.
+
+Keying on the base digest is what makes this stay current without
+anyone deciding to update it. When Heroku rebuilds the stack image, and
+they do so regularly (`heroku/heroku:24` and `:26` were both rebuilt
+2026-07-29), the key changes by itself and we rebuild once. Keying only
+on our Dockerfile would cache too well: the image would never pick up
+an operating system security update, because nothing we wrote changed.
+
+**Pinning survives this, and arguably improves.** Have the first job
+resolve the digest and pass it in, so the Dockerfile reads
+`FROM heroku/heroku:24-build@${BASE_DIGEST}`. Every build is then
+pinned to an exact digest, recorded in the tag and in an image label,
+and reproducible. What changes is the policy: instead of a digest
+frozen in a file until someone edits it, we pin to whatever was current
+when the image was built, and record what that was.
+
+**The awkward part is CircleCI's Docker executor.** The image a job runs
+in is resolved from static configuration when the job starts, so a job
+cannot run inside an image an earlier job in the same pipeline just
+computed the name of. Three ways around it, in increasing order of
+machinery:
+
+1. **A semantic tag the build job maintains**, such as
+   `badgeapp-test:ruby-3.4.10-heroku-24`, referenced literally in
+   `.circleci/config.yml`. The build job pushes to it when the inputs
+   change. Simple, and the config only changes when Ruby or the stack
+   changes, which is exactly when we want a human to look. The cost is
+   that the tag is mutable, so two branches changing the Dockerfile at
+   once can race.
+2. **A parameterized executor fed by CircleCI's dynamic
+   configuration**, where a setup job computes the tag and passes it to
+   the continuation. Exact, no races, more moving parts. Confirm how
+   parameterized executors behave here before committing to it.
+3. **A machine executor** that builds or pulls the image and runs the
+   tests inside a container it controls. Full control, but machine
+   executors start more slowly than Docker executors, which spends
+   some of the test time we are protecting.
+
+**The cost to watch is the cache miss, not the cache hit.** A miss has
+to install Ruby, and Heroku's own prebuilt Ruby tarballs are not
+publicly readable, so we would compile it. That is minutes, not
+seconds, and with the scheme above it lands on whoever's pull request
+happens to be first after Heroku rebuilds their stack image.
+
+Two ways to keep that off a developer's pull request:
+
+* **Rebuild on a schedule as well as on demand.** A nightly or weekly
+  job warms the cache for the current base digest, so ordinary pull
+  requests almost always hit it. The on-demand path stays as a
+  correctness backstop for when someone edits the Dockerfile.
+* **Let a miss fall back to the last good image** rather than blocking,
+  and let the scheduled job do the real build. Faster, but it means a
+  pull request can be tested on a slightly older image than the one it
+  asked for, which is a subtle thing to debug later. Prefer the first.
+
+With a scheduled warm-up, the honest description of the steady state is
+that the pipeline gains one job that takes a few seconds and does
+nothing, and we never build an image by hand again.
+
 #### Approach A revisited, given approach D
 
 Approach A and approach D optimise for different things, and the choice
@@ -380,16 +458,16 @@ the run, which is exactly the test time we are trying to protect.
 1. **Pin Node for the production build** (finding 5). Independent,
    cheap, and the only finding that can break a deploy. Do this first
    regardless of what is decided about the image.
-2. **Decide between approach A and approach D**, because the rest
-   follows from it. The question is not which is better engineering but
-   which problem we are solving: A ends image maintenance and leaves
-   the operating systems different; D makes them the same and requires
-   an image we build automatically.
-3. **Whichever is chosen, automate it before relying on it.** For A
-   that is Renovate or a scheduled workflow bumping a digest. For D it
-   is a scheduled rebuild that opens a pull request. The failure this
-   document describes is not that our image is old, it is that keeping
-   it current was manual.
+2. **Approach D**, decided 2026-08-04: build the test image on the same
+   stack image production uses, so we test what we run. Approach A was
+   considered and rejected because no stock CircleCI image can follow
+   production's operating system.
+3. **Build it in the pipeline and cache it on the base digest**, so
+   there is never a manual build. Warm the cache on a schedule so the
+   occasional real build does not land on a developer's pull request.
+   The failure this document describes is not that our image is old, it
+   is that keeping it current was manual; this is the part that fixes
+   that, and it should be built before anything depends on it.
 4. **Take Ruby to 3.4.10 in the same change**, closing finding 3. Under
    A that means pinning `cimg/ruby:3.4.10-browsers`, which exists,
    built 2026-06-30. Under D it means naming 3.4.10 in our own
