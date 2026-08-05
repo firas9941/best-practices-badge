@@ -1149,7 +1149,17 @@ after the push would accept it and report success for a deploy that
 released nothing. Under `-e` the step happened to abort first, so it was
 correct by accident. It now refuses to deploy, and says why.
 
-Tested with canned API responses, six paths:
+A second review found the same wrong default surviving in the *other*
+half of the code: the wait step still did
+`prev="$(cat ... || echo 0)"`. The Deploy step guarantees that file, so
+it could not bite today, but it is the identical mistake and a future
+step reordering would have made it live. It now refuses rather than
+guessing. Both API calls also gained `--max-time 30`, because a hung
+connection could otherwise block until CircleCI's 20 minute
+no-output timeout killed the job with a message pointing nowhere near
+the cause.
+
+Tested with canned API responses, seven paths:
 
 ```text
 normal deploy             -> exit 0
@@ -1158,6 +1168,7 @@ release expires           -> exit 1
 new release never appears -> exit 1   (the first bug)
 unparsable body          -> retries, then exit 0   (the second)
 API errors                -> retries, then exit 0
+missing baseline          -> exit 1   (the third)
 ```
 
 ### What deliberately did not change

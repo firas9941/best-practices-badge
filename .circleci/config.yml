@@ -641,7 +641,8 @@ jobs:
             # "|| true" because grep exits 1 on no match, which under
             # this job's -eo pipefail would abort with no message.
             HEROKU_API='https://api.heroku.com'
-            prev="$(curl -sfS "${HEROKU_API}/apps/${HEROKU_APP}/releases" \
+            prev="$(curl -sfS --max-time 30 \
+              "${HEROKU_API}/apps/${HEROKU_APP}/releases" \
               -H 'Accept: application/vnd.heroku+json; version=3' \
               -H "Authorization: Bearer ${HEROKU_API_KEY}" \
               -H 'Range: version ..; order=desc,max=1;' \
@@ -700,7 +701,18 @@ jobs:
             #
             # Ordering and limiting of the list come from:
             #   https://devcenter.heroku.com/articles/platform-api-reference#ranges
-            prev="$(cat /tmp/pre-deploy-release-version 2>/dev/null || echo 0)"
+            # Do NOT default this to 0 if the file is missing. Zero
+            # would make the release already live look newer than the
+            # baseline, so the loop below would accept it and report
+            # success for a deploy that released nothing. The Deploy
+            # step writes this file and fails if it cannot, so a
+            # missing file means something is wrong: say so.
+            if [ ! -s /tmp/pre-deploy-release-version ]; then
+              echo 'ERROR: no pre-deploy release baseline was recorded.'
+              echo 'Cannot tell a new release from the one already live.'
+              exit 1
+            fi
+            prev="$(cat /tmp/pre-deploy-release-version)"
             api="https://api.heroku.com/apps/${HEROKU_APP}/releases"
             # Only this flag may conclude success. Do not infer it from
             # $status: while we are skipping the release that was
@@ -710,7 +722,7 @@ jobs:
             deployed=
             # 240 * 15s = 1 hour, matching the release phase cap.
             for i in $(seq 1 240); do
-              body="$(curl -sfS "$api" \
+              body="$(curl -sfS --max-time 30 "$api" \
                 -H 'Accept: application/vnd.heroku+json; version=3' \
                 -H "Authorization: Bearer ${HEROKU_API_KEY}" \
                 -H 'Range: version ..; order=desc,max=1;')" || {
