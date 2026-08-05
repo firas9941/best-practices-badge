@@ -39,8 +39,16 @@ Finding 5 is closed once a production deploy confirms the log reports
 24.19.0 and no longer warns that the Node version "is not pinned and
 can change over time".
 
-**Decided, not yet built:** steps 4 to 10, 12 and 13 of
+**Decided, not yet built:** steps 4 to 10, 12, 13 and 15 to 19 of
 [The plan](#the-plan).
+
+**Build speed** was taken up 2026-08-05, once the step running the
+checks and tests had become most of the build. The time is now measured
+rather than guessed, and the order of the remaining work is decided.
+The 36-workers-for-two-processors claim from the Chrome work turned out
+to be **false**, and correcting it cost a red build; both the
+correction and how it was arrived at are recorded. See
+[Where the build's time goes](#where-the-builds-time-goes).
 
 **Steps 3 to 5 are done** on branch `build_env_image`: there is no test
 image at all. See
@@ -608,23 +616,33 @@ and `nproc` still says 4. And under `taskset -c 0,1`,
 So a quota constrains what we may *use* without changing what we may
 *see*.
 
-**So Java was never the problem here; we are.** CircleCI's warning about
+**So Java was never the problem here.** CircleCI's warning about
 `/proc`-reading runtimes is real in general, but the JVM has been
-container-aware for years and got this right. Ruby did not.
-`test/test_helper.rb` says
-`parallelize(workers: :number_of_processors, with: :processes)`, and
-`:number_of_processors` is `Etc.nprocessors`. So CI forks **36 Rails
-test worker processes, each with its own test database, for an
-allowance of 2 processors** inside 4 GiB with no swap. Eighteen times
-oversubscribed.
+container-aware for years and got this right.
 
-This is not new and not currently breaking: it predates all of this work
-and the suite passes. It is recorded, and not yet changed, because the
-right worker count is a measurement and only CI can take it.
-`ENV["PARALLEL_WORKERS"]` overrides the count, so the experiment is one
-variable: try 2, then 4, compare wall time against the present 36, keep
-the winner. Do not assume lower is faster, and do not assume it is
-slower either.
+**CORRECTED 2026-08-05: so has Rails, and this section originally said
+otherwise.** It claimed that because `test/test_helper.rb` says
+`parallelize(workers: :number_of_processors, with: :processes)`, and
+because `:number_of_processors` meant `Etc.nprocessors`, CI was forking
+36 test workers for an allowance of 2, eighteen times oversubscribed.
+
+That was wrong, and wrong in the way this document keeps warning
+about: by reasoning from a plausible mechanism instead of looking.
+`ActiveSupport::TestCase.parallelize` in Rails 8.1 resolves
+`:number_of_processors` with
+`Concurrent.available_processor_count`, **which reads the cgroup
+quota**, not the affinity mask. CI has been running 2 workers all
+along, which the build log said in plain words the whole time:
+
+```text
+Running 1232 tests in parallel using 2 processes
+Running 23 tests in a single process (parallelization threshold is 50)
+```
+
+The 36 was real, and `nproc` really does report it; it simply was never
+the number Rails used. See
+[Where the build's time goes](#where-the-builds-time-goes) for what
+happened when the correction was tested by setting the count by hand.
 
 For completeness, Selenium sized itself correctly off that same
 detection: `max-sessions = 1`, which is what serial system tests need.
@@ -2034,6 +2052,350 @@ NPM scanner on the presence of `package.json`, so it now shells out to
 must carry Node and npm or that check breaks. It should carry *this*
 Node; see [The image](#the-image).
 
+## Where the build's time goes
+
+Asked 2026-08-05 for easy wins, on the grounds that the step named "Run
+comprehensive checks and tests (rake default)" now dominates the build.
+Everything below was measured that day on a four-core development
+machine, net of the 5.9 seconds every `rake` invocation spends booting
+Rails, since that boot is paid once by `rake default` and would
+otherwise be counted twelve times.
+
+| Check | Net cost | Kind |
+| ----- | -------- | ---- |
+| `license_okay` + `license_finder_report.html` | **42.6s** | code-determined |
+| `html_from_markdown` | **~21s** | code-determined |
+| `report_code_statistics` | 9.6s | code-determined |
+| `percent_gems_up_to_date` | 8.5s | **time-varying** |
+| `rubocop` | 6.8s | code-determined |
+| `markdownlint` | 4.9s | code-determined |
+| `bundle_audit` | 3.3s | **time-varying** |
+| `whitespace_check` | 2.4s | code-determined |
+| `eslint` | 2.0s | code-determined |
+| `yaml_syntax_check` | 1.3s | code-determined |
+| `rails_best_practices` | 1.1s | code-determined |
+| `ruby_syntax` | 0.3s | code-determined |
+| **the checks together** | **~105s** | |
+| `rails test`, 1232 tests | 50.7s on four cores | |
+| `rails test:system`, 22 tests, serial | ~104s, measured in CI | |
+
+On CircleCI's two processors the checks plausibly cost 180 to 210
+seconds, which is roughly 40% of the step. That scaling is an estimate;
+the local figures are not. **Replace it with real per-step timings
+before claiming a saving.**
+
+### Code-determined and time-varying, which is the useful distinction
+
+Ten of those twelve checks give the same answer for the same commit for
+ever. Running them again on `staging` re-establishes what `main`
+already established, because `staging` is fast-forwarded from `main`
+and branch protection is what makes that true rather than merely
+customary.
+
+Two are not like that. `bundle_audit` reads an advisory database and
+`percent_gems_up_to_date` reads rubygems.org, and both move underneath
+an unchanged commit. A gem set that was clean when it merged can be
+vulnerable by the time it deploys, and that is exactly the moment we
+would want to know.
+
+So the question for each check is not how long it takes but which kind
+it is. Code-determined checks belong wherever the commit is first seen;
+time-varying checks belong on every build, deploys included.
+
+### The tests, and a wrong premise that cost a red build
+
+The Chrome work recorded that CI forked 36 test workers for an
+allowance of 2, and left the right number as a measurement for later.
+That measurement was taken, on two processors (`taskset -c 0,1`),
+varying only `PARALLEL_WORKERS`:
+
+| Workers | Wall time |
+| ------- | --------- |
+| 2 | 85.5s |
+| **4** | **74.8s** |
+| 8 | 89.0s |
+
+All three runs: 1232 tests, 12609 assertions, 0 failures. Read on its
+own the table says the optimum is near **twice** the allowance, because
+the suite spends much of its time waiting on PostgreSQL rather than
+computing.
+
+`PARALLEL_WORKERS: 4` therefore went into the `build` job. **It turned
+CI red, and the premise underneath it was false.** Both halves are
+worth keeping.
+
+**Rails was never asking for 36.** `parallelize` in Rails 8.1 resolves
+`:number_of_processors` with `Concurrent.available_processor_count`,
+which reads the **cgroup quota**, not the affinity mask. So CI had been
+running 2 workers all along, and the build log had been saying so in
+plain words:
+
+```text
+Running 1232 tests in parallel using 2 processes
+```
+
+Nobody read that line, on either side of the argument. It was there in
+every build for months. `nproc` really does report 36 in that
+container, and `Etc.nprocessors` really does follow the mask; those
+facts were right, and simply were not the ones that governed.
+
+### Setting PARALLEL_WORKERS also switches the threshold off
+
+The build failed with 67 files of untested code, and every test
+passing:
+
+```text
+1232 tests, 12609 assertions, 0 failures, 0 errors, 0 skips
+Intermediate Coverage (Regular Tests): 99.76%
+23 tests, 199 assertions, 0 failures, 0 errors, 0 skips
+Combined Coverage: 57.51%
+```
+
+Coverage was **complete after the unit tests and gone after the system
+tests**, which is the shape of a merge problem, not a testing problem.
+
+The cause is one line of Rails,
+`ActiveSupport::Testing::ParallelizeExecutor`:
+
+```ruby
+def should_parallelize?
+  (ENV["PARALLEL_WORKERS"] || tests_count > threshold) && many_workers?
+end
+```
+
+**Setting the variable does not set the worker count. It also
+suppresses the threshold**, and the threshold is the entire reason our
+23 system tests run serially. The two runs say it outright:
+
+| Run | Unit tests | System tests |
+| --- | ---------- | ------------ |
+| `main` | parallel, 2 processes | **single process (threshold is 50)** |
+| with `PARALLEL_WORKERS=4` | parallel, 4 processes | **parallel, 4 processes** |
+
+Parallel system tests then destroy the coverage, because SimpleCov
+names results after the worker. The system-test workers take the same
+names as the unit-test workers, `job-manual (subprocess: N)-W`, and
+overwrite them. Read out of a local resultset after such a run:
+
+```text
+job-manual (subprocess: 1)-0   covered_lines=2121
+job-manual (subprocess: 2)-1   covered_lines=416
+job-manual (subprocess: 3)-2   covered_lines=416
+job-manual (subprocess: 4)-3   covered_lines=416
+job-manual                     covered_lines=249
+```
+
+Those 416-line entries had held the unit tests' coverage. Nothing warns:
+the merged report lists five command names, exactly as a healthy run
+does, and the count of covered lines is the only thing that changed.
+
+**And the system tests should never have been parallel anyway.**
+`Capybara.server_port` is fixed at 31337, which is why they are serial.
+Run locally with the variable set, they fail: 1 failure and 2 errors,
+against 0 on the same commit without it. CI got away with it, probably
+because the single Selenium session serialises the browser work, so the
+only symptom there was the coverage collapse.
+
+**So the change is reverted**, and `.circleci/config.yml` sets no
+worker count. Rails already picks the quota-aware number.
+
+**What survives is the measurement, and it is still worth having.** On
+two processors, 4 workers beat 2 by about 13%. Claiming that saving
+needs a mechanism that does not switch the threshold off, which means
+passing the number to `parallelize(workers:)` in
+`test/test_helper.rb` rather than setting the environment variable.
+That is a change to how every developer's tests run, so it wants its
+own measurement rather than a doubling rule inferred from one
+two-processor experiment: 4 cores may not want 8 workers, and 36 cores
+certainly do not want 72 databases.
+
+### Three traps worth not stepping in again
+
+* **Do not count workers from the coverage line.** "Coverage report
+  generated for job-manual (subprocess: 1)-0, ..." lists every command
+  name in the merged resultset, which accumulates across runs, so it
+  reported eight workers for a three-worker run. Clear `coverage/`
+  first, which is what `test:clear` does inside `test:optimized`.
+* **Each worker gets its own database**, `test_0` upward, created on a
+  fresh PostgreSQL container every build. The worker count is a
+  database-creation cost as well as a CPU one.
+* **A green intermediate coverage number does not survive the run.**
+  `test:optimized` prints coverage after the unit tests and again after
+  the system tests. The gap between those two numbers is where a
+  merge fault shows, and it is the first thing to look at when
+  well-tested code is reported as untested.
+
+### The alternatives, and what each is worth
+
+| Option | Change | Saves | Effort |
+| ------ | ------ | ----- | ------ |
+| A | Split `build` into parallel `static` and `test` jobs | wall clock becomes the larger of the two | medium |
+| B | Move code-determined checks to GitHub Actions | same, on pull requests | medium |
+| C | Skip code-determined checks on `staging` and `production` | ~200s, deploy builds only | small |
+| D | Stop scanning licences twice | ~21s, every build | small |
+| E | Drop `html_from_markdown` | ~21s | **rejected** |
+| F | Parallelize the system tests | up to ~half of 104s | medium |
+| G | `resource_class: large` | perhaps 40% of the test half | trivial, costs credits |
+| H | `parallelism: N` with timing-based splitting | most of all | large |
+
+**E is rejected, and the reasoning was wrong rather than marginal.** It
+was proposed as waste, on the grounds that the generated HTML is
+gitignored and discarded when the container exits. But generating it is
+the point: converting all 81 files is how markdown problems are
+detected, and the output being thrown away does not make the conversion
+pointless. It stays, and it belongs in the static job.
+
+**A over B, for now.** They achieve nearly the same thing, and B has
+one real attraction, that GitHub Actions minutes are free for public
+repositories while CircleCI credits are not. Against that, B puts a
+second Ruby toolchain on a second platform, which then drifts from
+production, which is the failure this whole document exists to end.
+Keeping Ruby in one place wins today. See
+[Rebuilding this on GitHub](#rebuilding-this-on-github-later) for what
+would make B attractive later.
+
+**F and G are held back deliberately** until the cheap changes have
+been measured in CI. Both spend money, and neither should be bought on
+an estimate when a real number is a build away.
+
+### The order, and why it is this order
+
+1. ~~`PARALLEL_WORKERS: 4`~~ **Tried and reverted**, because the
+   premise was false and the mechanism was worse than the premise. See
+   [the threshold](#setting-parallel_workers-also-switches-the-threshold-off).
+   Rails already picks the quota-aware number; any future tuning goes
+   through `parallelize(workers:)`, not the environment.
+2. **DONE: D, stop scanning licences twice.** See
+   [One scan, not two](#one-scan-not-two).
+3. **DONE: C, the branch conditional.** See
+   [What the deploy branches skip](#what-the-deploy-branches-skip).
+4. **A, split the job**, which extends C's benefit to pull requests.
+5. **Measure again**, and only then consider F, G and H.
+
+Steps 1 to 3 are plausibly 250 to 300 seconds off a deploy build
+without spending another credit. Steps 2 and 3 are wanted soon
+specifically because a faster build makes every other change in this
+document cheaper to test.
+
+### One scan, not two
+
+Done 2026-08-05. `rake default` used to run `license_finder` twice over
+the same gems: `license_okay` to decide whether the licences are
+acceptable, and `license_finder_report.html` to render the same
+information as a browsable page. Between 21 and 38 seconds each,
+depending on how the npm scanner feels.
+
+**One command cannot do both**, which was checked rather than assumed.
+`action_items` is the gating command and it does accept `--format
+html`, which looks like the answer. On success it emits **205 bytes**
+saying everything is approved, against the report's 340 KB. It reports
+the action items, and when there are none there is nothing to report.
+
+So the report leaves `rake default` and stays a task:
+`rake license_finder_report.html`. The **check still runs everywhere**;
+what stopped running on every build is the second scan of the same
+gems for a copy of an answer we already had.
+
+The CircleCI `store_artifacts` entry for it went too. Worth knowing for
+anything similar: **`store_artifacts` does not fail on a path that does
+not exist.** Confirmed from a real build, where all seven upload steps
+reported success and only six artifact paths existed; `tmp/capybara`
+and `/tmp/circleci-artifacts` were both empty and neither complained.
+
+### What the deploy branches skip
+
+Done 2026-08-05, implementing the code-determined and time-varying
+distinction rather than merely describing it.
+
+`lib/tasks/default.rake` now names the short list, and `rake default`
+splices it in, so the two cannot drift:
+
+```ruby
+TIME_VARYING_CHECKS = %w[bundle bundle_audit percent_gems_up_to_date]
+```
+
+`rake deploy_checks` is that list plus `test:optimized`, and the
+`build` job picks between them:
+
+```text
+case "$CIRCLE_BRANCH" in
+  staging|production) rake_task=deploy_checks ;;
+  *)                  rake_task=default ;;
+esac
+```
+
+| Task | Prerequisites |
+| ---- | ------------- |
+| `default` | 17, unchanged apart from the licence report |
+| `deploy_checks` | 5 |
+
+**Exact matches, and any other branch gets everything**, so the failure
+mode is a branch checked too much rather than too little. Tested
+against ten branch names, including `Staging`, `staging2`,
+`my-staging`, `staging-bestpractices`, `production2` and the empty
+string: only `staging` and `production` take the short list.
+
+**The tests always run.** That is the point of the split rather than an
+exception to it: a green suite is not a property of the commit alone,
+it is how flapping is noticed, and it is the last thing standing
+between a deploy and production.
+
+Verified by running the whole of `rake default` end to end, 469
+seconds on a four-core machine, with every check passing and the test
+counts unchanged: 1232 tests and 12609 assertions, then 23 system
+tests, still `Running 23 tests in a single process (parallelization
+threshold is 50)`.
+
+One false alarm worth recording, because the next person will hit it.
+Running `CI=true bundle exec rake` locally fails one system test:
+
+```text
+Minitest::Assertion: CI must set SELENIUM_REMOTE_URL
+```
+
+That is the guard from the Chrome work working exactly as intended: it
+refuses to let CI silently drive a local browser. Locally, either
+leave `CI` unset or point `SELENIUM_REMOTE_URL` at a container.
+
+### Rebuilding this on GitHub, later
+
+The eventual aim is B: the code-determined checks run on GitHub
+Actions, in parallel with the tests on CircleCI, triggered by
+`pull_request` and pushes to `main`, so that they cannot run on
+`staging` or `production` by construction rather than by a conditional.
+
+The way to build it is the way the CircleCI executor was built, and
+that is the whole reason to record this now rather than improvise it
+later: run on Heroku's own stack image, install the Ruby that
+`.ruby-version` names and the Node that `package.json` names, and cache
+`~/ruby`. Done that way it is not a second environment to maintain; it
+is the same environment expressed twice, and any drift between them is
+a bug with an obvious fix. Done any other way, with `setup-ruby` and
+whatever Ubuntu the runner happens to be, it reintroduces exactly the
+divergence findings 2 and 4 were about.
+
+`.github/workflows/main.yml` currently runs `echo Hello, world!`, so
+the slot is already there.
+
+### Recording how current the gems are
+
+`percent_gems_up_to_date` must keep running on every build, deploys
+included, because that is a number worth having at the moment of a
+deploy. It is time-varying by definition.
+
+Today it only `puts` a line into the build log, which is the weakest
+useful form of recording: it cannot be diffed, plotted, or compared
+across builds, and CircleCI logs age out. It should write a small JSON
+file, with the timestamp, branch, commit and the counts, into
+`$CIRCLE_ARTIFACTS`.
+
+**An honest caveat, since it decides the design.** CircleCI artifacts
+expire too, after 30 days by default. If "consult it later" means
+months, artifacts are not enough, and the answer has to be somewhere
+that keeps history: a scheduled job appending to a file in the
+repository, or a metrics store. Not decided here, because how far back
+one wants to look is the question that settles it.
+
 ## The plan
 
 1. **DONE 2026-08-05: pin Node for the production build** (finding 5).
@@ -2092,6 +2454,38 @@ Independent of the above, and in no particular order with it:
     `workflow_dispatch` button. See [Deploying without a development
     environment](#deploying-without-a-development-environment).
 
+Making the build faster, in the order decided under
+[Where the build's time goes](#where-the-builds-time-goes):
+
+14. **ABANDONED 2026-08-05: `PARALLEL_WORKERS: 4`.** Tried, turned CI
+    red, reverted. Rails already reads the cgroup quota, so the 36
+    workers this was meant to fix never existed; and the variable
+    switches off the parallelization threshold, which is what keeps the
+    system tests serial. Tuning the worker count is still worth about
+    13% on two processors, but it has to go through
+    `parallelize(workers:)` in `test/test_helper.rb`, and it needs its
+    own measurement on more than one machine shape.
+15. **DONE 2026-08-05: stopped scanning licences twice.** The report
+    left `rake default` and stayed a task; the check still runs
+    everywhere. `action_items --format html` cannot replace it: on
+    success it emits 205 bytes, not the report. See
+    [One scan, not two](#one-scan-not-two).
+16. **DONE 2026-08-05: code-determined checks skipped on `staging` and
+    `production`.** `rake deploy_checks` is the time-varying checks
+    plus the whole test suite, and the `build` job picks it by exact
+    branch name. See
+    [What the deploy branches skip](#what-the-deploy-branches-skip).
+17. **Split `build` into parallel `static` and `test` jobs**, which
+    extends step 16 to pull requests. The static job needs neither
+    PostgreSQL nor Chrome.
+18. **Measure in CI, then decide** about parallel system tests, a larger
+    resource class, and splitting the suite across containers. None of
+    those should be bought on an estimate.
+19. **Record the gem-currency number as data**, not as a line in a log
+    that expires. See [Recording how current the
+    gems are](#recording-how-current-the-gems-are); how far back one
+    wants to look is the open question.
+
 Prerequisite: [a pin must carry its own
 tag](#prerequisite-a-pin-must-carry-its-own-tag) is done, ahead of
 the rest, because Renovate proposes the wrong upgrades without it.
@@ -2149,6 +2543,39 @@ cause.
   inside the executor that is already running.
 * `test/test_helper.rb:58` calls `WebMock.disable_net_connect!`, so no
   Minitest test may reach the network. Live checks belong in rake tasks.
+* Rails parallel testing gives **each worker its own database**
+  (`test_0`, `test_1`, ...), created on a fresh PostgreSQL container
+  every build. The worker count is therefore a database-creation cost
+  as well as a CPU one.
+* **Rails is container-aware and we are not.** `parallelize(workers:
+  :number_of_processors)` uses `Concurrent.available_processor_count`,
+  which reads the cgroup quota. `nproc` and `Etc.nprocessors` read the
+  affinity mask and report the host's 36. CI runs 2 workers and always
+  did; the build log says which, in words, every run.
+* **Never set `ENV["PARALLEL_WORKERS"]` here.** It does not merely set
+  the count: `should_parallelize?` is
+  `(ENV["PARALLEL_WORKERS"] || tests_count > threshold) && many_workers?`,
+  so setting it also suppresses the threshold that keeps our 23 system
+  tests serial. Parallel system tests then collide on
+  `Capybara.server_port` 31337 and overwrite each other's SimpleCov
+  results. Tune with `parallelize(workers:)` instead.
+* On two processors the test suite is fastest at **about twice** that
+  many workers, not at exactly that many, because much of it waits on
+  PostgreSQL. Measured: 85.5s at 2, 74.8s at 4, 89.0s at 8.
+* `rake default`'s checks cost about 105 seconds on four cores, of
+  which `license_finder` was 42.6 (now halved: the report left the
+  default chain) and `html_from_markdown` is 21. A whole `rake default`
+  including both test suites is 469 seconds there.
+* **`store_artifacts` does not fail on a missing path.** Confirmed from
+  a real build: seven upload steps all succeeded with six artifact
+  paths present. So a check that sometimes produces no artifact needs
+  no conditional around the upload.
+* `license_finder action_items --format html` gates correctly but emits
+  205 bytes on success, not a report, so one invocation cannot both
+  gate and produce the browsable page.
+* Ten of those checks are settled by the commit; only `bundle_audit`
+  and `percent_gems_up_to_date` can change answer without the code
+  changing.
 * There is no test image. The `build` job runs on Heroku's stack image
   and installs Ruby and Node into `$HOME` in about fourteen seconds.
 * DockerHub pulls through CircleCI are not rate limited, by arrangement
