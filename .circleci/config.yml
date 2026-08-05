@@ -47,15 +47,34 @@ version: 2.1
 executors:
   ruby-postgres:
     docker:
-      # Primary image - Ruby with browsers for testing
-      # When updating Ruby: update the tag and SHA256 here, and see the
-      # cache note above (cache versions manage themselves).
-      - image: drdavidawheeler/cii-bestpractices:3.4.1-browsers@sha256:97770a22ec2c88bf9fa028cc136446129f33e15df62bb4c0dc65f2c25d22ffe7
+      # Primary image - the SAME stack image production builds on.
+      #
+      # This is Heroku's own published image, not one of ours, which is
+      # the point. Our previous test image sat nineteen months out of
+      # date because rebuilding it was a manual chore; the way to stop
+      # that is not a better rebuild procedure but not having an image
+      # to rebuild. Ruby and Node are installed by a step below in about
+      # fourteen seconds, and this image is then just another pinned
+      # dependency that Renovate proposes upgrades for, exactly like the
+      # PostgreSQL and Chrome images beside it.
+      #
+      # It also closes finding 4: production builds on Heroku-24, and so
+      # now does CI, rather than on the Ubuntu 22.04 that every
+      # cimg/ruby:3.4.x is stuck on.
+      #
+      # It runs as uid 1000 "heroku" with no sudo, so every step below
+      # must work unelevated. That is why Ruby goes in $HOME.
+      - image: heroku/heroku:24-build@sha256:a6e743f508a2f37f90ddd551587c3a0776529219ae427296db8836fa9a680275
         environment:
           PG_HOST: localhost
           PG_USER: ubuntu
           RAILS_ENV: test
           RACK_ENV: test
+          # This image leaves LANG unset, which gives LC_CTYPE=POSIX and
+          # therefore a US-ASCII default external encoding. We serve six
+          # languages, so that would corrupt non-ASCII text in ways that
+          # surface far from the cause. C.utf8 exists in the image.
+          LANG: C.UTF-8
           # Drive Chrome in the selenium container below rather than a
           # Chrome installed beside the tests. Secondary containers share
           # this container's network, which is the same fact that lets
@@ -117,11 +136,11 @@ executors:
       # /bin/sh script, and the database migration runs on the Heroku
       # dyno via "heroku run", not here.
       #
-      # So it does *not* share the test image. That image carries Chrome,
-      # chromedriver, a full Ruby toolchain, and Google's apt repository,
-      # none of which deploy uses. This is also the one job holding
-      # HEROKU_API_KEY, the one that can push to production, so carrying
-      # less code here is worth having a second image.
+      # So it does *not* share the test executor, which is a full Heroku
+      # stack image and installs a Ruby toolchain it would never use.
+      # This is also the one job holding HEROKU_API_KEY, the one that
+      # can push to production, so carrying less here is worth a second
+      # image.
       #
       # Node 24 is the current LTS. The Heroku CLI we install below
       # requires node >=20.
@@ -139,6 +158,64 @@ jobs:
       CIRCLE_TEST_REPORTS: /tmp/circleci-test-results
     steps:
     - checkout
+    - run:
+        name: Install Ruby and Node into $HOME
+        command: |
+          set -euo pipefail
+          # Both versions come from the files that already govern them,
+          # so there is no third place to forget to update. The stack
+          # name is named once, here.
+          STACK=heroku-24
+          RUBY_VERSION="$(tr -d '[:space:]' < .ruby-version)"
+          NODE_VERSION="$(sed -n 's/.*"node": *"\([^"]*\)".*/\1/p' \
+                          package.json | head -1)"
+          test -n "$RUBY_VERSION"; test -n "$NODE_VERSION"
+
+          # Heroku's own prebuilt Ruby, so the interpreter matches
+          # production and this is a download rather than a compile.
+          # Note the arch segment: S3 answers 403, not 404, when listing
+          # is denied, so a missing object and a forbidden one look
+          # identical and only a 200 means anything.
+          echo "Installing Ruby ${RUBY_VERSION} for ${STACK}"
+          curl -sfSL --retry 5 --retry-delay 5 --retry-all-errors \
+            "https://heroku-buildpack-ruby.s3.us-east-1.amazonaws.com/${STACK}/amd64/ruby-${RUBY_VERSION}.tgz" \
+            | tar xz -C "$HOME" --one-top-level=ruby
+
+          # Node at the version package.json pins, so CI minifies
+          # JavaScript with the interpreter production minifies with.
+          # Verified against nodejs.org's own SHASUMS256.txt: integrity,
+          # not provenance, since both come from the same host, but it
+          # catches a truncated or corrupted download.
+          echo "Installing Node ${NODE_VERSION}"
+          nb="https://nodejs.org/download/release/v${NODE_VERSION}"
+          nt="node-v${NODE_VERSION}-linux-x64.tar.gz"
+          curl -sfSL --retry 5 --retry-delay 5 --retry-all-errors \
+            "${nb}/${nt}" -o "/tmp/${nt}"
+          curl -sfSL --retry 5 --retry-delay 5 --retry-all-errors \
+            "${nb}/SHASUMS256.txt" -o /tmp/SHASUMS256.txt
+          (cd /tmp && grep " ${nt}\$" SHASUMS256.txt | sha256sum -c -)
+          mkdir -p "$HOME/node"
+          tar xz -C "$HOME/node" --strip-components=1 -f "/tmp/${nt}"
+          rm -f "/tmp/${nt}" /tmp/SHASUMS256.txt
+
+          echo 'export PATH="$HOME/ruby/bin:$HOME/node/bin:$PATH"' \
+            >> "$BASH_ENV"
+    - run:
+        name: Confirm the toolchain, and that it can read UTF-8
+        command: |
+          set -euo pipefail
+          ruby -v
+          node --version
+          echo "CPUs visible: $(nproc)"
+          if [ -r /sys/fs/cgroup/memory.max ]; then
+            echo "memory limit (cgroup v2): $(cat /sys/fs/cgroup/memory.max)"
+          elif [ -r /sys/fs/cgroup/memory/memory.stat ]; then
+            grep hierarchical_memory_limit /sys/fs/cgroup/memory/memory.stat
+          fi
+          # Fail here, with a sentence, rather than in a test that
+          # mangles an accented character three steps later.
+          ruby -e 'raise "default_external is #{Encoding.default_external}" \
+                   unless Encoding.default_external == Encoding::UTF_8'
     # Refresh apt package lists before any apt-based installs.
     # Ubuntu mirrors occasionally return 404 for stale package versions
     # that have been replaced by a newer release; apt-get update fetches
@@ -200,34 +277,16 @@ jobs:
         command: script/validate_branch_name "$CIRCLE_BRANCH"
     - run: pwd
     - run: ls -l
-    # Chrome is deliberately not listed: the Chrome that matters is the
-    # one in the selenium container, and the wait step above prints its
-    # version. Any Chrome in this image is not the one under test.
-    #
-    # The memory and CPU lines answer a real question rather than
-    # decorating the log. "resource_class: medium" is shared by every
-    # container in this job, and adding the selenium container (Java plus
-    # Chrome) made that budget tighter without anyone measuring it. Read
-    # these numbers before changing resource_class, in either direction.
-    # The cgroup path is the method CircleCI's own documentation
-    # recommends; v2 replaced memory.stat's hierarchical_memory_limit
-    # with memory.max, so try both and print whichever exists.
-    # Java is not listed either, and that is the point: nothing we build
-    # or test uses a JVM. The only Java that matters is Selenium Grid's,
-    # inside its own image. When the new test image is built it should
-    # not install a JDK at all.
-    - run: |
-        ruby --version
-        node --version
-        echo "CPUs visible: $(nproc)"
-        if [ -r /sys/fs/cgroup/memory.max ]; then
-          echo "memory limit (cgroup v2): $(cat /sys/fs/cgroup/memory.max)"
-        elif [ -r /sys/fs/cgroup/memory/memory.stat ]; then
-          grep hierarchical_memory_limit /sys/fs/cgroup/memory/memory.stat
-        else
-          echo 'memory limit: could not read a cgroup limit'
-        fi
-        free -m 2>/dev/null || true
+    # There is deliberately no Chrome and no JVM in this image. The
+    # Chrome that matters runs in the selenium container, whose version
+    # the wait step above prints, and nothing we build or test uses
+    # Java. The memory figures printed by the toolchain step exist to
+    # answer a real question: "resource_class: medium" is 4GiB shared by
+    # every container in this job, and "CPUs visible" reports the host's
+    # count rather than our allowance, which is why the Rails test
+    # workers are oversubscribed. See
+    # docs/build-environment-staleness.md before changing either.
+    - run: free -m 2>/dev/null || true
     # Prepare for artifact and test results
     - run: mkdir -p $CIRCLE_ARTIFACTS $CIRCLE_TEST_REPORTS
     # Force cleanup to make deterministic.
@@ -244,9 +303,20 @@ jobs:
     # - run: find ~/.rubygems || true
     - run:
         name: Update bundler to match Gemfile.lock
-        command: >
-          sudo sh -c 'yes | gem install bundler --no-document
-          -v "$(cat Gemfile.lock | tail -1 | tr -d \\\\" \\\\")"'
+        # No sudo: this image has none, and does not need it, because
+        # Ruby lives in $HOME and so its gem directory is already ours.
+        #
+        # --force, not "yes |". Heroku's Ruby tarball ships its own
+        # "bundle" binstub, which belongs to no gem, so RubyGems refuses
+        # with "bundle from bundler conflicts with .../bin/bundle". That
+        # is an error, not a prompt, so piping "yes" cannot answer it;
+        # --force skips the overwrite check. The same is true of any gem
+        # whose binstub collides with the tarball's, "rake" included.
+        command: |
+          set -euo pipefail
+          want="$(tail -1 Gemfile.lock | tr -d '[:space:]')"
+          echo "Gemfile.lock was bundled with ${want}"
+          gem install bundler --no-document --force -v "${want}"
     - run:
         name: Bundler Version
         command: bundle --version
