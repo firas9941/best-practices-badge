@@ -41,11 +41,12 @@ version: 2.1
 # {{ checksum "Gemfile.lock" }} invalidate the cache when Ruby or the
 # gems change, so those need no manual bumping.
 #
-# The ONE manual part is the "v2-heroku24" token that leads the key.
-# CircleCI stores cache paths as ABSOLUTE paths, so a cache saved under
-# one $HOME cannot be restored under another. Change that token whenever
-# the executor image, its user, or its $HOME changes. See the restore
-# step for what happened when it was not changed.
+# The environment part is automatic too: a step writes the user, $HOME
+# and OS release to a file and the key hashes it, because CircleCI
+# stores cache paths as ABSOLUTE paths and a cache saved under one $HOME
+# cannot be restored under another. Nothing here needs bumping by hand,
+# including on a stack upgrade. See the restore step for what happened
+# when the key did not capture this.
 
 # Reusable executors - define Docker images once, use them multiple times
 executors:
@@ -162,34 +163,55 @@ jobs:
       CIRCLE_TEST_REPORTS: /tmp/circleci-test-results
     steps:
     - checkout
+    # Work out what makes a cache compatible, and let the key say so.
+    #
+    # CircleCI stores cache paths as ABSOLUTE paths, so a cache saved
+    # under one $HOME cannot be written under another. When this job
+    # moved from an image whose user was "circleci" to one whose user is
+    # "heroku", nothing in the key noticed: the restore matched, then
+    # produced 23,404 "permission denied" lines, wasted 27 seconds and
+    # restored nothing.
+    #
+    # So the key carries the three things that decide compatibility, read
+    # from the running container rather than written down by hand: who we
+    # are, where home is, and which OS this is. A stack upgrade therefore
+    # changes the key by itself, which is why no version number appears
+    # anywhere below.
+    #
+    # Why hash a file instead of putting these in the key directly? A
+    # cache key can only interpolate CircleCI's own templates, and
+    # {{ .Environment.X }} is restricted to variables CircleCI exports or
+    # a context supplies, "not any arbitrary environment variable".
+    # {{ checksum }} on a file is the only way to get a runtime value
+    # into a key. The step prints the file so the log stays readable.
+    - run:
+        name: Work out what makes a cache compatible
+        command: |
+          set -euo pipefail
+          . /etc/os-release
+          { id -un; echo "$HOME"; echo "${ID}-${VERSION_ID}"; } \
+            > /tmp/cache-env-id
+          echo 'Cache environment identity:'
+          sed 's/^/  /' /tmp/cache-env-id
     # Restore BEFORE installing anything, because the cache now carries
     # ~/ruby, which holds both the interpreter and every installed gem
-    # (Gem.dir is /home/heroku/ruby/lib/ruby/gems/X). A hit therefore
-    # skips the Ruby download AND most of "bundle install".
-    #
-    # The leading token is an ENVIRONMENT identity, and it is not
-    # decoration. CircleCI stores cache paths as ABSOLUTE paths, so a
-    # cache saved under one $HOME cannot be written under another. When
-    # this job moved from an image whose user was "circleci" to one whose
-    # user is "heroku", the old key still matched, and the restore
-    # produced 23,404 "permission denied" lines, wasted 27 seconds, and
-    # restored nothing. **Change this token whenever the executor image,
-    # its user, or its $HOME changes.**
+    # (Gem.dir is $HOME/ruby/lib/ruby/gems/X). A hit therefore skips the
+    # Ruby download AND most of "bundle install".
     #
     # arch comes before the checksums so the looser fallbacks below
     # cannot cross architectures.
     - restore_cache:
         keys:
-        # Exact: this Ruby, these gems, this branch.
-        - v2-heroku24-{{ arch }}-{{ checksum ".ruby-version" }}-{{ checksum "Gemfile.lock" }}-{{ .Branch }}
+        # Exact: this environment, this Ruby, these gems, this branch.
+        - v2-{{ checksum "/tmp/cache-env-id" }}-{{ arch }}-{{ checksum ".ruby-version" }}-{{ checksum "Gemfile.lock" }}-{{ .Branch }}
         # Same Ruby and gems from any branch. This is what stops every
         # new branch from starting cold, which it previously did: the old
         # key ended in {{ .Branch }} with no fallback at all.
-        - v2-heroku24-{{ arch }}-{{ checksum ".ruby-version" }}-{{ checksum "Gemfile.lock" }}-
+        - v2-{{ checksum "/tmp/cache-env-id" }}-{{ arch }}-{{ checksum ".ruby-version" }}-{{ checksum "Gemfile.lock" }}-
         # Same Ruby, any gems: the interpreter is still right and
         # "bundle install" reconciles the difference, which is far
         # cheaper than building the world.
-        - v2-heroku24-{{ arch }}-{{ checksum ".ruby-version" }}-
+        - v2-{{ checksum "/tmp/cache-env-id" }}-{{ arch }}-{{ checksum ".ruby-version" }}-
     - run:
         name: Install Ruby and Node into $HOME
         command: |
@@ -379,7 +401,7 @@ jobs:
     # Save dependency cache
     - save_cache:
         # Must match the primary restore key above, token and all.
-        key: v2-heroku24-{{ arch }}-{{ checksum ".ruby-version" }}-{{ checksum "Gemfile.lock" }}-{{ .Branch }}
+        key: v2-{{ checksum "/tmp/cache-env-id" }}-{{ arch }}-{{ checksum ".ruby-version" }}-{{ checksum "Gemfile.lock" }}-{{ .Branch }}
         # ~/ruby is the interpreter AND every gem: with Ruby installed
         # under $HOME, Gem.dir is $HOME/ruby/lib/ruby/gems/X, so one
         # directory covers both.

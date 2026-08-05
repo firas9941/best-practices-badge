@@ -935,11 +935,36 @@ Skipping writing "home/circleci/.rubygems/" - mkdir /home/circleci: permission d
 Extraction duration: 27.154492978s
 ```
 
-**The fix is an environment token leading the key**, `v2-heroku24`, with
-a comment saying to change it whenever the image, its user or its `$HOME`
-changes. That is a manual step, which this document generally dislikes,
-but it is manual in exactly the place where a human is already making a
-deliberate decision.
+**The fix reads the environment rather than describing it.** A step
+before `restore_cache` writes the three things that decide
+compatibility, and the key hashes that file:
+
+```text
+heroku
+/home/heroku
+ubuntu-24.04
+```
+
+The first attempt at this was a hand-written `v2-heroku24` token, which
+would have needed changing by hand on every image or stack move. That is
+the sort of chore this document exists to remove, and the stack number
+had no business being hardcoded. Reading `id -un`, `$HOME` and
+`/etc/os-release` instead means a stack upgrade changes the key by
+itself, and nothing needs bumping.
+
+Checked against both images: the old one gives
+`circleci | /home/circleci | ubuntu-24.04` and the new one
+`heroku | /home/heroku | ubuntu-24.04`. Note the OS is identical, so
+hashing the OS alone would *not* have caught this; it was the user and
+home that differed. All three parts earn their place.
+
+**Why hash a 33-byte file instead of using the values directly?** A
+cache key can only interpolate CircleCI's own templates, and
+`{{ .Environment.X }}` is restricted to variables CircleCI exports or a
+context supplies, "not any arbitrary environment variable".
+`{{ checksum }}` on a file is the only way to get a runtime value into a
+key at all. The hashing is a consequence, not a choice, and the step
+prints the file so the log stays readable.
 
 ### Bug 2: the cached paths held no gems at all
 
