@@ -906,6 +906,95 @@ place to forget.
   corrects an argument made earlier for `ghcr.io` on metering grounds,
   which does not apply through CircleCI.
 
+## The cache broke, and it was worse than it looked
+
+Found 2026-08-05, on the first staging deploy after the executor
+changed. `bundle install` took 2m06s on a supposedly warm cache, and
+`restoring cache` took 27 seconds to achieve nothing.
+
+**Two separate bugs, both mine, and the second is the expensive one.**
+
+### Bug 1: the key matched a cache that could not be written
+
+CircleCI stores cache paths as **absolute** paths. The cache had been
+saved by the old image, whose user was `circleci`:
+
+```text
+Cached paths:
+  * /home/circleci/.rubygems
+  * /home/circleci/ossf/best-practices-badge/vendor/bundle
+```
+
+The new executor runs as `heroku`, cannot create `/home/circleci`, and
+the key contained nothing that distinguished the two environments. So
+the restore matched, then failed on every single file:
+
+```text
+Skipping writing "home/circleci/.rubygems/" - mkdir /home/circleci: permission denied
+   ... 23,404 times ...
+Extraction duration: 27.154492978s
+```
+
+**The fix is an environment token leading the key**, `v2-heroku24`, with
+a comment saying to change it whenever the image, its user or its `$HOME`
+changes. That is a manual step, which this document generally dislikes,
+but it is manual in exactly the place where a human is already making a
+deliberate decision.
+
+### Bug 2: the cached paths held no gems at all
+
+Worse, because it would not have healed itself. With Ruby installed
+under `$HOME`, gems no longer live where the old key looked:
+
+```text
+Gem.dir      = /home/heroku/ruby/lib/ruby/gems/3.4.0   <- where gems go
+~/.rubygems                                            <- what we cached
+```
+
+`~/.rubygems` was where the **cimg** image put `GEM_HOME`; on this
+executor it does not exist. And `vendor/bundle` is empty because no
+`--path` is set. So even with a corrected key, every build would have
+reinstalled every gem, for ever, and the cache would have looked healthy
+while doing it.
+
+**The fix caches `~/ruby`**, which holds the interpreter *and* every gem,
+since `Gem.dir` is inside it. That also removes the Ruby download on a
+hit, so the restore now covers more than it ever did.
+
+`~/node` is deliberately not cached: 205 MB extracted to save an 8.7
+second download is a bad trade.
+
+### And a third thing, which was never right
+
+The old key ended in `{{ .Branch }}` with **no fallback keys at all**, so
+every new branch started completely cold no matter how many identical
+gem sets were already cached. That alone is a large part of why
+iterating felt slow. There are now three keys, progressively looser:
+
+| Key | Matches |
+| --- | ------- |
+| `…-{{ checksum "Gemfile.lock" }}-{{ .Branch }}` | this Ruby, these gems, this branch |
+| `…-{{ checksum "Gemfile.lock" }}-` | this Ruby and these gems, any branch |
+| `…-{{ checksum ".ruby-version" }}-` | this Ruby, any gems |
+
+`{{ arch }}` comes before the checksums so the looser fallbacks cannot
+cross architectures.
+
+### Guarded, and tested by breaking it
+
+Because the cache now carries the interpreter, a stale cache could
+silently test the wrong Ruby. The install step therefore verifies rather
+than trusts: it runs `$HOME/ruby/bin/ruby -v` to decide whether the
+cache really delivered something usable, and then compares the result
+against `.ruby-version`. Verified all three ways:
+
+```text
+miss  -> Installing Ruby 3.4.1 for heroku-24
+hit   -> Ruby restored from cache: ruby 3.4.1 ...
+stale -> ERROR: .ruby-version says 3.4.10, but the Ruby
+         in $HOME is 3.4.1. Refusing to test the wrong one.   (exit 1)
+```
+
 ## Keeping pins current
 
 The organising principle, decided 2026-08-04: **the pull request list is
