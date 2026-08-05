@@ -25,12 +25,21 @@ staging 2026-08-04):
   because 10.17.0 declared `engines: node 20.x` and Node 20 is end of
   life.
 
-**In progress** (branch `build_env_staleness`): step 1 of
-[the plan](#the-plan), pinning Node. The repository side is done; the
-buildpack still has to be added to the two Heroku applications, in the
-order given under [Pinning Node](#pinning-node-for-the-production-build).
+**Step 1 is complete**, 2026-08-05. `package.json` pins Node, and
+`heroku/nodejs` is configured ahead of `heroku/ruby` on **both**
+applications:
 
-**Decided, not yet built:** steps 6 to 12 of
+```text
+1. buildpack-mimalloc
+2. heroku/nodejs
+3. heroku/ruby
+```
+
+Finding 5 is closed once a production deploy confirms the log reports
+24.19.0 and no longer warns that the Node version "is not pinned and
+can change over time".
+
+**Decided, not yet built:** steps 4 to 10, 12 and 13 of
 [The plan](#the-plan).
 
 **Steps 3 to 5 are done** on branch `build_env_image`: there is no test
@@ -1073,8 +1082,20 @@ with a note to set them temporarily rather than permanently.
 
 ## Migrations move to a release phase
 
-Done 2026-08-05, on its own so it can be watched on staging before
-anything else in the deploy job moves.
+Done 2026-08-05, on its own so it could be watched on staging before
+anything else in the deploy job moved.
+
+**Verified on staging**, release v845, `Deploy 09446ffe`. Maintenance
+mode came back off by itself, and the release history shows something
+worth noticing: the earlier deploy, which failed at the baseline check,
+created **no release at all**. It refused before pushing, so there is
+nothing orphaned between v844 and v845. A failure that leaves no trace
+is the point of checking before the push rather than after it.
+
+Still unproven: the failure path, that a broken migration blocks the
+release and turns CI red. Everything about it is documented and
+simulated, and the guard has now refused a real deploy for a real
+reason, but nobody has yet watched a migration fail on purpose.
 
 `Procfile` now carries `release: bundle exec rails db:migrate`. Heroku
 runs that in a one-off dyno after a successful build and **before any
@@ -1591,7 +1612,133 @@ shadowed name cannot silently skip the application it needed.
 
 ### Move the database refresh into the deploy job
 
-Decided 2026-08-05, and it does more than tidy up.
+Decided and **done** 2026-08-05, and it does more than tidy up.
+
+The refresh is its own step in the deploy job, between entering
+maintenance mode and pushing, so the deploy job now reads:
+
+```text
+set up access, maintenance:on
+refresh staging's database      <- staging only
+push, capture the release baseline
+wait for the release, maintenance:off
+```
+
+`rake deploy_staging` is now the same five git commands as
+`deploy_production`, needing no Heroku credential and no interactive
+login. `production_to_staging` survives for refreshing staging out of
+band, and its migration is now blocking: it was detached only because
+CI migrated again straight afterwards, and a migration whose outcome
+nobody reports is not worth running.
+
+### No signed URL, because there is nothing to leak
+
+Raised 2026-08-05, and it was a real exposure rather than a theoretical
+one: **this project's CircleCI logs can be read by anyone**, and
+`pg:backups:url` returns a *signed, publicly fetchable* link to
+production's dump. Whoever held it could download the production
+database until the signature expired. The emails inside are encrypted;
+nothing else is.
+
+The first fix redacted the URL from the log. The better one, taken
+instead, is Heroku's documented cross-application restore, which takes
+an **identifier** so no secret is ever created:
+
+```text
+heroku pg:backups:restore production-bestpractices::a3822 \
+  DATABASE_URL --app staging-bestpractices --confirm staging-bestpractices
+```
+
+The redaction stays anyway, because the CLI may resolve that identifier
+to a URL internally and print it. It keeps the host and path, useful
+when debugging, and drops the query string, where the signature lives.
+
+**Finding the identifier needed the real output, not a guess.** Two
+assumptions would have been wrong:
+
+* Identifiers are not all `b123`. Scheduled backups are lettered `a`
+  and manual ones `b`, so the newest was `a3822`, and a pattern of
+  `^b[0-9]+$` would have matched nothing.
+* The newest backup is not necessarily usable. One still running, or
+  one that failed, appears at the top of the list and would have been
+  chosen. The parse insists on `Completed`.
+
+### The parse has to be forgiving, and one thing it was not
+
+`heroku pg:backups` has no `--json`, so this is a table parse. Asked how
+tolerant it is of formatting, and checking properly turned up a real
+defect rather than a style point.
+
+**The command prints three sections, not one.** Backups, then Restores,
+then Copies. Copy rows look exactly like backup rows: `c3221` matches
+the same identifier shape and carries the same `Completed` status. The
+first version simply took the first match in the whole output, which
+happened to be right only because Backups is printed first. **An empty
+or all-running Backups section would have fallen through and handed a
+*copy* identifier to a restore.** Wrong, silently, and precisely the
+failure that made a table parse worth worrying about.
+
+The parse now tracks which section it is in and considers nothing
+outside Backups.
+
+**Heroku's own documentation disagrees with Heroku's own output.** The
+published example shows backups with status `Finished`; the CLI we run
+prints `Completed`, which is the word the example reserves for restores.
+Both are accepted.
+
+On formatting specifically, it is tolerant by construction. awk's
+default field splitting treats any run of spaces or tabs as one
+separator, so column widths do not matter, and the status is matched as
+a whole word anywhere on the line rather than by column number, so a
+change to the "Created at" format cannot shift it out from under us.
+
+Tested against the real listing and seven synthetic ones:
+
+| Listing | Result |
+| ------- | ------ |
+| the real one, three sections | `a3822` |
+| Backups empty, Copies present | **refuses**, does not take `c3221` |
+| only a Restores section | refuses |
+| documentation style, `Finished`, single spaces | `b011` |
+| tab separated | `a899`, skipping a Running row |
+| a Running backup on top | skips it, `a3822` |
+| a Failed backup on top | skips it, `a3822` |
+| an API error instead of a table | refuses, exit 1 |
+
+What it still cannot survive is Heroku renaming the sections or the
+status words again. It fails closed when that happens, which is the
+most that can be promised of a parse with no machine-readable
+alternative.
+
+**Four independent exact-match checks guard the restore**, because it
+overwrites a database:
+
+1. The workflow filter admits only the branch names `staging` and
+   `production`. CircleCI treats a plain string as a branch name; a
+   regular expression would have to be written between slashes and
+   match the entire string.
+2. The job re-checks that with a `case` allowlist.
+3. The step itself tests `CIRCLE_BRANCH` for equality with `staging`.
+4. Both application names are literals; nothing is derived from the
+   branch, so no branch name can redirect the restore or choose its
+   source. The step also refuses if the target is not
+   `staging-bestpractices`, which is the check that would matter if
+   someone later replaced those literals with variables.
+
+Underneath all four: reaching any of it needs the right to push to this
+repository's `staging` branch, which is what branch protection is for.
+
+Tested against the real step code. Only the exact string `staging`
+triggers a restore; `staging2`, `my-staging`, `staging/foo`, `Staging`,
+`STAGING`, `staging-bestpractices`, leading or trailing spaces, and the
+glob patterns `sta*` and `*` all do not.
+
+**A bug caught by that testing, worth recording.** The first attempt
+put the restore in the same step as the push, so its early exit on
+non-staging branches skipped `git push` entirely: production would have
+deployed nothing. Splitting them into separate steps fixed it, and the
+test that catches it is simply asserting that `production` still
+pushes.
 
 `production_to_staging` exists in the `Rakefile` only because that is
 where someone happened to put it. It is work done *to* staging as part
@@ -1707,14 +1854,21 @@ There is no `package-lock.json`, because there is nothing to lock. The
 buildpack reads `package-lock.json` only to choose between `npm ci` and
 `npm install`, and takes the latter without complaint.
 
-**The application half, not done.** `heroku/nodejs` must be configured
-on both applications, between the mimalloc buildpack and `heroku/ruby`:
+**The application half, done 2026-08-05** on staging and then
+production. `heroku/nodejs` must sit between the mimalloc buildpack and
+`heroku/ruby`:
 
 ```text
 heroku buildpacks:add --index 2 heroku/nodejs --app staging-bestpractices
 ```
 
-Until then this pin does nothing. `heroku/ruby` does not read
+Check before adding, since the command is easy to run twice:
+
+```text
+heroku buildpacks --app production-bestpractices
+```
+
+Without that buildpack the pin does nothing. `heroku/ruby` does not read
 `engines.node`; it installs a Node of its own whenever it sees `execjs`
 in `Gemfile.lock`, which it does.
 
@@ -1733,11 +1887,11 @@ Node; see [The image](#the-image).
 
 ## The plan
 
-1. **Pin Node for the production build** (finding 5). Independent,
-   cheap, and the only finding that can break a deploy. Add the
-   `heroku/nodejs` buildpack ahead of `heroku/ruby` and pin the version.
-   See [Pinning Node](#pinning-node-for-the-production-build); the
-   repository half is done.
+1. **DONE 2026-08-05: pin Node for the production build** (finding 5).
+   `package.json` pins the version, and `heroku/nodejs` sits ahead of
+   `heroku/ruby` on both applications. See
+   [Pinning Node](#pinning-node-for-the-production-build). The last
+   confirmation is a production deploy log reporting 24.19.0.
 2. **DONE 2026-08-05: checked `heroku/heroku:24-build`** for `libpq`,
    its headers and a C toolchain. All present; see [The image](#the-image).
 3. **DONE 2026-08-05: run the `build` job on `heroku/heroku:24-build`
@@ -1763,9 +1917,29 @@ Node; see [The image](#the-image).
 
 Independent of the above, and in no particular order with it:
 
-11. **Move the staging database refresh into the CircleCI deploy job**,
-    which takes Heroku out of the deploy tasks altogether.
-12. **Stop booting Rails for every rake task**, then make the deploys a
+11. **DONE 2026-08-05: move the staging database refresh into the
+    CircleCI deploy job**, which takes Heroku out of deploying
+    altogether. `rake deploy_staging` is now pure git.
+12. **Break a migration on staging on purpose**, and confirm the
+    release is blocked and CI goes red. Deliberately later: it should
+    test the deploy job's *final* shape, so it belongs after step 11
+    rather than before, and there is no sense proving a mechanism twice
+    while it is still moving.
+
+    The happy path is proven; release v845 went out through the release
+    phase and maintenance mode cleared itself. What is unproven is the
+    claim the whole design rests on: that a failed migration stops the
+    release rather than shipping code against an unmigrated database.
+    It is documented by Heroku and simulated here, and the guard has
+    refused a real deploy for a real reason, but nobody has watched
+    this particular failure happen.
+
+    What to expect: the release reaches `failed`, the previous release
+    keeps serving, the deploy job exits 1, and **maintenance mode stays
+    on deliberately**, so clearing it is part of cleaning up. A migration
+    that raises on purpose is enough; revert it once the behaviour is
+    confirmed.
+13. **Stop booting Rails for every rake task**, then make the deploys a
     `workflow_dispatch` button. See [Deploying without a development
     environment](#deploying-without-a-development-environment).
 
