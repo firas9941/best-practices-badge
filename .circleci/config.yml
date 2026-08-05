@@ -628,6 +628,21 @@ jobs:
             heroku maintenance:on --app "$HEROKU_APP"
             # Give production site a few seconds to complete ongoing work.
             [ "$HEROKU_APP" != 'production-bestpractices' ] || sleep 10
+            # Record the newest release version BEFORE pushing. The
+            # wait step below must not mistake the release that is
+            # already live for the one this deploy creates.
+            #
+            # Release list endpoint and the Range header that orders it:
+            #   https://devcenter.heroku.com/articles/platform-api-reference#release
+            #   https://devcenter.heroku.com/articles/platform-api-reference#ranges
+            HEROKU_API='https://api.heroku.com'
+            curl -sfS "${HEROKU_API}/apps/${HEROKU_APP}/releases" \
+              -H 'Accept: application/vnd.heroku+json; version=3' \
+              -H "Authorization: Bearer ${HEROKU_API_KEY}" \
+              -H 'Range: version ..; order=desc,max=1;' \
+              | grep -o '"version":[0-9]*' | head -1 | cut -d: -f2 \
+              > /tmp/pre-deploy-release-version
+            echo "Newest release before deploy: v$(cat /tmp/pre-deploy-release-version)"
             echo "Deploying to $HEROKU_APP"
             # Switching from "master" here requires additional work, see:
             # https://stackoverflow.com/questions/10451330/clean-git-repo-on-heroku
@@ -645,10 +660,79 @@ jobs:
       #       name: Setup Heroku
       #       command: bash .circleci/setup-heroku.sh
       - run:
-          name: Migrate DB
+          name: Wait for the release, then leave maintenance mode
           command: |
             export HEROKU_APP="$CIRCLE_BRANCH"-bestpractices
-            heroku run --app "$HEROKU_APP" -- bundle exec rails db:migrate
+            # Migrations now run in the release phase; see Procfile.
+            #
+            # Do NOT infer success from "git push heroku". Heroku
+            # documents that a build can succeed while its release
+            # fails, does not document the push's exit status for that
+            # case, and says outright that for "real-time detection
+            # during CI/CD pipelines, you would need to use the
+            # Platform API rather than rely solely on the git push exit
+            # code":
+            #   https://devcenter.heroku.com/articles/release-phase
+            #
+            # So ask the API. Release.status is a documented enum of
+            # failed, pending, succeeded and expired; the values here
+            # come from the machine-readable schema rather than prose:
+            #   https://devcenter.heroku.com/articles/platform-api-reference#release
+            #   curl -H 'Accept: application/vnd.heroku+json; version=3' \
+            #     https://api.heroku.com/schema
+            # (that URL returns 400 without the Accept header, so it is
+            # not dead if you paste it into a browser)
+            #
+            # Ordering and limiting of the list come from:
+            #   https://devcenter.heroku.com/articles/platform-api-reference#ranges
+            prev="$(cat /tmp/pre-deploy-release-version 2>/dev/null || echo 0)"
+            api="https://api.heroku.com/apps/${HEROKU_APP}/releases"
+            # Only this flag may conclude success. Do not infer it from
+            # $status: while we are skipping the release that was
+            # already live, $status holds ITS value, which is normally
+            # "succeeded", and a loop that never sees a new release
+            # would then report success. Tested; it did exactly that.
+            deployed=
+            # 240 * 15s = 1 hour, matching the release phase cap.
+            for i in $(seq 1 240); do
+              body="$(curl -sfS "$api" \
+                -H 'Accept: application/vnd.heroku+json; version=3' \
+                -H "Authorization: Bearer ${HEROKU_API_KEY}" \
+                -H 'Range: version ..; order=desc,max=1;')" || {
+                  echo "Release query failed; retrying."; sleep 15; continue; }
+              version="$(printf '%s' "$body" \
+                | grep -o '"version":[0-9]*' | head -1 | cut -d: -f2)"
+              status="$(printf '%s' "$body" \
+                | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)"
+              # Ignore the release that was already live.
+              if [ "${version:-0}" -le "$prev" ]; then
+                echo "Waiting for a new release (newest is still v${version})."
+                sleep 15; continue
+              fi
+              case "$status" in
+                succeeded)
+                  echo "Release v${version} succeeded; migrations ran."
+                  deployed=yes
+                  break ;;
+                failed|expired)
+                  echo "ERROR: release v${version} ${status}."
+                  echo 'The new code was NOT deployed and the previous'
+                  echo 'release is still serving. Maintenance mode is'
+                  echo 'left ON deliberately: look before clearing it.'
+                  exit 1 ;;
+                pending)
+                  echo "Release v${version} pending (check ${i})." ;;
+                *)
+                  echo "ERROR: unexpected release status '${status}'."
+                  exit 1 ;;
+              esac
+              sleep 15
+            done
+            if [ "$deployed" != 'yes' ]; then
+              echo 'ERROR: no new release reached "succeeded" in time.'
+              echo "The newest release is still v${version:-unknown}."
+              exit 1
+            fi
             if [ -f '.recalculate' ] ; then
                 echo 'Recalculation marker found, performing recalculation.'
                 heroku run --app "$HEROKU_APP" -- rake update_all_badge_percentages

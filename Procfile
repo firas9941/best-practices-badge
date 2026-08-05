@@ -19,4 +19,36 @@
 # and turn SOLID_QUEUE_IN_PUMA off.  solid_queue coordinates through the
 # database, so it won't run a job twice, but there's no reason to have
 # two configurations to keep in step unless we need the separation.
+
+# Database migrations run here, as a release phase command, rather than
+# from the CI deploy job.
+#
+# Source for everything in this comment:
+#   https://devcenter.heroku.com/articles/release-phase
+#
+# Heroku runs this in a one-off dyno after a successful build and
+# BEFORE any dyno boots on the new release: "If the release command
+# exits with a non-zero exit status ... the release is not deployed to
+# the app's dyno formation."
+#
+# That is safer than what we did before.  Previously CI pushed the slug
+# and then ran the migration separately, so a failed migration left the
+# new code already live against an unmigrated database.  Now a failed
+# migration means the new release never goes live at all and the
+# previous one keeps serving.
+#
+# Two behaviours to know.  Release phase also runs on config var
+# changes and on rollbacks, so this command must stay idempotent;
+# db:migrate is.  And it has a one hour cap that cannot be extended,
+# after which the release status becomes "expired".
+#
+# CI does NOT learn about failures from "git push heroku": Heroku
+# documents that a build can succeed while its release fails, and does
+# not document the push's exit status for that case.  The same article
+# says that "for real-time detection during CI/CD pipelines, you would
+# need to use the Platform API rather than rely solely on the git push
+# exit code", so the deploy job polls that API instead.  See
+# .circleci/config.yml.
+release: bundle exec rails db:migrate
+
 web: ./ignore-termerr env BUNDLE_DISABLE_EXEC_LOAD=true bundle exec puma -C config/puma.rb

@@ -1071,6 +1071,83 @@ operation. They arrived with "Fix git push to heroku (#1798)" in **March
 years, burying the Heroku build output that actually matters. Removed,
 with a note to set them temporarily rather than permanently.
 
+## Migrations move to a release phase
+
+Done 2026-08-05, on its own so it can be watched on staging before
+anything else in the deploy job moves.
+
+`Procfile` now carries `release: bundle exec rails db:migrate`. Heroku
+runs that in a one-off dyno after a successful build and **before any
+dyno boots on the new release**, and its documentation is explicit: "If
+the release command exits with a non-zero exit status ... the release is
+not deployed to the app's dyno formation."
+
+That is safer than what it replaces, not merely cheaper. Previously CI
+pushed the slug and ran the migration afterwards, so a failed migration
+left the new code already live against an unmigrated database. Now a
+failed migration means the new release never goes live and the previous
+one keeps serving.
+
+### Do not trust the push's exit status. It is undocumented.
+
+Asked directly whether `git push heroku` fails when the release phase
+fails, "even if it does today, it might not in the future unless
+something documents that". Checked, and the answer is that **it is not
+documented**. Heroku says only:
+
+* "It is possible for a *build* to succeed and its associated *release*
+  to fail."
+* "For real-time detection during CI/CD pipelines, you would need to use
+  the Platform API rather than rely solely on the `git push` exit code."
+
+So the deploy job asks the API instead. Every part of that rests on
+documented behaviour, taken from the machine-readable schema at
+`https://api.heroku.com/schema` rather than from prose:
+
+| Thing | Documented as |
+| ----- | ------------- |
+| `Release.status` | enum `failed`, `pending`, `succeeded`, `expired` |
+| newest release | `GET /apps/{app}/releases` |
+| ordering | `Range: version ..; order=desc,max=1;` |
+
+Note `expired` is a fourth terminal state, presumably the one-hour cap,
+so the check insists on `succeeded` rather than merely "not failed".
+
+### Two traps, one of which was in my own first draft
+
+**The release that is already live looks newest.** Poll immediately
+after the push and the newest release may still be the previous one,
+whose status is `succeeded`. So the job records the newest version
+*before* pushing and ignores anything not greater than it.
+
+**And that guard let a bug straight back in.** With the skip
+implemented as `continue`, the loop variable `$status` still held the
+*old* release's `succeeded`, so a final `[ "$status" != succeeded ]`
+check passed even when a new release never appeared at all. A deploy
+that produced no release would have reported success. Found by testing
+rather than by reading: success is now recorded in a dedicated flag that
+only the success branch sets.
+
+Tested with canned API responses, all four paths:
+
+```text
+normal deploy            -> exit 0
+migration fails          -> exit 1
+release expires          -> exit 1
+new release never appears-> exit 1   (this one was the bug)
+```
+
+### What deliberately did not change
+
+The unreachable recalculation branch is still there, still calling
+`heroku run`. It cannot fire: `.recalculate` is matched by
+`.gitignore` line 70 (`.*`) and has never been committed, so `checkout`
+never produces it. Removing it, and removing the CLI it keeps alive, is
+a separate change; this one is only the release phase.
+
+Maintenance mode is also left ON when a release fails, deliberately, so
+that a failure is looked at rather than cleared automatically.
+
 ## Keeping pins current
 
 The organising principle, decided 2026-08-04: **the pull request list is
