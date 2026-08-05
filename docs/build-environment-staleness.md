@@ -1159,7 +1159,24 @@ connection could otherwise block until CircleCI's 20 minute
 no-output timeout killed the job with a message pointing nowhere near
 the cause.
 
-Tested with canned API responses, seven paths:
+A third pass caught a bug introduced by the second. `grep -m1` caps
+matching **lines**, not matches, and this JSON is a single line, so `-o`
+still emitted every match on it: with more than one release in the body,
+`version` became two lines and the integer comparison would have died
+with a bash error. The original `head -1` had been right about that; the
+fix traded a real bug for a latent one. It now uses `sed -n 1p`, which
+takes the first match and reads its whole input, so it cannot give grep
+a SIGPIPE either, and the version is validated as a bare integer rather
+than merely non-empty.
+
+That case is now tested, along with the two ways the `Range` header
+could let us down. If it were ignored but ordering stayed descending,
+the newest release is still first and the check works. If it were
+ignored *and* ordering were ascending, the oldest release comes first,
+never exceeds the baseline, and the job times out and fails: wrong, but
+safely wrong, never a false success.
+
+Tested with canned API responses, eight paths:
 
 ```text
 normal deploy             -> exit 0
@@ -1169,6 +1186,8 @@ new release never appears -> exit 1   (the first bug)
 unparsable body          -> retries, then exit 0   (the second)
 API errors                -> retries, then exit 0
 missing baseline          -> exit 1   (the third)
+two releases in one body  -> exit 0   (the fourth)
+Range ignored, ascending  -> exit 1   (safely wrong)
 ```
 
 ### What deliberately did not change

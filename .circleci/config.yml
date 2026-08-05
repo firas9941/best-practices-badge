@@ -635,9 +635,14 @@ jobs:
             # Release list endpoint and the Range header that orders it:
             #   https://devcenter.heroku.com/articles/platform-api-reference#release
             #   https://devcenter.heroku.com/articles/platform-api-reference#ranges
-            # grep -om1 rather than "grep -o | head -1": head exits
-            # early, which can leave grep with SIGPIPE, and pipefail
-            # would then fail the pipeline on a successful match.
+            # "sed -n 1p" rather than "head -1": head exits early,
+            # which can leave grep with SIGPIPE, and pipefail would then
+            # fail the pipeline on a successful match. sed reads its
+            # whole input, so it cannot.
+            #
+            # NOT "grep -m1": that caps matching LINES, and this JSON is
+            # one line, so -o would still emit every match on it.
+            #
             # "|| true" because grep exits 1 on no match, which under
             # this job's -eo pipefail would abort with no message.
             HEROKU_API='https://api.heroku.com'
@@ -646,11 +651,12 @@ jobs:
               -H 'Accept: application/vnd.heroku+json; version=3' \
               -H "Authorization: Bearer ${HEROKU_API_KEY}" \
               -H 'Range: version ..; order=desc,max=1;' \
-              | grep -om1 '"version":[0-9]*' | cut -d: -f2 || true)"
+              | grep -o '"version":[0-9]*' | sed -n 1p | cut -d: -f2 || true)"
             # Do NOT fall back to 0 here. Zero would make the release
             # that is already live look newer than the baseline, so the
             # check after the push would accept it and report success
             # for a deploy that never released anything.
+            case "$prev" in ''|*[!0-9]*) prev='' ;; esac
             if [ -z "$prev" ]; then
               echo 'ERROR: could not read the current release version.'
               echo 'Refusing to deploy: the check after the push could'
@@ -727,16 +733,25 @@ jobs:
                 -H "Authorization: Bearer ${HEROKU_API_KEY}" \
                 -H 'Range: version ..; order=desc,max=1;')" || {
                   echo "Release query failed; retrying."; sleep 15; continue; }
-              # See the note above on grep -om1 and "|| true"; this
-              # job runs under -eo pipefail, so a body without these
-              # fields would otherwise abort the step silently instead
-              # of retrying.
+              # See the note in the Deploy step on "sed -n 1p" versus
+              # head and -m1, and on "|| true": this job runs under
+              # -eo pipefail, so a body without these fields would
+              # otherwise abort the step silently instead of retrying.
               version="$(printf '%s' "$body" \
-                | grep -om1 '"version":[0-9]*' | cut -d: -f2 || true)"
+                | grep -o '"version":[0-9]*' | sed -n 1p | cut -d: -f2 || true)"
               status="$(printf '%s' "$body" \
-                | grep -om1 '"status":"[^"]*"' | cut -d'"' -f4 || true)"
-              if [ -z "$version" ] || [ -z "$status" ]; then
-                echo 'Could not parse the release response; retrying.'
+                | grep -o '"status":"[^"]*"' | sed -n 1p | cut -d'"' -f4 || true)"
+              # Insist on a bare integer: this also catches a
+              # multi-line value, which is what a body holding more
+              # than one release would produce, rather than letting it
+              # crash the comparison below.
+              case "$version" in
+                ''|*[!0-9]*)
+                  echo 'Could not parse a single release version; retrying.'
+                  sleep 15; continue ;;
+              esac
+              if [ -z "$status" ]; then
+                echo 'Could not parse the release status; retrying.'
                 sleep 15; continue
               fi
               # Ignore the release that was already live.
