@@ -519,6 +519,27 @@ jobs:
                 ;;
             esac
       - run:
+          name: Pin the Heroku CLI version
+          command: |
+            set -euo pipefail
+            # Single source of truth for the version. The cache key below
+            # hashes this file, so bumping the version invalidates the
+            # cache by itself and nothing needs remembering. The
+            # integrity hash lives beside it so the two cannot drift:
+            # bump one without the other and the SHA-512 check fails
+            # loudly rather than installing something unexpected.
+            echo '11.8.1' > /tmp/heroku-cli-version
+            {
+              echo "export HEROKU_VERSION='$(cat /tmp/heroku-cli-version)'"
+              echo "export HEROKU_INTEGRITY='sha512-FgNpd1CvHXrHDQnr59aK7DNY+1UbtX2QFPTMfEBODAk64WtlLX/d+yrbYowSoDfXxxN2zUCzAzgQdGKBEanrxg=='"
+            } >> "$BASH_ENV"
+      # The CLI is 592KB as a tarball but 381MB and 45,233 files once
+      # npm has installed it, which is why this step took 51 seconds.
+      # Cache it: we use exactly three of its commands.
+      - restore_cache:
+          keys:
+          - heroku-cli-v1-{{ arch }}-{{ checksum "/tmp/heroku-cli-version" }}
+      - run:
           # Install the Heroku CLI at a pinned version with an independently
           # hardcoded SHA-512 hash for integrity verification.
           #
@@ -541,6 +562,20 @@ jobs:
           # See: https://devcenter.heroku.com/articles/heroku-cli
           name: Install Heroku CLI tools (to easily control maintenance mode)
           command: |
+            set -uo pipefail
+            # Always export the path, hit or miss.
+            echo 'export PATH="$HOME/heroku-cli/bin:$PATH"' >> "$BASH_ENV"
+            # Skip everything below if the cache already delivered a
+            # working CLI at the version we asked for. Check by running
+            # it, not by testing for the directory, so a half-restored
+            # cache falls back to a clean install instead of failing
+            # later in a confusing way.
+            if [ -x "$HOME/heroku-cli/bin/heroku" ] && \
+               "$HOME/heroku-cli/bin/heroku" --version 2>/dev/null \
+                 | grep -q "heroku/${HEROKU_VERSION} "; then
+              echo "Heroku CLI ${HEROKU_VERSION} restored from cache."
+              exit 0
+            fi
             echo "** Node version:"
             node -v
             echo "** npm version:"
@@ -550,11 +585,10 @@ jobs:
             # life. 11.x declares ">=20", so we can track the current
             # Node LTS instead. The commands we use here (git:remote,
             # maintenance:on/off, run) are unchanged across that bump.
-            HEROKU_VERSION="11.8.1"
             HEROKU_TARBALL_URL="https://registry.npmjs.org/heroku/-/heroku-${HEROKU_VERSION}.tgz"
-            # SHA-512 integrity hash in SRI format, recorded from the npm registry.
-            # Obtain via: npm view heroku@${HEROKU_VERSION} dist.integrity
-            HEROKU_INTEGRITY="sha512-FgNpd1CvHXrHDQnr59aK7DNY+1UbtX2QFPTMfEBODAk64WtlLX/d+yrbYowSoDfXxxN2zUCzAzgQdGKBEanrxg=="
+            # HEROKU_VERSION and HEROKU_INTEGRITY come from the pin step
+            # above. Obtain a new hash via:
+            #   npm view heroku@VERSION dist.integrity
             # Strip the "sha512-" prefix to get the raw base64-encoded hash.
             HEROKU_EXPECTED_HASH="${HEROKU_INTEGRITY#sha512-}"
             echo "** Downloading Heroku CLI ${HEROKU_VERSION}"
@@ -570,11 +604,13 @@ jobs:
             fi
             echo "** Hash verified. Installing Heroku CLI."
             npm install -g --prefix ~/heroku-cli ./heroku.tgz
-            export PATH="$HOME/heroku-cli/bin:$PATH"
-            echo 'export PATH="$HOME/heroku-cli/bin:$PATH"' >> "$BASH_ENV"
             rm -f heroku.tgz
             echo "** Heroku CLI version:"
-            heroku --version
+            "$HOME/heroku-cli/bin/heroku" --version
+      - save_cache:
+          key: heroku-cli-v1-{{ arch }}-{{ checksum "/tmp/heroku-cli-version" }}
+          paths:
+            - ~/heroku-cli
       - run:
           name: Deploy to Heroku
           command: |
@@ -596,7 +632,14 @@ jobs:
             # Switching from "master" here requires additional work, see:
             # https://stackoverflow.com/questions/10451330/clean-git-repo-on-heroku
             # https://stackoverflow.com/questions/36111040/error-message-after-successfully-pushing-to-heroku
-            GIT_CURL_VERBOSE=1 GIT_TRACE=1 git push heroku "$CIRCLE_BRANCH:master"
+            # GIT_CURL_VERBOSE=1 GIT_TRACE=1 used to be set here. They
+            # arrived with "Fix git push to heroku (#1798)" in March
+            # 2022 as debugging aids for a problem long since fixed, and
+            # stayed for four years, logging every HTTP header and git
+            # operation and burying the Heroku build output that
+            # actually matters. Set them temporarily if a push
+            # misbehaves; do not leave them on.
+            git push heroku "$CIRCLE_BRANCH:master"
       # - run:
       #       # This may no longer be necessary
       #       name: Setup Heroku

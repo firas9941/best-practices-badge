@@ -1020,6 +1020,57 @@ stale -> ERROR: .ruby-version says 3.4.10, but the Ruby
          in $HOME is 3.4.1. Refusing to test the wrong one.   (exit 1)
 ```
 
+## The deploy job, and what was actually slow in it
+
+Asked 2026-08-05 whether a 51 second "Install Heroku CLI tools" and a
+3m08s "Deploy to Heroku" were caused by the cache breakage. **Neither
+was**: the deploy job uses the `deploy-only` executor and has no
+`restore_cache` at all. They are two separate stories.
+
+### The CLI install was ours, and worth fixing
+
+Measured: the published tarball is **592 KB**, and `npm install -g`
+turns it into **381 MB across 45,233 files**. For a tool we use for
+exactly three commands.
+
+It is now cached, keyed on a file holding the version, so a version bump
+invalidates the cache by itself. The install step checks by *running*
+the restored binary and matching `heroku/<version>` in its output,
+rather than testing for a directory, so a half-restored cache
+reinstalls instead of failing later.
+
+Verified the detection both ways: it matches
+`heroku/11.8.1 linux-x64 node-v22.23.1` and does not match a different
+version.
+
+A standalone tarball would avoid npm entirely, but Heroku publishes it
+only at unversioned channel URLs, which cannot be pinned, so it is not
+an improvement under our pinning policy.
+
+**Longer term, two of the three CLI uses do not need a CLI at all.**
+`heroku git:remote` only sets a git remote URL, and `maintenance:on/off`
+is one Platform API call. Only `heroku run` for the migration genuinely
+needs it, because an attached one-off dyno is real work to reproduce. If
+that is ever solved, 381 MB leaves the deploy job.
+
+### The deploy itself is mostly Heroku's time
+
+`git push heroku` blocks while Heroku builds the slug: bundle install
+and `assets:precompile`, on their machines. Very little of 3m08s is
+ours.
+
+That figure is also **not a fair baseline**. Release v844 was the first
+deploy after `heroku/nodejs` joined the buildpack chain, which
+invalidates Heroku's build cache and adds a Node install. Compare the
+next one before concluding anything.
+
+One thing in that step *was* ours: the push ran under
+`GIT_CURL_VERBOSE=1 GIT_TRACE=1`, which log every HTTP header and git
+operation. They arrived with "Fix git push to heroku (#1798)" in **March
+2022** as debugging aids for a problem long since fixed, and stayed four
+years, burying the Heroku build output that actually matters. Removed,
+with a note to set them temporarily rather than permanently.
+
 ## Keeping pins current
 
 The organising principle, decided 2026-08-04: **the pull request list is
