@@ -782,7 +782,39 @@ seconds. No `Dockerfile`, no registry, no credential, no
 That is the answer to findings 1, 2 and 4 together, and it is a smaller
 answer than the one this document spent a day designing.
 
+### Which Heroku image, and why it is the build one
+
+`heroku/heroku:24-build`, not `heroku/heroku:24`. They are different
+images and the distinction is easy to get backwards:
+
+| | `:24` (run) | `:24-build` (ours) |
+| - | ----------- | ------------------ |
+| gcc, g++, make | absent | present |
+| libpq headers | absent | present |
+
+`:24` is what production **dynos run on**. `:24-build` is what Heroku
+**compiles the slug in**. We need the build variant because twenty of
+our gems build native extensions, and the run image has no compiler.
+
+So we match production's *build* environment exactly and its *runtime*
+environment approximately: same stack, fewer packages in production.
+That gap does not matter, because gems are compiled during
+`bundle install`, not at runtime.
+
+Note also that Ruby and Node are not test-only additions. Heroku's
+`ruby` and `nodejs` buildpacks install exactly those onto exactly this
+image when building a slug, so the job is doing roughly what the
+buildpack does. The parity is structural rather than accidental, and
+nothing in the executor exists only for testing.
+
 ### How it got there, because the route matters
+
+**Moving Chrome out first is what made this possible**, and that was
+load-bearing rather than incidental. While the test environment had to
+carry a browser, it had to add Google's apt repository, which is
+finding 1 walking back in with us owning the key rotation. Only once
+Chrome lived in its own pinned container did "just use the stack image"
+become available at all.
 
 Approach D was right that CI should run on the same stack as
 production. It was wrong to assume that meant *building an image*. The
