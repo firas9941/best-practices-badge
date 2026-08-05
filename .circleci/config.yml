@@ -635,14 +635,29 @@ jobs:
             # Release list endpoint and the Range header that orders it:
             #   https://devcenter.heroku.com/articles/platform-api-reference#release
             #   https://devcenter.heroku.com/articles/platform-api-reference#ranges
+            # grep -om1 rather than "grep -o | head -1": head exits
+            # early, which can leave grep with SIGPIPE, and pipefail
+            # would then fail the pipeline on a successful match.
+            # "|| true" because grep exits 1 on no match, which under
+            # this job's -eo pipefail would abort with no message.
             HEROKU_API='https://api.heroku.com'
-            curl -sfS "${HEROKU_API}/apps/${HEROKU_APP}/releases" \
+            prev="$(curl -sfS "${HEROKU_API}/apps/${HEROKU_APP}/releases" \
               -H 'Accept: application/vnd.heroku+json; version=3' \
               -H "Authorization: Bearer ${HEROKU_API_KEY}" \
               -H 'Range: version ..; order=desc,max=1;' \
-              | grep -o '"version":[0-9]*' | head -1 | cut -d: -f2 \
-              > /tmp/pre-deploy-release-version
-            echo "Newest release before deploy: v$(cat /tmp/pre-deploy-release-version)"
+              | grep -om1 '"version":[0-9]*' | cut -d: -f2 || true)"
+            # Do NOT fall back to 0 here. Zero would make the release
+            # that is already live look newer than the baseline, so the
+            # check after the push would accept it and report success
+            # for a deploy that never released anything.
+            if [ -z "$prev" ]; then
+              echo 'ERROR: could not read the current release version.'
+              echo 'Refusing to deploy: the check after the push could'
+              echo 'not then tell a new release from the live one.'
+              exit 1
+            fi
+            echo "$prev" > /tmp/pre-deploy-release-version
+            echo "Newest release before deploy: v${prev}"
             echo "Deploying to $HEROKU_APP"
             # Switching from "master" here requires additional work, see:
             # https://stackoverflow.com/questions/10451330/clean-git-repo-on-heroku
@@ -700,12 +715,20 @@ jobs:
                 -H "Authorization: Bearer ${HEROKU_API_KEY}" \
                 -H 'Range: version ..; order=desc,max=1;')" || {
                   echo "Release query failed; retrying."; sleep 15; continue; }
+              # See the note above on grep -om1 and "|| true"; this
+              # job runs under -eo pipefail, so a body without these
+              # fields would otherwise abort the step silently instead
+              # of retrying.
               version="$(printf '%s' "$body" \
-                | grep -o '"version":[0-9]*' | head -1 | cut -d: -f2)"
+                | grep -om1 '"version":[0-9]*' | cut -d: -f2 || true)"
               status="$(printf '%s' "$body" \
-                | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)"
+                | grep -om1 '"status":"[^"]*"' | cut -d'"' -f4 || true)"
+              if [ -z "$version" ] || [ -z "$status" ]; then
+                echo 'Could not parse the release response; retrying.'
+                sleep 15; continue
+              fi
               # Ignore the release that was already live.
-              if [ "${version:-0}" -le "$prev" ]; then
+              if [ "$version" -le "$prev" ]; then
                 echo "Waiting for a new release (newest is still v${version})."
                 sleep 15; continue
               fi

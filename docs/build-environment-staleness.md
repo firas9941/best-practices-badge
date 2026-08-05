@@ -1128,13 +1128,36 @@ that produced no release would have reported success. Found by testing
 rather than by reading: success is now recorded in a dedicated flag that
 only the success branch sets.
 
-Tested with canned API responses, all four paths:
+### A review found two more, and they were the same mistake twice
+
+The deploy job sets no `shell:`, so it runs under CircleCI's default
+**`/bin/bash -eo pipefail`**. That matters more than it looks.
+
+`version="$(... | grep -o ... | head -1 | cut ...)"` fails the whole
+pipeline when `grep` finds nothing, and `-e` then aborts the step **with
+no message**, so the retry written right beside it could never run. The
+same construction can also hand `grep` a SIGPIPE when `head` exits
+early, which `pipefail` turns into a failure on a *successful* match.
+
+Both are now `grep -om1 ... || true`, with an explicit emptiness check
+that retries and says so. `head` is gone from this step entirely.
+
+The same flags also made a *third* thing wrong in principle: falling
+back to `prev=0` when the current version could not be read. Zero makes
+the release already live look newer than the baseline, so the check
+after the push would accept it and report success for a deploy that
+released nothing. Under `-e` the step happened to abort first, so it was
+correct by accident. It now refuses to deploy, and says why.
+
+Tested with canned API responses, six paths:
 
 ```text
-normal deploy            -> exit 0
-migration fails          -> exit 1
-release expires          -> exit 1
-new release never appears-> exit 1   (this one was the bug)
+normal deploy             -> exit 0
+migration fails           -> exit 1
+release expires           -> exit 1
+new release never appears -> exit 1   (the first bug)
+unparsable body          -> retries, then exit 0   (the second)
+API errors                -> retries, then exit 0
 ```
 
 ### What deliberately did not change
