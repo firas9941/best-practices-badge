@@ -787,8 +787,8 @@ answer than the one this document spent a day designing.
 `heroku/heroku:24-build`, not `heroku/heroku:24`. They are different
 images and the distinction is easy to get backwards:
 
-| | `:24` (run) | `:24-build` (ours) |
-| - | ----------- | ------------------ |
+| Tooling | `:24` (run) | `:24-build` (ours) |
+| ------- | ----------- | ------------------ |
 | gcc, g++, make | absent | present |
 | libpq headers | absent | present |
 
