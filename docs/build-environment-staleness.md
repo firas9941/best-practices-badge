@@ -906,6 +906,301 @@ place to forget.
   corrects an argument made earlier for `ghcr.io` on metering grounds,
   which does not apply through CircleCI.
 
+## The cache broke, and it was worse than it looked
+
+Found 2026-08-05, on the first staging deploy after the executor
+changed. `bundle install` took 2m06s on a supposedly warm cache, and
+`restoring cache` took 27 seconds to achieve nothing.
+
+**Two separate bugs, both mine, and the second is the expensive one.**
+
+### Bug 1: the key matched a cache that could not be written
+
+CircleCI stores cache paths as **absolute** paths. The cache had been
+saved by the old image, whose user was `circleci`:
+
+```text
+Cached paths:
+  * /home/circleci/.rubygems
+  * /home/circleci/ossf/best-practices-badge/vendor/bundle
+```
+
+The new executor runs as `heroku`, cannot create `/home/circleci`, and
+the key contained nothing that distinguished the two environments. So
+the restore matched, then failed on every single file:
+
+```text
+Skipping writing "home/circleci/.rubygems/" - mkdir /home/circleci: permission denied
+   ... 23,404 times ...
+Extraction duration: 27.154492978s
+```
+
+**The fix reads the environment rather than describing it.** A step
+before `restore_cache` writes the three things that decide
+compatibility, and the key hashes that file:
+
+```text
+heroku
+/home/heroku
+ubuntu-24.04
+```
+
+The first attempt at this was a hand-written `v2-heroku24` token, which
+would have needed changing by hand on every image or stack move. That is
+the sort of chore this document exists to remove, and the stack number
+had no business being hardcoded. Reading `id -un`, `$HOME` and
+`/etc/os-release` instead means a stack upgrade changes the key by
+itself, and nothing needs bumping.
+
+Checked against both images: the old one gives
+`circleci | /home/circleci | ubuntu-24.04` and the new one
+`heroku | /home/heroku | ubuntu-24.04`. Note the OS is identical, so
+hashing the OS alone would *not* have caught this; it was the user and
+home that differed. All three parts earn their place.
+
+**Why hash a 33-byte file instead of using the values directly?** A
+cache key can only interpolate CircleCI's own templates, and
+`{{ .Environment.X }}` is restricted to variables CircleCI exports or a
+context supplies, "not any arbitrary environment variable".
+`{{ checksum }}` on a file is the only way to get a runtime value into a
+key at all. The hashing is a consequence, not a choice, and the step
+prints the file so the log stays readable.
+
+### Bug 2: the cached paths held no gems at all
+
+Worse, because it would not have healed itself. With Ruby installed
+under `$HOME`, gems no longer live where the old key looked:
+
+```text
+Gem.dir      = /home/heroku/ruby/lib/ruby/gems/3.4.0   <- where gems go
+~/.rubygems                                            <- what we cached
+```
+
+`~/.rubygems` was where the **cimg** image put `GEM_HOME`; on this
+executor it does not exist. And `vendor/bundle` is empty because no
+`--path` is set. So even with a corrected key, every build would have
+reinstalled every gem, for ever, and the cache would have looked healthy
+while doing it.
+
+**The fix caches `~/ruby`**, which holds the interpreter *and* every gem,
+since `Gem.dir` is inside it. That also removes the Ruby download on a
+hit, so the restore now covers more than it ever did.
+
+`~/node` is deliberately not cached: 205 MB extracted to save an 8.7
+second download is a bad trade.
+
+### And a third thing, which was never right
+
+The old key ended in `{{ .Branch }}` with **no fallback keys at all**, so
+every new branch started completely cold no matter how many identical
+gem sets were already cached. That alone is a large part of why
+iterating felt slow. There are now three keys, progressively looser:
+
+| Key | Matches |
+| --- | ------- |
+| `…-{{ checksum "Gemfile.lock" }}-{{ .Branch }}` | this Ruby, these gems, this branch |
+| `…-{{ checksum "Gemfile.lock" }}-` | this Ruby and these gems, any branch |
+| `…-{{ checksum ".ruby-version" }}-` | this Ruby, any gems |
+
+`{{ arch }}` comes before the checksums so the looser fallbacks cannot
+cross architectures.
+
+### Guarded, and tested by breaking it
+
+Because the cache now carries the interpreter, a stale cache could
+silently test the wrong Ruby. The install step therefore verifies rather
+than trusts: it runs `$HOME/ruby/bin/ruby -v` to decide whether the
+cache really delivered something usable, and then compares the result
+against `.ruby-version`. Verified all three ways:
+
+```text
+miss  -> Installing Ruby 3.4.1 for heroku-24
+hit   -> Ruby restored from cache: ruby 3.4.1 ...
+stale -> ERROR: .ruby-version says 3.4.10, but the Ruby
+         in $HOME is 3.4.1. Refusing to test the wrong one.   (exit 1)
+```
+
+## The deploy job, and what was actually slow in it
+
+Asked 2026-08-05 whether a 51 second "Install Heroku CLI tools" and a
+3m08s "Deploy to Heroku" were caused by the cache breakage. **Neither
+was**: the deploy job uses the `deploy-only` executor and has no
+`restore_cache` at all. They are two separate stories.
+
+### The CLI install was ours, and worth fixing
+
+Measured: the published tarball is **592 KB**, and `npm install -g`
+turns it into **381 MB across 45,233 files**. For a tool we use for
+exactly three commands.
+
+It is now cached, keyed on a file holding the version, so a version bump
+invalidates the cache by itself. The install step checks by *running*
+the restored binary and matching `heroku/<version>` in its output,
+rather than testing for a directory, so a half-restored cache
+reinstalls instead of failing later.
+
+Verified the detection both ways: it matches
+`heroku/11.8.1 linux-x64 node-v22.23.1` and does not match a different
+version.
+
+A standalone tarball would avoid npm entirely, but Heroku publishes it
+only at unversioned channel URLs, which cannot be pinned, so it is not
+an improvement under our pinning policy.
+
+**Longer term, two of the three CLI uses do not need a CLI at all.**
+`heroku git:remote` only sets a git remote URL, and `maintenance:on/off`
+is one Platform API call. Only `heroku run` for the migration genuinely
+needs it, because an attached one-off dyno is real work to reproduce. If
+that is ever solved, 381 MB leaves the deploy job.
+
+### The deploy itself is mostly Heroku's time
+
+`git push heroku` blocks while Heroku builds the slug: bundle install
+and `assets:precompile`, on their machines. Very little of 3m08s is
+ours.
+
+That figure is also **not a fair baseline**. Release v844 was the first
+deploy after `heroku/nodejs` joined the buildpack chain, which
+invalidates Heroku's build cache and adds a Node install. Compare the
+next one before concluding anything.
+
+One thing in that step *was* ours: the push ran under
+`GIT_CURL_VERBOSE=1 GIT_TRACE=1`, which log every HTTP header and git
+operation. They arrived with "Fix git push to heroku (#1798)" in **March
+2022** as debugging aids for a problem long since fixed, and stayed four
+years, burying the Heroku build output that actually matters. Removed,
+with a note to set them temporarily rather than permanently.
+
+## Migrations move to a release phase
+
+Done 2026-08-05, on its own so it can be watched on staging before
+anything else in the deploy job moves.
+
+`Procfile` now carries `release: bundle exec rails db:migrate`. Heroku
+runs that in a one-off dyno after a successful build and **before any
+dyno boots on the new release**, and its documentation is explicit: "If
+the release command exits with a non-zero exit status ... the release is
+not deployed to the app's dyno formation."
+
+That is safer than what it replaces, not merely cheaper. Previously CI
+pushed the slug and ran the migration afterwards, so a failed migration
+left the new code already live against an unmigrated database. Now a
+failed migration means the new release never goes live and the previous
+one keeps serving.
+
+### Do not trust the push's exit status. It is undocumented.
+
+Asked directly whether `git push heroku` fails when the release phase
+fails, "even if it does today, it might not in the future unless
+something documents that". Checked, and the answer is that **it is not
+documented**. Heroku says only:
+
+* "It is possible for a *build* to succeed and its associated *release*
+  to fail."
+* "For real-time detection during CI/CD pipelines, you would need to use
+  the Platform API rather than rely solely on the `git push` exit code."
+
+So the deploy job asks the API instead. Every part of that rests on
+documented behaviour, taken from the machine-readable schema at
+`https://api.heroku.com/schema` rather than from prose:
+
+| Thing | Documented as |
+| ----- | ------------- |
+| `Release.status` | enum `failed`, `pending`, `succeeded`, `expired` |
+| newest release | `GET /apps/{app}/releases` |
+| ordering | `Range: version ..; order=desc,max=1;` |
+
+Note `expired` is a fourth terminal state, presumably the one-hour cap,
+so the check insists on `succeeded` rather than merely "not failed".
+
+### Two traps, one of which was in my own first draft
+
+**The release that is already live looks newest.** Poll immediately
+after the push and the newest release may still be the previous one,
+whose status is `succeeded`. So the job records the newest version
+*before* pushing and ignores anything not greater than it.
+
+**And that guard let a bug straight back in.** With the skip
+implemented as `continue`, the loop variable `$status` still held the
+*old* release's `succeeded`, so a final `[ "$status" != succeeded ]`
+check passed even when a new release never appeared at all. A deploy
+that produced no release would have reported success. Found by testing
+rather than by reading: success is now recorded in a dedicated flag that
+only the success branch sets.
+
+### A review found two more, and they were the same mistake twice
+
+The deploy job sets no `shell:`, so it runs under CircleCI's default
+**`/bin/bash -eo pipefail`**. That matters more than it looks.
+
+`version="$(... | grep -o ... | head -1 | cut ...)"` fails the whole
+pipeline when `grep` finds nothing, and `-e` then aborts the step **with
+no message**, so the retry written right beside it could never run. The
+same construction can also hand `grep` a SIGPIPE when `head` exits
+early, which `pipefail` turns into a failure on a *successful* match.
+
+Both are now `grep -om1 ... || true`, with an explicit emptiness check
+that retries and says so. `head` is gone from this step entirely.
+
+The same flags also made a *third* thing wrong in principle: falling
+back to `prev=0` when the current version could not be read. Zero makes
+the release already live look newer than the baseline, so the check
+after the push would accept it and report success for a deploy that
+released nothing. Under `-e` the step happened to abort first, so it was
+correct by accident. It now refuses to deploy, and says why.
+
+A second review found the same wrong default surviving in the *other*
+half of the code: the wait step still did
+`prev="$(cat ... || echo 0)"`. The Deploy step guarantees that file, so
+it could not bite today, but it is the identical mistake and a future
+step reordering would have made it live. It now refuses rather than
+guessing. Both API calls also gained `--max-time 30`, because a hung
+connection could otherwise block until CircleCI's 20 minute
+no-output timeout killed the job with a message pointing nowhere near
+the cause.
+
+A third pass caught a bug introduced by the second. `grep -m1` caps
+matching **lines**, not matches, and this JSON is a single line, so `-o`
+still emitted every match on it: with more than one release in the body,
+`version` became two lines and the integer comparison would have died
+with a bash error. The original `head -1` had been right about that; the
+fix traded a real bug for a latent one. It now uses `sed -n 1p`, which
+takes the first match and reads its whole input, so it cannot give grep
+a SIGPIPE either, and the version is validated as a bare integer rather
+than merely non-empty.
+
+That case is now tested, along with the two ways the `Range` header
+could let us down. If it were ignored but ordering stayed descending,
+the newest release is still first and the check works. If it were
+ignored *and* ordering were ascending, the oldest release comes first,
+never exceeds the baseline, and the job times out and fails: wrong, but
+safely wrong, never a false success.
+
+Tested with canned API responses, eight paths:
+
+```text
+normal deploy             -> exit 0
+migration fails           -> exit 1
+release expires           -> exit 1
+new release never appears -> exit 1   (the first bug)
+unparsable body          -> retries, then exit 0   (the second)
+API errors                -> retries, then exit 0
+missing baseline          -> exit 1   (the third)
+two releases in one body  -> exit 0   (the fourth)
+Range ignored, ascending  -> exit 1   (safely wrong)
+```
+
+### What deliberately did not change
+
+The unreachable recalculation branch is still there, still calling
+`heroku run`. It cannot fire: `.recalculate` is matched by
+`.gitignore` line 70 (`.*`) and has never been committed, so `checkout`
+never produces it. Removing it, and removing the CLI it keeps alive, is
+a separate change; this one is only the release phase.
+
+Maintenance mode is also left ON when a release fails, deliberately, so
+that a failure is looked at rather than cleared automatically.
+
 ## Keeping pins current
 
 The organising principle, decided 2026-08-04: **the pull request list is
