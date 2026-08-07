@@ -80,27 +80,9 @@ jobs:
       # also why a personal access token was rejected: it belongs to a
       # person and expires on their clock, not the project's.
       #
-      # WHAT THE APP GRANTS, on this repository only, and why each one:
-      #   contents: write, pull-requests: write   a pull request is a
-      #     branch plus a commit, and GitHub files both under contents;
-      #     there is no narrower permission for it.
-      #   issues: write                           the dependency
-      #     dashboard is an issue, and so are Renovate's config-error
-      #     reports. Without it a broken renovate.json5 produces a green
-      #     run that did nothing, which is the failure this whole
-      #     workflow is arranged to avoid.
-      #   checks: read, statuses: read            so it can see whether
-      #     CI passed on a pull request it already opened, and leave it
-      #     alone or refresh it accordingly.
-      #
-      # Never "workflows: write": scoped to the circleci manager,
-      # Renovate has no business under .github/workflows, and
-      # withholding it means it cannot alter our GitHub Actions. Branch
-      # protection on main, staging and production means it cannot merge
-      # or deploy regardless.
-      #
       # The minted token is revoked in this action's post step, so it is
-      # dead when the job ends rather than an hour later.
+      # dead when the job ends rather than an hour later. What it may do
+      # while it lives is the permission list below.
       - name: Mint a short-lived token from the App
         id: app_token
         # Pin to commit SHA to prevent supply chain attacks via tag mutation.
@@ -125,27 +107,37 @@ jobs:
           # NAMING THE PERMISSIONS HERE IS THE PREFLIGHT CHECK, and it
           # does two jobs at once.
           #
-          # It fails loudly. GitHub rejects a request for a permission
-          # the installation does not hold, so if any of these are ever
-          # missing this step stops the run instead of letting Renovate
-          # start and half work. That case is otherwise invisible: the
-          # step before proves only that the two secrets EXIST, and a
-          # Renovate that cannot open its dashboard issue still opens
-          # pull requests and still exits zero. A green run that quietly
-          # dropped half its job is the thing this workflow is arranged
-          # to never do.
+          # It fails loudly. GitHub refuses to issue a token carrying a
+          # permission the installation does not hold, so a short grant
+          # stops the run instead of letting Renovate start and half
+          # work. That case is otherwise invisible: the step before
+          # proves only that the two secrets EXIST, and a Renovate that
+          # cannot open its dashboard issue still opens pull requests
+          # and still exits zero. A green run that quietly dropped half
+          # its job is the thing this workflow is arranged never to do.
           #
-          # It also scopes the token down. Without these the token
-          # carries everything the installation has, now and whatever it
-          # is granted later; with them it carries these five and
-          # nothing else, whatever the App accumulates.
+          # It also scopes the token DOWN. Without this list the token
+          # carries everything the installation holds, including
+          # anything the App is granted later for some other caller;
+          # with it the token carries these five and nothing else.
           #
-          # So this list must equal what Renovate actually needs. Adding
-          # a Renovate feature that needs more means granting it on the
-          # App AND naming it here.
+          # So the list must equal what Renovate actually needs, and a
+          # feature wanting more means granting it on the App AND naming
+          # it here. Never "workflows: write": scoped to the circleci
+          # manager, Renovate has no business under .github/workflows,
+          # and withholding it means it cannot alter our GitHub Actions.
+          # Branch protection on main, staging and production means it
+          # cannot merge or deploy regardless.
+          #
+          # A pull request is a branch plus a commit, and GitHub files
+          # both of those under contents; there is no narrower pair.
           permission-contents: write
           permission-pull-requests: write
+          # The dependency dashboard is an issue, and so are Renovate's
+          # config-error reports.
           permission-issues: write
+          # Whether CI passed on a pull request it already opened, so it
+          # knows to leave that alone or refresh it.
           permission-checks: read
           permission-statuses: read
 
