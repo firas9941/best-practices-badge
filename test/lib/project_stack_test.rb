@@ -6,7 +6,10 @@
 
 require 'test_helper'
 require 'tmpdir'
-require_relative '../../lib/project_stack'
+
+# No require_relative: lib/ is an autoload path, and requiring it here
+# would move this file's load-time lines out of the test worker's
+# coverage result. See test/lib/heroku_ruby_availability_test.rb.
 
 class ProjectStackTest < ActiveSupport::TestCase
   def with_config(text)

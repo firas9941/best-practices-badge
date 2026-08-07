@@ -5,7 +5,15 @@
 # SPDX-License-Identifier: MIT
 
 require 'test_helper'
-require_relative '../../lib/heroku_ruby_availability'
+
+# NO require_relative HERE, DELIBERATELY. lib/ is an autoload path (see
+# config/application.rb), so naming the constant loads the file inside
+# the worker process running these tests. Requiring it at the top loads
+# it once in the PARENT instead, before Rails forks its test workers,
+# and the parent's result is named "job-manual", which the later serial
+# system-test run overwrites. The file's load-time lines, its requires,
+# constants and def headers, then look untested: every method body is
+# exercised and "rake test:optimized" still fails on coverage.
 
 # Every probe is stubbed: the suite is hermetic on purpose, and a test
 # that reached S3 would fail on a train and pass or fail for reasons
