@@ -1827,20 +1827,39 @@ repository config, which is the check that means something.
 
 ### Before it can work
 
-**Create a `RENOVATE_TOKEN` secret**, and do not make it the default
-`GITHUB_TOKEN`. GitHub raises no workflow runs for events created by
-that token, so a Renovate pull request opened with it would start none
-of `brakeman`, `codeql`, `codespell` or `main`, and would be checked
-*less* than a pull request from a stranger. CircleCI is unaffected,
-triggering from its own integration.
+**Renovate must not authenticate as the default `GITHUB_TOKEN`.** GitHub
+raises no workflow runs for events created by that token, so a Renovate
+pull request opened with it would start none of `brakeman`, `codeql`,
+`codespell` or `main`, and would be checked *less* than a pull request
+from a stranger. CircleCI is unaffected, triggering from its own
+integration.
 
-A GitHub App installation token or a fine-grained personal access token,
-granting exactly `contents: write` and `pull-requests: write`. Never
-`workflows: write`: scoped to `circleci`, Renovate has no business under
-`.github/workflows`, and withholding it means it cannot alter our GitHub
-Actions.
+The credential is a GitHub App owned by the `ossf` organization,
+`openssf-badge-renovate`, installed on this repository alone. What it
+grants, and why each:
 
-**The workflow fails loudly until that secret exists**, rather than
+* `contents: write` and `pull-requests: write`, because a pull request
+  is a branch plus a commit and GitHub files both under contents. There
+  is no narrower permission for it.
+* `issues: write`, because the dependency dashboard is an issue and so
+  are Renovate's config-error reports. Without it a broken
+  `renovate.json5` produces a green run that did nothing.
+* `checks: read` and `statuses: read`, so it can see whether CI passed
+  on a pull request it already opened.
+
+Never `workflows: write`: scoped to `circleci`, Renovate has no business
+under `.github/workflows`, and withholding it means it cannot alter our
+GitHub Actions. Branch protection on `main`, `staging` and `production`
+means it cannot merge or deploy regardless.
+
+**A GitHub App installation token expires one hour after it is issued**,
+so it cannot be a stored secret. What is stored are two repository
+secrets, `RENOVATE_APP_ID` and `RENOVATE_APP_PRIVATE_KEY`, and the
+workflow mints a token from them on each run and revokes it when the job
+ends. This is also why a personal access token was rejected: it belongs
+to a person and expires on their clock rather than the project's.
+
+**The workflow fails loudly until those secrets exist**, rather than
 skipping quietly. A weekly red run is a reminder to finish the setup; a
 weekly green run that did nothing is how a dependency updater goes
 unnoticed for a year.
@@ -3132,7 +3151,7 @@ one wants to look is the question that settles it.
 9. **DONE 2026-08-05: added Renovate**, self-hosted, scoped to
    `circleci` and permissioned as above. See
    [Renovate, for the CircleCI images](#renovate-for-the-circleci-images).
-   It does nothing until a `RENOVATE_TOKEN` secret exists, and says so.
+   It does nothing until the App secrets exist, and says so.
 10. **Upgrade to Heroku-26 by accepting a pull request.** No longer a
     manual exercise: changing the executor image tag moves the tests,
     and the deploy job moves the applications to match, staging first by
