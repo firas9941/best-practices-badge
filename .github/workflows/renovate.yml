@@ -107,6 +107,15 @@ jobs:
         # Verify: curl -s https://api.github.com/repos/actions/create-github-app-token/git/ref/tags/v3.2.0
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
+          # EXPECT A DEPRECATION WARNING ON THIS LINE, and ignore it.
+          # The action annotates "app-id" with "Use 'client-id'
+          # instead.", which reads like something is broken or about to
+          # break. Neither is true. An App has both an id and a client
+          # id, they are different strings, and swapping one for the
+          # other here means an ossf organization owner generating and
+          # storing a third secret. The input still works and the action
+          # still accepts it; the warning is the action's preference,
+          # not a removal notice. Revisit if it ever becomes an error.
           app-id: ${{ secrets.RENOVATE_APP_ID }}
           private-key: ${{ secrets.RENOVATE_APP_PRIVATE_KEY }}
           # Omitting "owner" and "repositories" scopes the token to the

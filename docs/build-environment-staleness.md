@@ -1743,10 +1743,12 @@ punctual contributor.
 That holds only while its proposals get the same scrutiny as anyone
 else's, so:
 
-* Grant `contents: write` and `pull-requests: write`, nothing else.
-* **Not** `workflows: write`. Scoped to `circleci` and `ruby-version` it
-  has no business under `.github/workflows/`, and withholding it means
-  it cannot alter our GitHub Actions.
+* Grant only what it needs and nothing else. The list as built, with
+  the reason for each entry, is under
+  [Before it can work](#before-it-can-work).
+* **Not** `workflows: write`. Scoped to `circleci` it has no business
+  under `.github/workflows/`, and withholding it means it cannot alter
+  our GitHub Actions.
 * Keep branch protection on `staging` and `production`. Those are the
   branches the deploy job runs from, so protecting them is what makes
   "it cannot deploy" true rather than intended.
@@ -1754,10 +1756,10 @@ else's, so:
   workflow runs for events raised by that token. Our `brakeman`,
   `codeql`, `codespell` and `main` workflows all trigger on
   `pull_request`, so a Renovate pull request opened with it would skip
-  all four and be checked *less* than a stranger's. Use a dedicated
-  GitHub App installation token or a fine-grained personal access token
-  with the two permissions above. CircleCI is unaffected either way,
-  since it triggers from its own integration.
+  all four and be checked *less* than a stranger's. Use a credential of
+  our own instead; which one, and why it cannot simply be stored in a
+  secret, is under [Before it can work](#before-it-can-work). CircleCI
+  is unaffected either way, since it triggers from its own integration.
 
 ## Renovate, for the CircleCI images
 
