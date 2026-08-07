@@ -89,6 +89,7 @@ STATIC_CHECKS = %w[
   yaml_syntax_check
   circleci_config_check
   codeql_version_check
+  ruby_version_matches_lock
   html_from_markdown
   eslint
   report_code_statistics
@@ -111,6 +112,7 @@ STATIC_CHECKS = %w[
 DYNAMIC_CHECKS = %w[
   bundle_audit
   percent_gems_up_to_date
+  ruby_version_deployable
   test:optimized
 ].freeze
 
@@ -571,6 +573,103 @@ task codeql_version_check: :no_rails do
     end
     exit 1
   end
+end
+
+# THE RUBY VERSION IS IN TWO FILES AND HEROKU READS THE OTHER ONE.
+# Gemfile says `ruby File.read('.ruby-version').strip`, so the two agree
+# whenever "bundle install" last ran and stop agreeing the moment
+# .ruby-version is edited alone. Heroku's support reference: "We install
+# the Ruby version specified in your Gemfile.lock".
+#
+# Nothing else catches this. CI runs a plain "bundle install", so
+# Bundler reconciles the lock in the working tree and the suite passes;
+# "bundle check" reports satisfied even with BUNDLE_FROZEN=true, since
+# frozen mode guards the gem set and not the recorded Ruby. Nothing is
+# red until a deploy installs the OLD Ruby and meets a Gemfile
+# demanding the new one.
+#
+# STATIC: both files are in the tree, so no commit, no change.
+desc 'Check .ruby-version and Gemfile.lock name the same Ruby'
+task ruby_version_matches_lock: :no_rails do
+  puts 'Checking .ruby-version against Gemfile.lock...'
+  wanted = File.read('.ruby-version').strip
+  # "RUBY VERSION\n   ruby 3.4.1p0"; the patchlevel suffix is Bundler's
+  # and is not part of what .ruby-version can say, so it is ignored.
+  locked = File.read('Gemfile.lock')[/^RUBY VERSION\s*\n\s*ruby ([\d.]+)/, 1]
+
+  if locked.nil?
+    puts 'ERROR: Gemfile.lock has no RUBY VERSION section.'
+    puts 'Gemfile names a Ruby, so the lock should record one. Run'
+    puts '"bundle install" and commit the result.'
+    exit 1
+  elsif locked == wanted
+    puts "Both name Ruby #{wanted}."
+  else
+    puts "ERROR: .ruby-version says #{wanted}, Gemfile.lock says #{locked}."
+    puts 'Heroku installs the version in Gemfile.lock, so this deploys'
+    puts 'the wrong Ruby, or fails when Bundler finds the Gemfile asking'
+    puts "for #{wanted}. Run \"bundle install\" and commit Gemfile.lock"
+    puts 'alongside the .ruby-version change.'
+    exit 1
+  end
+end
+
+# Only Rubies Heroku publishes for our stack will deploy, so a bumped
+# .ruby-version could pass every test and fail at deploy. This asks S3
+# the same question a deploy will.
+#
+# DYNAMIC, not static: Heroku can withdraw a Ruby under an unchanged
+# tree, and the moment to hear about that is the deploy we were about
+# to do. Same argument as bundle_audit.
+#
+# NOT A MINITEST TEST. test/test_helper.rb disables outbound
+# connections, and WebMock's refusal is not a network error, so any
+# "skip when offline" logic would read it as an offline developer and
+# skip for ever. A guard that never guards is worse than none, being
+# also reassuring.
+#
+# Offline is a SKIP: a developer on a train is not stopped, and CI has
+# a network, so CI is where this bites.
+desc 'Check .ruby-version is a Ruby Heroku can deploy on our stack'
+task ruby_version_deployable: :no_rails do
+  require_relative '../heroku_ruby_availability'
+  require_relative '../project_stack'
+
+  version = File.read('.ruby-version').strip
+  stack = ProjectStack.name
+  puts "Checking Heroku has Ruby #{version} for #{stack}..."
+
+  begin
+    deployable = HerokuRubyAvailability.available?(
+      version: version, stack: stack
+    )
+  rescue HerokuRubyAvailability::Unreachable => e
+    puts "SKIPPED: #{e.message}"
+    puts 'Offline, so this proves nothing either way. CI has a network.'
+    next
+  end
+
+  if deployable
+    puts "Heroku has ruby-#{version} for #{stack}."
+  else
+    puts "ERROR: Heroku has no ruby-#{version} for #{stack}."
+    puts 'This would pass every test here and then fail at deploy.'
+    puts "Asked for: #{HerokuRubyAvailability.url_for(
+      version: version, stack: stack
+    )}"
+    puts 'Pick a version from .github/heroku-ruby-versions.txt, or run'
+    puts '"rake heroku_ruby_versions" to see what Heroku has now.'
+    exit 1
+  end
+end
+
+# A convenience for humans. The weekly workflow runs the same script to
+# refresh .github/heroku-ruby-versions.txt, which Renovate reads as a
+# custom datasource; it lives in script/ because it must run on a bare
+# runner, and our Rakefile loads config/boot, i.e. Bundler.
+desc 'Print the Rubies Heroku can deploy on our stack'
+task heroku_ruby_versions: :no_rails do
+  sh 'script/heroku_ruby_versions'
 end
 
 # The following are invoked as needed.
