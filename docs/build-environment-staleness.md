@@ -1604,11 +1604,12 @@ Three tools, distinct ground:
 | ---- | ------ |
 | Dependabot | `Gemfile`, npm, GitHub Actions workflows |
 | Renovate | `.circleci/config.yml` images and orbs |
-| `propose_ruby_upgrade` | `.ruby-version`, from what Heroku has |
+| Renovate | `.ruby-version` and `Gemfile.lock`, from what Heroku has |
 
-Renovate does **not** manage `.ruby-version`, though it can; see
-[Proposing Ruby upgrades](#proposing-ruby-upgrades-heroku-can-build)
-for why we took that job away from it.
+Renovate manages `.ruby-version`, but **not** with its own
+`ruby-version` datasource, which knows what Ruby has released rather
+than what Heroku can deploy. We feed it the second; see
+[Proposing Ruby upgrades](#proposing-ruby-upgrades-heroku-can-build).
 
 **Dependabot cannot read `.circleci/config.yml`.** It has no CircleCI
 support: `dependabot/dependabot-core` carries one directory per
@@ -1629,9 +1630,9 @@ ruby version in Gemfile", asks for exactly `Gemfile`, `Gemfile.lock` and
 trimmed file contents as the current version. We use the first and not
 the second.
 
-Run Renovate with `enabledManagers` limited to `circleci`. At its
-defaults it also reads the Gemfile, `.ruby-version` and Dockerfiles, and
-competes with Dependabot and with `propose_ruby_upgrade`.
+Run Renovate with `enabledManagers` limited to `circleci` and
+`custom.regex`. At its defaults it also reads the Gemfile and the
+Dockerfiles, where it competes with Dependabot.
 
 ### Prerequisite: a pin must carry its own tag
 
@@ -2151,12 +2152,13 @@ The devcenter reference page lists supported versions in prose, 3.3.12,
 machine-readably. So probing is not a workaround for a missing API; it
 is the only method available, and it is what the vendor does.
 
-**The design: propose only what exists.** A scheduled job,
-`propose_ruby_upgrade`, probes forward exactly as Heroku does, and opens
-a pull request bumping `.ruby-version` to what it finds. It cannot
-propose an undeployable version, so there is nothing to retry, and the
-schedule *is* the retry: a Heroku lag means "no pull request this week,
-a pull request next week", silently and with nothing red.
+**The design: propose only what exists.** A scheduled job probes
+forward exactly as Heroku does, and a pull request bumping
+`.ruby-version` follows from what it finds. Nothing undeployable can be
+proposed, so there is nothing to retry, and the schedule *is* the
+retry: a Heroku lag means "no pull request this week, a pull request
+next week", silently and with nothing red. Who opens that pull request
+changed during the build; see [As built](#as-built-2026-08-07-the-probe-publishes-renovate-decides).
 
 * **Probe every line above ours, not just our own patch line.** A move
   from 3.4 to 3.5, or to 4.0, is a decision we want *offered*. Offering
@@ -2168,19 +2170,96 @@ a pull request next week", silently and with nothing red.
   answers "does Heroku have this Ruby for this stack", two callers.
 * A dead cron here leaves us stale, not wrong, and the guard rather
   than the cron is what keeps an undeployable pin out.
-* **It opens pull requests, so the token analysis written for Renovate
+* **It opens a pull request, so the token analysis written for Renovate
   applies to it unchanged**: `contents: write` and
   `pull-requests: write`, never `workflows: write`, and **not** the
-  default `GITHUB_TOKEN`, or its pull requests would start none of our
-  `pull_request` workflows and be checked less than a stranger's.
+  default `GITHUB_TOKEN`, or its pull request would start none of our
+  `pull_request` workflows and be checked less than a stranger's. As
+  built, the only pull request it opens is the one refreshing the
+  published list; the upgrade proposals are Renovate's.
 * Being `lib/` code, it falls under the 100% coverage rule. Unit-test
   the probe with stubbed HTTP; see the guard below, which shares it.
+
+### As built, 2026-08-07: the probe publishes, Renovate decides
+
+The first version of this opened the pull requests itself, and in doing
+so reimplemented Renovate's deduplication, rebasing and rejection
+memory in about 400 lines of our own Ruby. That was the wrong shape,
+and deleting it was the improvement. What is left is a division that
+matches what each tool actually knows.
+
+| Piece | Where |
+| ----- | ----- |
+| The probe, and the search across lines | `lib/heroku_ruby_availability.rb` |
+| Which stack we are on | `lib/project_stack.rb` |
+| Print what Heroku has | `script/heroku_ruby_versions` |
+| Publish it weekly, as a pull request | `.github/workflows/heroku_ruby_versions.yml` |
+| The published fact | `.github/heroku-ruby-versions.txt` |
+| Everything after that | `.github/renovate.json5` |
+| Deployability guard | `rake ruby_version_deployable` |
+| Two-files guard | `rake ruby_version_matches_lock` |
+
+**Renovate has a `ruby-version` datasource and we still do not use it**,
+because it knows what Ruby has RELEASED and what matters here is what
+Heroku has BUILT for our stack, which lags it. What changed is that
+Renovate can be TOLD. A custom datasource with a `file://` registry
+reads a file from the repository, and `format: 'plain'` treats each
+line as an available release, which is exactly what the probe prints.
+So we publish the fact and Renovate does the rest: noticing, opening,
+rebasing, remembering a rejection, one pull request per line through
+`separateMinorPatch` and `separateMultipleMajor`.
+
+**The file has to be committed**, which is the one real cost. Renovate
+resolves `file://` with `readLocalFile`, relative to the clone it makes
+for itself, so a file written into a runner's workspace is invisible to
+it. Hence the weekly job opens a pull request against a fixed branch
+rather than writing a scratch file. In practice that pull request is
+rare, since Heroku publishes a few Rubies a year, and it doubles as the
+notification that it happened. Merging it changes no version we run.
+
+**The list describes Heroku, not us.** Every line is probed from patch
+zero, including our own, so the version we already run appears while it
+is still newest on its line. If the list were "what is newer than us"
+it would churn every time we accepted an upgrade, and every such change
+would arrive looking like news from Heroku.
+
+**The search matches Heroku's, gaps and all.** `highest_patch` probes a
+window of five patch levels and slides it only when the last of the
+window exists, which is what `OutdatedRubyVersion`'s
+`DEFAULT_RANGE = 1..5` does. It steps over a gap of up to four and
+stops at a wider one. A hole that wide would hide the version from a
+deploy's own suggestion too, so matching the vendor is the conservative
+choice rather than the convenient one. A test is named for that limit.
+
+**A blip must not empty the list.** Being unable to reach S3 is not the
+same as Heroku having withdrawn everything, so the script exits
+non-zero and prints nothing, and the workflow leaves the committed file
+alone. The published fact goes stale rather than false.
+
+**No bundle, on purpose.** The script and the two libraries it loads
+use nothing but the standard library, so the workflow needs no
+`bundle install` and no matching Ruby to ask an S3 bucket a handful of
+questions. Adding a gem to either library breaks that workflow rather
+than the test suite, which is why the constraint is written at the top
+of both files. It is also why this is a script and not only a rake
+task: our `Rakefile` loads `config/boot`, which is Bundler.
+
+**Both files move together.** Heroku installs the Ruby named in
+`Gemfile.lock`, not the one in `.ruby-version`; see the guard below.
+The custom manager matches both files, so Renovate updates them in one
+pull request. It captures only the digits in the lock, leaving
+Bundler's `p0` suffix in place, because `Gem::Version` reads a letter
+as a prerelease marker and Renovate would otherwise skip that
+occurrence as unstable. The patchlevel therefore goes stale until the
+next `bundle install` writes the real one back. Nothing reads it to
+choose an interpreter, and a plausible invented number would have been
+worse than an obviously stale one.
 
 ## Guard: Ruby pins must stay deployable
 
 Only Ruby versions Heroku offers for our stack will deploy, so a pull
-request proposing a newer one, from `propose_ruby_upgrade` or from a
-human editing the file by hand, could pass CI and fail at deploy. Guard
+request proposing a newer one, from Renovate or from a human editing
+the file by hand, could pass CI and fail at deploy. Guard
 it in CI.
 
 The check reads `.ruby-version`, issues one `HEAD` for the corresponding
@@ -2194,9 +2273,14 @@ refused. Worse, that refusal is not a network error, so any
 developer, skip silently, and go on skipping forever. A guard that never
 guards is more dangerous than no guard, because it is also reassuring.
 
-So make it a **rake task that CI runs**, one that needs no Rails and
-therefore lives in `lib/tasks/standalone/`; see [Deploying without a
-development environment](#deploying-without-a-development-environment).
+So make it a **rake task that CI runs**, one that needs no Rails. As
+built it is `ruby_version_deployable` in `lib/tasks/default.rake`,
+marked `: :no_rails`, which is the mechanism that already exists for
+exactly this and which the `Rakefile` audits on every invocation. It
+was to have lived in `lib/tasks/standalone/`; that directory is part of
+[Deploying without a development
+environment](#deploying-without-a-development-environment), which is
+not built yet, and moving this task there when it is costs one line.
 There the skip is honest, because a real connection failure is a real
 connection failure. Skip when offline so local work is unaffected; CI
 has a network, and CI is where it matters.
@@ -2211,7 +2295,8 @@ has a network, and CI is where it matters.
 * **Assert "must be 200"**, never "must not be 404", for the S3 reason
   above.
 * **The probe itself is ordinary `lib/` code** shared with
-  `propose_ruby_upgrade`, so it falls under the 100% coverage rule.
+  `script/heroku_ruby_versions`, so it falls under the 100% coverage
+  rule.
   Unit-test it with stubbed HTTP covering 200, 403 and a connection
   failure. The rake task is the thin part that CI runs live.
 
@@ -3153,12 +3238,18 @@ one wants to look is the question that settles it.
    pull requests older than step 3 still pin it by digest, and deleting
    it breaks their pipelines for no gain.
 5. **Retire the DockerHub image** once no live branch pins it.
-6. **Add the Heroku-availability probe and the guard** that uses it, so
-   step 7 cannot silently regress.
+6. **DONE 2026-08-07: added the Heroku-availability probe and the
+   guard** that uses it, so step 7 cannot silently regress.
+   `lib/heroku_ruby_availability.rb` is the probe and
+   `rake ruby_version_deployable` is the guard, in `DYNAMIC_CHECKS`.
 7. **Take Ruby to 3.4.10** (finding 3), which under this design is a
-   one-line change to `.ruby-version` and nothing else.
-8. **Add `propose_ruby_upgrade`**, sharing the probe from step 6, so
-   nobody has to remember to look.
+   one-line change to `.ruby-version` and nothing else. No longer a
+   thing to remember: step 8 now proposes it as a pull request.
+8. **DONE 2026-08-07: Ruby upgrades arrive as pull requests**, so
+   nobody has to remember to look. The probe from step 6 publishes what
+   Heroku has and Renovate proposes from it; we do not open those pull
+   requests ourselves. See
+   [Proposing Ruby upgrades Heroku can build](#proposing-ruby-upgrades-heroku-can-build).
 9. **DONE 2026-08-05: added Renovate**, self-hosted, scoped to
    `circleci` and permissioned as above. See
    [Renovate, for the CircleCI images](#renovate-for-the-circleci-images).
