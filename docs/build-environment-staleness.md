@@ -1743,10 +1743,12 @@ punctual contributor.
 That holds only while its proposals get the same scrutiny as anyone
 else's, so:
 
-* Grant `contents: write` and `pull-requests: write`, nothing else.
-* **Not** `workflows: write`. Scoped to `circleci` and `ruby-version` it
-  has no business under `.github/workflows/`, and withholding it means
-  it cannot alter our GitHub Actions.
+* Grant only what it needs and nothing else. The list as built, with
+  the reason for each entry, is under
+  [Before it can work](#before-it-can-work).
+* **Not** `workflows: write`. Scoped to `circleci` it has no business
+  under `.github/workflows/`, and withholding it means it cannot alter
+  our GitHub Actions.
 * Keep branch protection on `staging` and `production`. Those are the
   branches the deploy job runs from, so protecting them is what makes
   "it cannot deploy" true rather than intended.
@@ -1754,10 +1756,10 @@ else's, so:
   workflow runs for events raised by that token. Our `brakeman`,
   `codeql`, `codespell` and `main` workflows all trigger on
   `pull_request`, so a Renovate pull request opened with it would skip
-  all four and be checked *less* than a stranger's. Use a dedicated
-  GitHub App installation token or a fine-grained personal access token
-  with the two permissions above. CircleCI is unaffected either way,
-  since it triggers from its own integration.
+  all four and be checked *less* than a stranger's. Use a credential of
+  our own instead; which one, and why it cannot simply be stored in a
+  secret, is under [Before it can work](#before-it-can-work). CircleCI
+  is unaffected either way, since it triggers from its own integration.
 
 ## Renovate, for the CircleCI images
 
@@ -1827,20 +1829,48 @@ repository config, which is the check that means something.
 
 ### Before it can work
 
-**Create a `RENOVATE_TOKEN` secret**, and do not make it the default
-`GITHUB_TOKEN`. GitHub raises no workflow runs for events created by
-that token, so a Renovate pull request opened with it would start none
-of `brakeman`, `codeql`, `codespell` or `main`, and would be checked
-*less* than a pull request from a stranger. CircleCI is unaffected,
-triggering from its own integration.
+**Renovate must not authenticate as the default `GITHUB_TOKEN`.** GitHub
+raises no workflow runs for events created by that token, so a Renovate
+pull request opened with it would start none of `brakeman`, `codeql`,
+`codespell` or `main`, and would be checked *less* than a pull request
+from a stranger. CircleCI is unaffected, triggering from its own
+integration.
 
-A GitHub App installation token or a fine-grained personal access token,
-granting exactly `contents: write` and `pull-requests: write`. Never
-`workflows: write`: scoped to `circleci`, Renovate has no business under
-`.github/workflows`, and withholding it means it cannot alter our GitHub
-Actions.
+The credential is a GitHub App owned by the `ossf` organization,
+`openssf-badge-renovate`, installed on this repository alone. What it
+grants, and why each:
 
-**The workflow fails loudly until that secret exists**, rather than
+* `contents: write` and `pull-requests: write`, because a pull request
+  is a branch plus a commit and GitHub files both under contents. There
+  is no narrower permission for it.
+* `issues: write`, because the dependency dashboard is an issue and so
+  are Renovate's config-error reports. Without it a broken
+  `renovate.json5` produces a green run that did nothing.
+* `checks: read` and `statuses: read`, so it can see whether CI passed
+  on a pull request it already opened.
+
+Never `workflows: write`: scoped to `circleci`, Renovate has no business
+under `.github/workflows`, and withholding it means it cannot alter our
+GitHub Actions. Branch protection on `main`, `staging` and `production`
+means it cannot merge or deploy regardless.
+
+**The workflow names that same list when it mints the token**, which is
+how a missing permission is caught. GitHub refuses to issue a token
+carrying a permission the installation does not hold, so the run stops
+there. Checking that the secrets exist is not enough: a Renovate that
+cannot open its dashboard issue still opens pull requests and still
+exits zero, so a half-granted App would otherwise show up as a green
+run that quietly did half its job. Naming the permissions also scopes
+the token to exactly those five, whatever the App is granted later.
+
+**A GitHub App installation token expires one hour after it is issued**,
+so it cannot be a stored secret. What is stored are two repository
+secrets, `RENOVATE_APP_ID` and `RENOVATE_APP_PRIVATE_KEY`, and the
+workflow mints a token from them on each run and revokes it when the job
+ends. This is also why a personal access token was rejected: it belongs
+to a person and expires on their clock rather than the project's.
+
+**The workflow fails loudly until those secrets exist**, rather than
 skipping quietly. A weekly red run is a reminder to finish the setup; a
 weekly green run that did nothing is how a dependency updater goes
 unnoticed for a year.
@@ -3132,7 +3162,7 @@ one wants to look is the question that settles it.
 9. **DONE 2026-08-05: added Renovate**, self-hosted, scoped to
    `circleci` and permissioned as above. See
    [Renovate, for the CircleCI images](#renovate-for-the-circleci-images).
-   It does nothing until a `RENOVATE_TOKEN` secret exists, and says so.
+   It does nothing until the App secrets exist, and says so.
 10. **Upgrade to Heroku-26 by accepting a pull request.** No longer a
     manual exercise: changing the executor image tag moves the tests,
     and the deploy job moves the applications to match, staging first by
