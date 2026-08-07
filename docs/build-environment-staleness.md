@@ -1852,6 +1852,15 @@ under `.github/workflows`, and withholding it means it cannot alter our
 GitHub Actions. Branch protection on `main`, `staging` and `production`
 means it cannot merge or deploy regardless.
 
+**The workflow names that same list when it mints the token**, which is
+how a missing permission is caught. GitHub refuses to issue a token
+carrying a permission the installation does not hold, so the run stops
+there. Checking that the secrets exist is not enough: a Renovate that
+cannot open its dashboard issue still opens pull requests and still
+exits zero, so a half-granted App would otherwise show up as a green
+run that quietly did half its job. Naming the permissions also scopes
+the token to exactly those five, whatever the App is granted later.
+
 **A GitHub App installation token expires one hour after it is issued**,
 so it cannot be a stored secret. What is stored are two repository
 secrets, `RENOVATE_APP_ID` and `RENOVATE_APP_PRIVATE_KEY`, and the
