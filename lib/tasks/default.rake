@@ -815,22 +815,34 @@ end
 # empty list of problems, which is to say like success.
 desc 'Deploy current origin/staging to production'
 task deploy_production: :no_rails do
-  sh <<~'SHELL'
-    api=https://api.github.com/repos/ossf/best-practices-badge/commits/staging
-    checks=$(curl -sSf "$api/status" "$api/check-runs?per_page=100") || exit 1
-    not_green=$(printf '%s\n' "$checks" |
-      grep -E '"(state|status|conclusion)":' |
-      grep -vE '"(success|completed)"')
-    if [ -n "$not_green" ]; then
-      echo 'Refusing to deploy: staging has not passed everything.'
-      printf '%s\n' "$not_green"
-      echo 'Open the staging commit on GitHub to see what.'
-      exit 1
-    fi
-    git fetch origin staging:production \
-        +staging:refs/remotes/origin/staging &&
-      git push origin production
-  SHELL
+  # The check is quiet, because how we ask is bookkeeping; what it found
+  # is not. Both arms say something: one line when staging is clean, and
+  # the refusal with the offending lines when it is not. Its own sh, so a
+  # refusal raises here and the deploy below is never reached, which is
+  # why the "if" no longer has to fall through to it.
+  verbose(false) do
+    sh <<~'SHELL'
+      api=https://api.github.com/repos/ossf/best-practices-badge/commits/staging
+      checks=$(curl -sSf "$api/status" \
+        "$api/check-runs?per_page=100") || exit 1
+      not_green=$(printf '%s\n' "$checks" |
+        grep -E '"(state|status|conclusion)":' |
+        grep -vE '"(success|completed)"')
+      if [ -z "$not_green" ]; then
+        echo 'Staging has passed everything.'
+      else
+        echo 'Refusing to deploy: staging has not passed everything.'
+        printf '%s\n' "$not_green"
+        echo 'Open the staging commit on GitHub to see what.'
+        exit 1
+      fi
+    SHELL
+  end
+
+  # Shown as it runs, like the staging deploy: these are the commands.
+  sh 'git fetch origin staging:production ' \
+     '+staging:refs/remotes/origin/staging && ' \
+     'git push origin production'
 end
 
 rule '.html' => '.md' do |t|
