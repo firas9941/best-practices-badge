@@ -754,27 +754,36 @@ end
 # them. deploy_production quotes its delimiter for exactly that reason.
 desc 'Deploy current origin/main to staging'
 task deploy_staging: :no_rails do
-  sh <<~SHELL
-    git fetch origin main:staging +main:refs/remotes/origin/main &&
-      git push origin staging || exit 1
+  # Shown as it runs, because these two commands ARE the deploy and are
+  # what someone without a development environment types instead.
+  sh 'git fetch origin main:staging +main:refs/remotes/origin/main && ' \
+     'git push origin staging'
 
-    ahead=$(git rev-list --count origin/main..main 2>/dev/null || echo 0)
-    behind=$(git rev-list --count main..origin/main 2>/dev/null || echo 0)
-    if [ "$ahead" -gt 0 ]; then
-      echo
-      echo "WARNING: your local main has commits that are not on GitHub,"
-      echo 'so they are not reviewed, not tested and not deployed:'
-      git log --oneline origin/main..main
-      echo 'If you meant to work on a branch, move them onto one and put'
-      echo 'main back where GitHub has it:'
-      echo '  git branch SAVED-WORK main'
-      echo '  git switch main && git reset --keep origin/main'
-    elif [ "$behind" -gt 0 ]; then
-      echo
-      echo 'Your local main is out of date. To catch up:'
-      echo '  git switch main && git pull --ff-only'
-    fi
-  SHELL
+  # Reported quietly. "verbose(false)" keeps Rake from echoing this
+  # script, which is bookkeeping rather than anything anyone would run by
+  # hand, so the only thing that reaches the screen is a finding. It is a
+  # separate sh so a failed deploy above raises and this never runs,
+  # which is why nothing here needs "|| exit 1".
+  verbose(false) do
+    sh <<~SHELL
+      ahead=$(git rev-list --count origin/main..main 2>/dev/null || echo 0)
+      behind=$(git rev-list --count main..origin/main 2>/dev/null || echo 0)
+      if [ "$ahead" -gt 0 ]; then
+        echo
+        echo "WARNING: your local main has commits that are not on GitHub,"
+        echo 'so they are not reviewed, not tested and not deployed:'
+        git log --oneline origin/main..main
+        echo 'If you meant to work on a branch, move them onto one and put'
+        echo 'main back where GitHub has it:'
+        echo '  git branch SAVED-WORK main'
+        echo '  git switch main && git reset --keep origin/main'
+      elif [ "$behind" -gt 0 ]; then
+        echo
+        echo 'Your local main is out of date. To catch up:'
+        echo '  git switch main && git pull --ff-only'
+      fi
+    SHELL
+  end
 end
 
 # Same shape as deploy_staging, one branch further along, so the same
