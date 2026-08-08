@@ -280,7 +280,7 @@ tier, and CircleCI runs the suite again on the staging branch, so
 starting a staging deploy while main is still being checked simply runs
 two suites at once.
 
-**Afterwards it tells you about your own `main`, if there is anything to
+**After it deploys, it tells you about your own `main`, if there is anything to
 say.** Behind GitHub, the usual case, it gives you the one command to
 catch up. Ahead of GitHub, which is what happens when you start work
 without branching first, it warns, lists the commits that exist only on
@@ -295,7 +295,7 @@ deploy.
 ### Deploying to staging without a development environment
 
 These two commands deploy to staging, and are exactly what
-`rake deploy_staging` runs:
+`rake deploy_staging` runs to deploy to staging:
 
 ~~~~sh
 git fetch origin main:staging +main:refs/remotes/origin/main &&
