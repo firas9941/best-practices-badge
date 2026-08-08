@@ -2306,9 +2306,20 @@ the tests genuinely run on the Ruby being proposed.
 
 ## Deploying without a development environment
 
-Investigated 2026-08-04. `rake deploy_staging` and `rake deploy_production`
-currently require a working development environment. Nothing they do
-needs one; the requirement is an accident of how Rake starts.
+**DONE 2026-08-08.** Deploying needs `git` and the right to push, and
+nothing else: no Ruby, no bundle, no rbenv, no Heroku credential. The
+commands are in
+[INSTALL.md](./INSTALL.md#deployment-instructions) and the reasoning
+behind them in
+[implementation.md](./implementation.md#deploying-in-detail).
+
+Investigated 2026-08-04, when `rake deploy_staging` and
+`rake deploy_production` did require a working development environment.
+Nothing they did needed one; the requirement was an accident of how Rake
+starts, and what follows is why. Both halves are now fixed: Rake boots
+only for tasks that need it, and the deploy tasks are one fetch and one
+push each, which is what the documentation gives anyone without an
+environment to run.
 
 ### Every rake task boots the whole application
 
@@ -2719,21 +2730,41 @@ next person knows the method rather than rediscovering it. Putting it
 in `script/`, and eventually in `rake default`, is the obvious next
 step and is not taken here.
 
-### Then the deploy can be a button
+### Then the deploy could have been a button, and is not
 
-With the tasks free of Rails, and free of Heroku, a `workflow_dispatch`
-GitHub Actions workflow with a `target` input can call exactly the same
-code, so there is one implementation and two ways to run it, and the
-local path still works when GitHub does not.
+**REJECTED 2026-08-08**, after the tasks were free of Rails and of
+Heroku and a `workflow_dispatch` workflow with a `target` input became
+easy. Two reasons, the second of which was not visible from here:
 
-Both buttons now need **no Heroku credential at all**. What they need is
-the right to push to the protected `staging` and `production` branches:
-a GitHub App token listed as a bypass actor on exactly those two
-branches, not a broadly privileged `GITHUB_TOKEN`. Authorisation is
-GitHub Environments with required reviewers, one per target, which now
-guard an action rather than a secret. That the push starts no
-GitHub-side workflow does not matter here, because CircleCI triggers
-from its own integration.
+1. **It needs a credential that can write to a deploy branch**, listed as
+   a bypass actor on `staging` and `production`. Nothing else in this
+   repository holds that, and a scheduled or dispatchable job holding it
+   is a larger thing to protect than the problem it solves. Using a
+   person's own credentials leaves authorisation exactly where branch
+   protection already puts it.
+2. **It would have stopped the SBOMs, silently.**
+   `.github/workflows/sbom.yml` triggers on pushes to `staging` and
+   `production`, and GitHub raises no workflow runs for events created by
+   `GITHUB_TOKEN`. A button using that token would deploy correctly and
+   quietly stop generating and signing SBOMs. An App token does raise
+   those events, so this is avoidable, but it is the kind of thing that
+   is discovered months later by noticing an absence.
+
+The paragraph below this one used to say that a push starting no
+GitHub-side workflow "does not matter here, because CircleCI triggers
+from its own integration". CircleCI is indeed unaffected, and that is
+still true of the deploy itself. What it missed is that GitHub Actions
+does watch those branches, for the SBOM, so it did matter.
+
+What replaced the button is two `git` commands anyone with push rights
+can run, documented in
+[INSTALL.md](./INSTALL.md#deployment-instructions), with `rake
+deploy_staging` and `rake deploy_production` as thin wrappers around the
+same pair. One implementation, no new credential, and every
+push-triggered workflow still fires.
+
+The analysis that follows is kept because it remains correct about what
+a button *would* need, should the trade ever look different.
 
 The remaining cautions, reduced from four to two by the move above:
 
@@ -3285,8 +3316,16 @@ Independent of the above, and in no particular order with it:
     on deliberately**, so clearing it is part of cleaning up. A migration
     that raises on purpose is enough; revert it once the behaviour is
     confirmed.
-13. **Stop booting Rails for every rake task**, then make the deploys a
-    `workflow_dispatch` button. See [Deploying without a development
+13. **DONE 2026-08-08: deploying needs no development environment.**
+    Two halves, ending differently. Rake now boots only for tasks that
+    need it, so `rake -T` costs 2.5 seconds rather than 4.7 and a
+    `: :no_rails` task runs without the application. And the deploy tasks
+    are one fetch and one push each, documented for anyone without an
+    environment. **The `workflow_dispatch` button was rejected**, not
+    deferred: it needs a credential that can write to a deploy branch,
+    and a button using `GITHUB_TOKEN` would have quietly stopped the SBOM
+    generation that triggers on pushes to `staging` and `production`. See
+    [Deploying without a development
     environment](#deploying-without-a-development-environment).
 
 Making the build faster, in the order decided under
