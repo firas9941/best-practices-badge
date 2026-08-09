@@ -1604,11 +1604,12 @@ Three tools, distinct ground:
 | ---- | ------ |
 | Dependabot | `Gemfile`, npm, GitHub Actions workflows |
 | Renovate | `.circleci/config.yml` images and orbs |
-| `propose_ruby_upgrade` | `.ruby-version`, from what Heroku has |
+| Renovate | `.ruby-version` and `Gemfile.lock`, from what Heroku has |
 
-Renovate does **not** manage `.ruby-version`, though it can; see
-[Proposing Ruby upgrades](#proposing-ruby-upgrades-heroku-can-build)
-for why we took that job away from it.
+Renovate manages `.ruby-version`, but **not** with its own
+`ruby-version` datasource, which knows what Ruby has released rather
+than what Heroku can deploy. We feed it the second; see
+[Proposing Ruby upgrades](#proposing-ruby-upgrades-heroku-can-build).
 
 **Dependabot cannot read `.circleci/config.yml`.** It has no CircleCI
 support: `dependabot/dependabot-core` carries one directory per
@@ -1629,9 +1630,9 @@ ruby version in Gemfile", asks for exactly `Gemfile`, `Gemfile.lock` and
 trimmed file contents as the current version. We use the first and not
 the second.
 
-Run Renovate with `enabledManagers` limited to `circleci`. At its
-defaults it also reads the Gemfile, `.ruby-version` and Dockerfiles, and
-competes with Dependabot and with `propose_ruby_upgrade`.
+Run Renovate with `enabledManagers` limited to `circleci` and
+`custom.regex`. At its defaults it also reads the Gemfile and the
+Dockerfiles, where it competes with Dependabot.
 
 ### Prerequisite: a pin must carry its own tag
 
@@ -1743,10 +1744,12 @@ punctual contributor.
 That holds only while its proposals get the same scrutiny as anyone
 else's, so:
 
-* Grant `contents: write` and `pull-requests: write`, nothing else.
-* **Not** `workflows: write`. Scoped to `circleci` and `ruby-version` it
-  has no business under `.github/workflows/`, and withholding it means
-  it cannot alter our GitHub Actions.
+* Grant only what it needs and nothing else. The list as built, with
+  the reason for each entry, is under
+  [Before it can work](#before-it-can-work).
+* **Not** `workflows: write`. Scoped to `circleci` it has no business
+  under `.github/workflows/`, and withholding it means it cannot alter
+  our GitHub Actions.
 * Keep branch protection on `staging` and `production`. Those are the
   branches the deploy job runs from, so protecting them is what makes
   "it cannot deploy" true rather than intended.
@@ -1754,10 +1757,365 @@ else's, so:
   workflow runs for events raised by that token. Our `brakeman`,
   `codeql`, `codespell` and `main` workflows all trigger on
   `pull_request`, so a Renovate pull request opened with it would skip
-  all four and be checked *less* than a stranger's. Use a dedicated
-  GitHub App installation token or a fine-grained personal access token
-  with the two permissions above. CircleCI is unaffected either way,
-  since it triggers from its own integration.
+  all four and be checked *less* than a stranger's. Use a credential of
+  our own instead; which one, and why it cannot simply be stored in a
+  secret, is under [Before it can work](#before-it-can-work). CircleCI
+  is unaffected either way, since it triggers from its own integration.
+
+## Renovate, for the CircleCI images
+
+Added 2026-08-05, plan step 9. Two files: `.github/renovate.json5` and
+`.github/workflows/renovate.yml`.
+
+**Scoped to one manager**, `circleci`, which is the entire reason
+Renovate is here. Dependabot already covers the `Gemfile`, npm and the
+GitHub Actions workflows, and cannot read `.circleci/config.yml` at all.
+At its defaults Renovate would also read the `Gemfile`, `.ruby-version`
+and Dockerfiles, competing with Dependabot and preempting the Ruby
+design below.
+
+**Self-hosted**, as a scheduled workflow, rather than the hosted GitHub
+App: updating our own CI configuration is no reason to give a third
+party write access to this repository.
+
+The five image pins it will see:
+
+```text
+heroku/heroku:24-build          (twice: ruby-postgres and ruby-only)
+cimg/postgres:16.4
+selenium/standalone-chrome:150.0.7871.124
+cimg/node:24.19.0
+```
+
+### The one rule that needed writing
+
+`heroku/heroku` gets **digest updates only**. Digest changes are Heroku
+rebuilding the same stack, which is exactly what we want to follow. A
+tag change would be `24-build` to `26-build`, moving CI to a different
+Ubuntu from the one production builds on, which is the problem findings
+2 and 4 existed to solve. Confirmed 2026-08-05 with
+`heroku stack --app ...` that both applications are on **heroku-24**, so
+the pin is currently correct; changing it is plan step 10, taken
+deliberately and in the test environment first.
+
+Note it is pinned **twice**, once per executor, and the two must always
+move together or the static job and the test job stop checking the same
+environment.
+
+### A trap the validator caught
+
+The workflow first passed `configurationFile: .github/renovate.json5` to
+the action. That input sets Renovate's **global** configuration, which
+is a different layer: it configures the runner, not this repository's
+update rules. `renovate-config-validator` says so if you read it
+carefully, reporting
+
+```text
+INFO: Validating .github/renovate.json5 as global config
+```
+
+when handed the path, against a plain `Validating .github/renovate.json5`
+when it discovers the file itself. Renovate finds that path unaided, it
+being one of the standard repository config locations, so the input is
+gone.
+
+Worth knowing the validator exists at all:
+
+```sh
+npx --yes --package renovate renovate-config-validator
+```
+
+Run with no arguments it discovers the file and validates it as a
+repository config, which is the check that means something.
+
+### Before it can work
+
+**Renovate must not authenticate as the default `GITHUB_TOKEN`.** GitHub
+raises no workflow runs for events created by that token, so a Renovate
+pull request opened with it would start none of `brakeman`, `codeql`,
+`codespell` or `main`, and would be checked *less* than a pull request
+from a stranger. CircleCI is unaffected, triggering from its own
+integration.
+
+The credential is a GitHub App owned by the `ossf` organization,
+`openssf-badge-renovate`, installed on this repository alone. What it
+grants, and why each:
+
+* `contents: write` and `pull-requests: write`, because a pull request
+  is a branch plus a commit and GitHub files both under contents. There
+  is no narrower permission for it.
+* `issues: write`, because the dependency dashboard is an issue and so
+  are Renovate's config-error reports. Without it a broken
+  `renovate.json5` produces a green run that did nothing.
+* `checks: read` and `statuses: read`, so it can see whether CI passed
+  on a pull request it already opened.
+
+Never `workflows: write`: scoped to `circleci`, Renovate has no business
+under `.github/workflows`, and withholding it means it cannot alter our
+GitHub Actions. Branch protection on `main`, `staging` and `production`
+means it cannot merge or deploy regardless.
+
+**The workflow names that same list when it mints the token**, which is
+how a missing permission is caught. GitHub refuses to issue a token
+carrying a permission the installation does not hold, so the run stops
+there. Checking that the secrets exist is not enough: a Renovate that
+cannot open its dashboard issue still opens pull requests and still
+exits zero, so a half-granted App would otherwise show up as a green
+run that quietly did half its job. Naming the permissions also scopes
+the token to exactly those five, whatever the App is granted later.
+
+**A GitHub App installation token expires one hour after it is issued**,
+so it cannot be a stored secret. What is stored are two repository
+secrets, `RENOVATE_APP_ID` and `RENOVATE_APP_PRIVATE_KEY`, and the
+workflow mints a token from them on each run and revokes it when the job
+ends. This is also why a personal access token was rejected: it belongs
+to a person and expires on their clock rather than the project's.
+
+**The workflow fails loudly until those secrets exist**, rather than
+skipping quietly. A weekly red run is a reminder to finish the setup; a
+weekly green run that did nothing is how a dependency updater goes
+unnoticed for a year.
+
+## The stack is one decision, proposed as a pull request
+
+Decided and built 2026-08-05. Upgrading the stack used to be plan step
+10, a manual exercise to be done "test environment first". It is now a
+pull request, and accepting it does the whole thing.
+
+**The executor image tag is the single source of truth.** Change
+`heroku/heroku:24-build` to `26-build` in `.circleci/config.yml` and:
+
+1. the tests run on heroku-26, because that is the image they run in;
+2. the deploy job sets the application's stack to heroku-26 before
+   pushing, so the slug is built and run there;
+3. staging gets it when `main` is merged to `staging`, production when
+   `staging` is merged to `production`.
+
+**Nothing repeats the stack name**, which is what makes that true rather
+than hopeful. Heroku's images set `CNB_STACK_ID`, so the build job asks
+the running container what it is:
+
+```text
+$ docker run --rm heroku/heroku:24-build env | grep -i stack
+CNB_STACK_ID=heroku-24
+```
+
+That value drives the Ruby download URL, which is per stack, and is
+written to the workspace for the deploy job. So "the base we tested on"
+and "the base we deploy onto" are the same string carried forward, not
+two things that agree. The `STACK=heroku-24` line this replaces sat one
+line below a comment claiming the stack was "named once, here".
+
+### What the deploy job does with it
+
+* **Maintenance mode is taken for a stack change.** It touches no data,
+  so the migration argument does not apply, but it rebuilds the
+  application on a different operating system, and going quiet for that
+  is the safer default. Stack changes are rare, so it costs nothing.
+* **`stack:set` runs before the push**, because it changes only what the
+  *next* build uses.
+* **`build_stack` and `stack` are different fields and both matter.**
+  The first is what the next build will use, the second what the dynos
+  run now. They differ exactly between a `stack:set` and the rebuild
+  that follows, which is precisely this moment. Comparing the wrong one
+  would set the stack again on every deploy, or miss that it moved.
+* **After the release, `stack.name` must equal the tested stack**, or
+  the job fails: the application would be live on an operating system
+  the suite never ran on, which is the one thing this exists to prevent.
+
+### Parsing that JSON with node, not grep
+
+`script/heroku_app_field` reads one dotted field from the application's
+JSON. It exists because the obvious `grep` cannot work here: the app
+object has several `"name"` fields, for the app, its region, its owner,
+its stack and its build stack, and a pattern that finds "the name that
+looks like a stack" cannot tell `stack` from `build_stack`. `node` is
+guaranteed, the deploy job running on `cimg/node`.
+
+It is a script rather than shell in the YAML for three reasons: each
+CircleCI step is a fresh shell and this is needed in three of them;
+shell inside that file gets no `shellcheck` and cannot be run locally;
+and a doubled less-than sign anywhere in that file breaks CircleCI's
+parser, which rules out the here-document this would otherwise be.
+
+### One definition of a stack name, in one file
+
+`script/valid_stack_name` owns the answer to "is this a stack name",
+and the three places that need it call it. It was written inline twice
+first, which is how a rule comes to disagree with itself: two copies in
+different jobs on different executor images, with nothing to make them
+change together.
+
+It accepts `heroku-` followed by anything, deliberately not `heroku-`
+followed by two digits. The names we know are `heroku-22`, `heroku-24`
+and `heroku-26`, and encoding that shape buys a check that rejects the
+correct answer the day the shape changes, inside a deploy. Tested with
+`heroku-28`, `heroku-30` and `heroku-next`, all accepted, while
+`nonsense`, a bare `heroku-`, a bare `heroku` and an empty string are
+refused.
+
+The three callers, and why each is a caller rather than a duplicate:
+
+| Where | Why it checks |
+| ----- | ------------- |
+| `prepare_ruby` | the Ruby tarball URL is per stack, and a wrong name gives a puzzling 403 |
+| the record step | checked where it is WRITTEN, not only where it is read |
+| the set-stack step | the value is about to be handed to `heroku stack:set` against production |
+
+The record step's check closes a gap: it used to rely on `prepare_ruby`
+having validated the value earlier in the same job, which is an ordering
+nothing enforced. Move that step above `prepare_ruby` and an empty file
+would have been written in silence.
+
+There is a test for the property that matters, which is that these are
+one rule and not three: replace `script/valid_stack_name` with something
+that rejects everything, and the deploy step refuses. A shared
+definition nothing proves is shared is just three copies with extra
+steps.
+
+Verified against a fixture where the two deliberately differ:
+
+```text
+stack.name        -> heroku-24
+build_stack.name  -> heroku-26
+```
+
+### The smoke test, and what it is not
+
+After maintenance mode lifts, the job asks the site for one real page:
+`https://<app>.herokuapp.com/projects/1.json`, retrying for a minute.
+
+**Through the CDN, because there is no way round it and there should not
+be.** The first version of this went straight at
+`https://<app>.herokuapp.com/`, on the reasoning that bypassing Fastly
+stops a cached copy making a dead origin look alive. That reasoning was
+right and the premise was wrong: `verify_origin_shielding` in
+`ApplicationController` answers **403** to any request whose last
+`X-Forwarded-For` hop is not a trusted Fastly edge. Direct origin access
+is forbidden by design, which is cloud-piercing protection working, and
+a smoke test is no reason to want a hole in it. I had checked the
+commented-out block in `config/initializers/fastly.rb` and concluded the
+protection was off; the live mechanism is in the controller.
+
+So it asks Fastly for something the cache cannot already hold, using an
+inert query parameter the CDN varies on:
+
+```text
+/projects/1.json?useless_parameter=build1234-try3-27561
+```
+
+**Different on every attempt, not merely every build.** That distinction
+is the whole point. With one URL for the twelve retries, a 502 from a
+dyno still starting could itself be cached and then re-served to every
+remaining attempt, turning a state that would have recovered into a
+guaranteed failure. The value carries the build and attempt number so it
+can be found in a log, plus `$RANDOM` so two runs cannot collide.
+
+The value also carries `date +%s`, so it varies without depending on
+`CIRCLE_BUILD_NUM` or `$RANDOM`. Four sources of variation, because the
+line has to keep working when one of its assumptions stops being true:
+the build number is empty off CircleCI, the attempt number repeats
+between runs, `$RANDOM` is not in every shell, and the clock moves
+whatever else happens.
+
+`X-Cache` and `Age` are **printed rather than asserted**, from the
+headers of the request that just succeeded. Reading them from a second
+request to the same URL, which is how this was first written, would
+report a hit on the cache entry the first request had just created: a
+diagnostic that lies in the ordinary case. A MISS proves the answer came
+from the application; a HIT would be worth seeing but is no reason to
+fail a good deploy.
+
+### Reviewed before it could run
+
+This fires rarely and changes a lot when it does, so the diff was read
+back rather than trusted. Four things came out of that reading:
+
+* **`'"id": *1'` also matches `"id":10`.** A response about some other
+  project would have passed. It now requires the digit to end,
+  `'"id": *1[,}]'`, and there are tests for a compact body, a
+  pretty-printed body, and a body about project 10.
+* **The `X-Cache` diagnostic issued a second request**, as above.
+* **The stack confirmation judged on a single read.** `stack` follows
+  the release rather than leading it, so on the very deploy that moves
+  the stack it may briefly still report the old one. Failing at once
+  would be a false alarm at exactly the moment the check matters most;
+  it now retries for thirty seconds.
+* **`HEROKU_APP` was assigned twice** in the maintenance decision, a
+  leftover from inserting the stack check above the migration check.
+
+**The hostname comes from the application**, via
+`heroku config:get PUBLIC_HOSTNAME`, so staging and production each
+answer for themselves and nothing has to be kept in step. One variable
+by name, deliberately: a bare `heroku config` would print every secret
+the application holds into a log anyone can read.
+
+**`/projects/1.json`, not `/robots.txt`**, because it routes, queries
+the database and serialises a real record, so it exercises the whole web
+path instead of proving something is listening.
+
+**It is detection, not prevention**, and cannot be otherwise:
+maintenance mode answers 503 to everything, and a one-off dyno serves no
+HTTP. Prevention is the release phase, which already runs
+`rails db:migrate` on the run image and so proves every gem loads on the
+new stack before the release goes live. This is the layer after that.
+
+It runs on **every** deploy, not only on stack changes, because a check
+that fires once every few years is a check nobody knows is broken.
+
+### Tested by stubbing Heroku
+
+Both new steps and the changed decision step were extracted from
+`.circleci/config.yml` and run under the deploy job's shell with `curl`
+and `heroku` stubbed. Eleven checks: a stack change forcing maintenance
+mode on, an unknown tested stack doing the same, `stack:set` running
+when the stacks differ and not when they agree, refusals for `nonsense`
+and a bare `heroku-`, acceptance of three stack names that do not exist
+yet, the post-release confirmation passing and failing, and the smoke
+test both answering and exhausting its retries. Fourteen in all, and
+eleven more cover the migration half.
+
+### Renovate's part
+
+The `heroku/heroku` rule is the opposite of what it was an hour earlier.
+The proposal is *wanted*: it is how a stack upgrade arrives. It carries
+a `stack-upgrade` label and a note in the pull request body saying what
+merging it will do, because "bump an image digest" and "move the
+operating system under production" should not look alike.
+
+**One pull request per dependency** is Renovate's default and is relied
+on rather than configured: nothing sets `groupName` and there is no
+`extends`, so a stack upgrade arrives alone even in a week when
+PostgreSQL and Chrome also have updates. The two `heroku/heroku` pins
+are one dependency and correctly share a pull request, since they must
+move together.
+
+**A rejected proposal stays rejected.** `recreateWhen` is `auto`: close
+a pull request without merging and Renovate will not open it again for
+that same version, while a *newer* version is a new question and does
+get asked. Close the 1.9.9 proposal and 1.9.10 may still arrive. That is
+the default, written out anyway, because relying on a default for
+behaviour this visible means a future change to it would surprise us
+quietly. While a pull request is open, Renovate updates that same branch
+rather than opening a second: branch names derive from the dependency,
+so duplicates cannot pile up.
+
+The consequence worth knowing: closing a proposal removes it from the
+pull request list, which is where this project keeps "the decisions
+waiting for a human". The dependency dashboard is what stops that being
+a silent forget. It lists what Renovate could propose and is not
+proposing, closed items included, with a checkbox to ask again.
+
+**The validator earns its keep on claims like these.** It rejects
+invented option names, checked by feeding it `recreateWhenX` and
+watching it fail, so a successful validation is evidence that an option
+exists and not merely that the file parses.
+
+`prHourlyLimit` is set to zero, against a default of 2. This runs weekly
+from a workflow that starts, works and exits, so a limit of two would
+mean two proposals a week with the rest silently waiting for the next
+run: a stack upgrade could sit behind routine bumps for weeks with
+nothing saying so.
 
 ## Proposing Ruby upgrades Heroku can build
 
@@ -1794,12 +2152,13 @@ The devcenter reference page lists supported versions in prose, 3.3.12,
 machine-readably. So probing is not a workaround for a missing API; it
 is the only method available, and it is what the vendor does.
 
-**The design: propose only what exists.** A scheduled job,
-`propose_ruby_upgrade`, probes forward exactly as Heroku does, and opens
-a pull request bumping `.ruby-version` to what it finds. It cannot
-propose an undeployable version, so there is nothing to retry, and the
-schedule *is* the retry: a Heroku lag means "no pull request this week,
-a pull request next week", silently and with nothing red.
+**The design: propose only what exists.** A scheduled job probes
+forward exactly as Heroku does, and a pull request bumping
+`.ruby-version` follows from what it finds. Nothing undeployable can be
+proposed, so there is nothing to retry, and the schedule *is* the
+retry: a Heroku lag means "no pull request this week, a pull request
+next week", silently and with nothing red. Who opens that pull request
+changed during the build; see [As built](#as-built-2026-08-07-the-probe-publishes-renovate-decides).
 
 * **Probe every line above ours, not just our own patch line.** A move
   from 3.4 to 3.5, or to 4.0, is a decision we want *offered*. Offering
@@ -1811,19 +2170,96 @@ a pull request next week", silently and with nothing red.
   answers "does Heroku have this Ruby for this stack", two callers.
 * A dead cron here leaves us stale, not wrong, and the guard rather
   than the cron is what keeps an undeployable pin out.
-* **It opens pull requests, so the token analysis written for Renovate
+* **It opens a pull request, so the token analysis written for Renovate
   applies to it unchanged**: `contents: write` and
   `pull-requests: write`, never `workflows: write`, and **not** the
-  default `GITHUB_TOKEN`, or its pull requests would start none of our
-  `pull_request` workflows and be checked less than a stranger's.
+  default `GITHUB_TOKEN`, or its pull request would start none of our
+  `pull_request` workflows and be checked less than a stranger's. As
+  built, the only pull request it opens is the one refreshing the
+  published list; the upgrade proposals are Renovate's.
 * Being `lib/` code, it falls under the 100% coverage rule. Unit-test
   the probe with stubbed HTTP; see the guard below, which shares it.
+
+### As built, 2026-08-07: the probe publishes, Renovate decides
+
+The first version of this opened the pull requests itself, and in doing
+so reimplemented Renovate's deduplication, rebasing and rejection
+memory in about 400 lines of our own Ruby. That was the wrong shape,
+and deleting it was the improvement. What is left is a division that
+matches what each tool actually knows.
+
+| Piece | Where |
+| ----- | ----- |
+| The probe, and the search across lines | `lib/heroku_ruby_availability.rb` |
+| Which stack we are on | `lib/project_stack.rb` |
+| Print what Heroku has | `script/heroku_ruby_versions` |
+| Publish it weekly, as a pull request | `.github/workflows/heroku_ruby_versions.yml` |
+| The published fact | `.github/heroku-ruby-versions.txt` |
+| Everything after that | `.github/renovate.json5` |
+| Deployability guard | `rake ruby_version_deployable` |
+| Two-files guard | `rake ruby_version_matches_lock` |
+
+**Renovate has a `ruby-version` datasource and we still do not use it**,
+because it knows what Ruby has RELEASED and what matters here is what
+Heroku has BUILT for our stack, which lags it. What changed is that
+Renovate can be TOLD. A custom datasource with a `file://` registry
+reads a file from the repository, and `format: 'plain'` treats each
+line as an available release, which is exactly what the probe prints.
+So we publish the fact and Renovate does the rest: noticing, opening,
+rebasing, remembering a rejection, one pull request per line through
+`separateMinorPatch` and `separateMultipleMajor`.
+
+**The file has to be committed**, which is the one real cost. Renovate
+resolves `file://` with `readLocalFile`, relative to the clone it makes
+for itself, so a file written into a runner's workspace is invisible to
+it. Hence the weekly job opens a pull request against a fixed branch
+rather than writing a scratch file. In practice that pull request is
+rare, since Heroku publishes a few Rubies a year, and it doubles as the
+notification that it happened. Merging it changes no version we run.
+
+**The list describes Heroku, not us.** Every line is probed from patch
+zero, including our own, so the version we already run appears while it
+is still newest on its line. If the list were "what is newer than us"
+it would churn every time we accepted an upgrade, and every such change
+would arrive looking like news from Heroku.
+
+**The search matches Heroku's, gaps and all.** `highest_patch` probes a
+window of five patch levels and slides it only when the last of the
+window exists, which is what `OutdatedRubyVersion`'s
+`DEFAULT_RANGE = 1..5` does. It steps over a gap of up to four and
+stops at a wider one. A hole that wide would hide the version from a
+deploy's own suggestion too, so matching the vendor is the conservative
+choice rather than the convenient one. A test is named for that limit.
+
+**A blip must not empty the list.** Being unable to reach S3 is not the
+same as Heroku having withdrawn everything, so the script exits
+non-zero and prints nothing, and the workflow leaves the committed file
+alone. The published fact goes stale rather than false.
+
+**No bundle, on purpose.** The script and the two libraries it loads
+use nothing but the standard library, so the workflow needs no
+`bundle install` and no matching Ruby to ask an S3 bucket a handful of
+questions. Adding a gem to either library breaks that workflow rather
+than the test suite, which is why the constraint is written at the top
+of both files. It is also why this is a script and not only a rake
+task: our `Rakefile` loads `config/boot`, which is Bundler.
+
+**Both files move together.** Heroku installs the Ruby named in
+`Gemfile.lock`, not the one in `.ruby-version`; see the guard below.
+The custom manager matches both files, so Renovate updates them in one
+pull request. It captures only the digits in the lock, leaving
+Bundler's `p0` suffix in place, because `Gem::Version` reads a letter
+as a prerelease marker and Renovate would otherwise skip that
+occurrence as unstable. The patchlevel therefore goes stale until the
+next `bundle install` writes the real one back. Nothing reads it to
+choose an interpreter, and a plausible invented number would have been
+worse than an obviously stale one.
 
 ## Guard: Ruby pins must stay deployable
 
 Only Ruby versions Heroku offers for our stack will deploy, so a pull
-request proposing a newer one, from `propose_ruby_upgrade` or from a
-human editing the file by hand, could pass CI and fail at deploy. Guard
+request proposing a newer one, from Renovate or from a human editing
+the file by hand, could pass CI and fail at deploy. Guard
 it in CI.
 
 The check reads `.ruby-version`, issues one `HEAD` for the corresponding
@@ -1837,9 +2273,14 @@ refused. Worse, that refusal is not a network error, so any
 developer, skip silently, and go on skipping forever. A guard that never
 guards is more dangerous than no guard, because it is also reassuring.
 
-So make it a **rake task that CI runs**, one that needs no Rails and
-therefore lives in `lib/tasks/standalone/`; see [Deploying without a
-development environment](#deploying-without-a-development-environment).
+So make it a **rake task that CI runs**, one that needs no Rails. As
+built it is `ruby_version_deployable` in `lib/tasks/default.rake`,
+marked `: :no_rails`, which is the mechanism that already exists for
+exactly this and which the `Rakefile` audits on every invocation. It
+was to have lived in `lib/tasks/standalone/`; that directory is part of
+[Deploying without a development
+environment](#deploying-without-a-development-environment), which is
+not built yet, and moving this task there when it is costs one line.
 There the skip is honest, because a real connection failure is a real
 connection failure. Skip when offline so local work is unaffected; CI
 has a network, and CI is where it matters.
@@ -1854,7 +2295,8 @@ has a network, and CI is where it matters.
 * **Assert "must be 200"**, never "must not be 404", for the S3 reason
   above.
 * **The probe itself is ordinary `lib/` code** shared with
-  `propose_ruby_upgrade`, so it falls under the 100% coverage rule.
+  `script/heroku_ruby_versions`, so it falls under the 100% coverage
+  rule.
   Unit-test it with stubbed HTTP covering 200, 403 and a connection
   failure. The rake task is the thin part that CI runs live.
 
@@ -1864,9 +2306,20 @@ the tests genuinely run on the Ruby being proposed.
 
 ## Deploying without a development environment
 
-Investigated 2026-08-04. `rake deploy_staging` and `rake deploy_production`
-currently require a working development environment. Nothing they do
-needs one; the requirement is an accident of how Rake starts.
+**DONE 2026-08-08.** Deploying needs `git` and the right to push, and
+nothing else: no Ruby, no bundle, no rbenv, no Heroku credential. The
+commands are in
+[INSTALL.md](./INSTALL.md#deployment-instructions) and the reasoning
+behind them in
+[implementation.md](./implementation.md#deploying-in-detail).
+
+Investigated 2026-08-04, when `rake deploy_staging` and
+`rake deploy_production` did require a working development environment.
+Nothing they did needed one; the requirement was an accident of how Rake
+starts, and what follows is why. Both halves are now fixed: Rake boots
+only for tasks that need it, and the deploy tasks are one fetch and one
+push each, which is what the documentation gives anyone without an
+environment to run.
 
 ### Every rake task boots the whole application
 
@@ -2277,21 +2730,41 @@ next person knows the method rather than rediscovering it. Putting it
 in `script/`, and eventually in `rake default`, is the obvious next
 step and is not taken here.
 
-### Then the deploy can be a button
+### Then the deploy could have been a button, and is not
 
-With the tasks free of Rails, and free of Heroku, a `workflow_dispatch`
-GitHub Actions workflow with a `target` input can call exactly the same
-code, so there is one implementation and two ways to run it, and the
-local path still works when GitHub does not.
+**REJECTED 2026-08-08**, after the tasks were free of Rails and of
+Heroku and a `workflow_dispatch` workflow with a `target` input became
+easy. Two reasons, the second of which was not visible from here:
 
-Both buttons now need **no Heroku credential at all**. What they need is
-the right to push to the protected `staging` and `production` branches:
-a GitHub App token listed as a bypass actor on exactly those two
-branches, not a broadly privileged `GITHUB_TOKEN`. Authorisation is
-GitHub Environments with required reviewers, one per target, which now
-guard an action rather than a secret. That the push starts no
-GitHub-side workflow does not matter here, because CircleCI triggers
-from its own integration.
+1. **It needs a credential that can write to a deploy branch**, listed as
+   a bypass actor on `staging` and `production`. Nothing else in this
+   repository holds that, and a scheduled or dispatchable job holding it
+   is a larger thing to protect than the problem it solves. Using a
+   person's own credentials leaves authorisation exactly where branch
+   protection already puts it.
+2. **It would have stopped the SBOMs, silently.**
+   `.github/workflows/sbom.yml` triggers on pushes to `staging` and
+   `production`, and GitHub raises no workflow runs for events created by
+   `GITHUB_TOKEN`. A button using that token would deploy correctly and
+   quietly stop generating and signing SBOMs. An App token does raise
+   those events, so this is avoidable, but it is the kind of thing that
+   is discovered months later by noticing an absence.
+
+The paragraph below this one used to say that a push starting no
+GitHub-side workflow "does not matter here, because CircleCI triggers
+from its own integration". CircleCI is indeed unaffected, and that is
+still true of the deploy itself. What it missed is that GitHub Actions
+does watch those branches, for the SBOM, so it did matter.
+
+What replaced the button is two `git` commands anyone with push rights
+can run, documented in
+[INSTALL.md](./INSTALL.md#deployment-instructions), with `rake
+deploy_staging` and `rake deploy_production` as thin wrappers around the
+same pair. One implementation, no new credential, and every
+push-triggered workflow still fires.
+
+The analysis that follows is kept because it remains correct about what
+a button *would* need, should the trade ever look different.
 
 The remaining cautions, reduced from four to two by the move above:
 
@@ -2796,16 +3269,28 @@ one wants to look is the question that settles it.
    pull requests older than step 3 still pin it by digest, and deleting
    it breaks their pipelines for no gain.
 5. **Retire the DockerHub image** once no live branch pins it.
-6. **Add the Heroku-availability probe and the guard** that uses it, so
-   step 7 cannot silently regress.
+6. **DONE 2026-08-07: added the Heroku-availability probe and the
+   guard** that uses it, so step 7 cannot silently regress.
+   `lib/heroku_ruby_availability.rb` is the probe and
+   `rake ruby_version_deployable` is the guard, in `DYNAMIC_CHECKS`.
 7. **Take Ruby to 3.4.10** (finding 3), which under this design is a
-   one-line change to `.ruby-version` and nothing else.
-8. **Add `propose_ruby_upgrade`**, sharing the probe from step 6, so
-   nobody has to remember to look.
-9. **Add Renovate**, self-hosted, scoped to `circleci` and permissioned
-   as above.
-10. **Then upgrade production to Heroku-26**, test environment first, so
-    the stack move is exercised somewhere before it reaches production.
+   one-line change to `.ruby-version` and nothing else. No longer a
+   thing to remember: step 8 now proposes it as a pull request.
+8. **DONE 2026-08-07: Ruby upgrades arrive as pull requests**, so
+   nobody has to remember to look. The probe from step 6 publishes what
+   Heroku has and Renovate proposes from it; we do not open those pull
+   requests ourselves. See
+   [Proposing Ruby upgrades Heroku can build](#proposing-ruby-upgrades-heroku-can-build).
+9. **DONE 2026-08-05: added Renovate**, self-hosted, scoped to
+   `circleci` and permissioned as above. See
+   [Renovate, for the CircleCI images](#renovate-for-the-circleci-images).
+   It does nothing until the App secrets exist, and says so.
+10. **Upgrade to Heroku-26 by accepting a pull request.** No longer a
+    manual exercise: changing the executor image tag moves the tests,
+    and the deploy job moves the applications to match, staging first by
+    the ordinary branch flow. See [The stack is one
+    decision](#the-stack-is-one-decision-proposed-as-a-pull-request).
+    Both applications were on heroku-24 as of 2026-08-05.
 
 Independent of the above, and in no particular order with it:
 
@@ -2831,8 +3316,16 @@ Independent of the above, and in no particular order with it:
     on deliberately**, so clearing it is part of cleaning up. A migration
     that raises on purpose is enough; revert it once the behaviour is
     confirmed.
-13. **Stop booting Rails for every rake task**, then make the deploys a
-    `workflow_dispatch` button. See [Deploying without a development
+13. **DONE 2026-08-08: deploying needs no development environment.**
+    Two halves, ending differently. Rake now boots only for tasks that
+    need it, so `rake -T` costs 2.5 seconds rather than 4.7 and a
+    `: :no_rails` task runs without the application. And the deploy tasks
+    are one fetch and one push each, documented for anyone without an
+    environment. **The `workflow_dispatch` button was rejected**, not
+    deferred: it needs a credential that can write to a deploy branch,
+    and a button using `GITHUB_TOKEN` would have quietly stopped the SBOM
+    generation that triggers on pushes to `staging` and `production`. See
+    [Deploying without a development
     environment](#deploying-without-a-development-environment).
 
 Making the build faster, in the order decided under

@@ -240,10 +240,27 @@ commands:
           name: Install Ruby and Node into $HOME
           command: |
             set -euo pipefail
-            # Both versions come from the files that already govern them,
-            # so there is no third place to forget to update. The stack
-            # name is named once, here.
-            STACK=heroku-24
+            # Every version comes from whatever already governs it, so
+            # there is no second place to forget.
+            #
+            # The stack is not named here at all: Heroku's own images set
+            # CNB_STACK_ID, so the running container tells us which stack
+            # it is. That makes the executor image pin above the single
+            # source of truth. Change "heroku/heroku:24-build" to
+            # "26-build" and this download, the tests, and the stack the
+            # applications are deployed onto all follow, because the
+            # deploy job is handed this same value; see the workspace
+            # below and "Set the Heroku stack" in the deploy job.
+            STACK="${CNB_STACK_ID:-}"
+            # What counts as a stack name is defined in ONE place, and
+            # this is not it: see script/valid_stack_name. Two copies of
+            # a rule are a rule that disagrees with itself eventually.
+            script/valid_stack_name "$STACK" || {
+              echo 'The primary image should be a heroku/heroku stack'
+              echo 'image, which sets CNB_STACK_ID. Refusing to guess.'
+              exit 1
+            }
+            echo "Stack, from the image itself: ${STACK}"
             RUBY_VERSION="$(tr -d '[:space:]' < .ruby-version)"
             NODE_VERSION="$(sed -n 's/.*"node": *"\([^"]*\)".*/\1/p' \
                             package.json | head -1)"
@@ -499,6 +516,29 @@ jobs:
     - run:
         name: Create database
         command: bundle exec rake db:setup
+    # Hand the deploy job the stack these tests are about to run on.
+    #
+    # Not a copy of the tag from this file, and not a second opinion
+    # about what the stack ought to be: the value comes from
+    # CNB_STACK_ID inside the image that runs the suite. So "the base we
+    # tested on" and "the base we deploy onto" are the same string by
+    # construction rather than by two things agreeing.
+    - run:
+        name: Record the stack these tests run on
+        command: |
+          set -euo pipefail
+          # Checked at the point of WRITING, not only where it is read.
+          # prepare_ruby has already validated this in the same job, but
+          # that is an ordering nothing enforces: move this step above
+          # it and an empty file would be written in silence.
+          script/valid_stack_name "${CNB_STACK_ID:-}" || exit 1
+          mkdir -p /tmp/workspace
+          printf '%s' "$CNB_STACK_ID" > /tmp/workspace/tested-stack
+          echo "Tested on: $(cat /tmp/workspace/tested-stack)"
+    - persist_to_workspace:
+        root: /tmp/workspace
+        paths:
+          - tested-stack
     # Start testing
     - run:
         name: Check for whitespace issues.
@@ -584,6 +624,11 @@ jobs:
     executor: deploy-only
     steps:
       - checkout
+      # The stack the tests actually ran on, written by the build job.
+      # Everything about the stack in this job comes from this file, so
+      # what was tested and what is deployed onto cannot disagree.
+      - attach_workspace:
+          at: /tmp/workspace
       # OSPS-BR-01.02: Validate branch name before use in deployment
       # Defense in depth - even though workflow filters limit to staging/production,
       # the code should validate explicitly to prevent accidents or misconfigurations
@@ -731,12 +776,31 @@ jobs:
             [ "$CIRCLE_BRANCH" != 'staging' ] ||
               keep 'staging restores its database below.'
 
+            HEROKU_APP="$CIRCLE_BRANCH"-bestpractices
+
+            # A stack change rebuilds the application on a different
+            # operating system. It touches no data, so the migration
+            # argument above does not apply, but it changes enough
+            # underneath a running dyno that going quiet for it is the
+            # safer default. Stack changes are rare, so this costs
+            # almost nothing.
+            tested_stack="$(cat /tmp/workspace/tested-stack 2>/dev/null \
+              || true)"
+            [ -n "$tested_stack" ] ||
+              keep 'the tested stack is unknown; see the build job.'
+            live_stack="$(script/heroku_app_field stack.name \
+              "$HEROKU_APP" || true)"
+            [ -n "$live_stack" ] ||
+              keep "could not read ${HEROKU_APP}'s current stack."
+            echo "Stack: tested on ${tested_stack}, app runs ${live_stack}"
+            [ "$tested_stack" = "$live_stack" ] ||
+              keep "this deploy moves ${HEROKU_APP} to ${tested_stack}."
+
             # Which commit is live? Ask for several releases, because
             # changing a config var also makes one and its description
             # is not a deploy. Descriptions read "Deploy 09446ffe", and
             # this JSON is pretty-printed, so allow the space after the
             # colon; see the baseline check below for that lesson.
-            HEROKU_APP="$CIRCLE_BRANCH"-bestpractices
             live="$(curl -sfS --max-time 30 \
               "https://api.heroku.com/apps/${HEROKU_APP}/releases" \
               -H 'Accept: application/vnd.heroku+json; version=3' \
@@ -798,6 +862,56 @@ jobs:
               echo "Not entering maintenance mode: $HEROKU_APP keeps"
               echo 'serving throughout, because this deploy migrates'
               echo 'nothing. See the previous step for the reasoning.'
+            fi
+      - run:
+          name: Set the Heroku stack to the one the tests ran on
+          command: |
+            export HEROKU_APP="$CIRCLE_BRANCH"-bestpractices
+
+            # The base we tested on becomes the base we deploy onto.
+            # This value came from CNB_STACK_ID inside the image that ran
+            # the suite, carried here through the workspace, so it is the
+            # same string rather than a second opinion. Changing
+            # "heroku/heroku:24-build" in the executor above is therefore
+            # the whole of a stack upgrade: the tests move first, and if
+            # they pass, the application follows.
+            #
+            # Before the push, deliberately: stack:set only changes what
+            # the NEXT build uses, so it must be set while there is still
+            # a push to come.
+            tested_stack="$(cat /tmp/workspace/tested-stack)"
+            # Same definition as the build job uses, because it is the
+            # same file rather than a second copy of the rule. Checked
+            # here as well because this value is about to be handed to
+            # "heroku stack:set" against production, and an argument
+            # that reconfigures production is worth checking wherever it
+            # arrives from.
+            script/valid_stack_name "$tested_stack" || {
+              echo 'Refusing to deploy: the tested stack, carried from'
+              echo 'the build job, is not a stack name.'
+              exit 1
+            }
+
+            # build_stack, not stack: the first is what the next build
+            # will use, the second what the dynos run now. They differ
+            # exactly between a stack:set and the rebuild that follows,
+            # which is this moment, so comparing the wrong one would set
+            # the stack again on every deploy.
+            build_stack="$(script/heroku_app_field build_stack.name \
+              "$HEROKU_APP" || true)"
+            if [ -z "$build_stack" ]; then
+              echo "ERROR: could not read ${HEROKU_APP}'s build stack."
+              echo 'Refusing to deploy: this deploy might silently build'
+              echo 'on a different operating system from the tested one.'
+              exit 1
+            fi
+
+            if [ "$build_stack" = "$tested_stack" ]; then
+              echo "Stack already ${tested_stack}; nothing to change."
+            else
+              echo "Moving ${HEROKU_APP} from ${build_stack} to" \
+                   "${tested_stack}, which is what the tests ran on."
+              heroku stack:set "$tested_stack" --app "$HEROKU_APP"
             fi
       - run:
           name: Restore production's latest backup over staging
@@ -1118,15 +1232,39 @@ jobs:
                 -H "Authorization: Bearer ${HEROKU_API_KEY}" \
                 -H 'Range: version ..; order=desc,max=1;')" || {
                   echo "Release query failed; retrying."; sleep 15; continue; }
-              # See the note in the Deploy step on "sed -n 1p" versus
-              # head and -m1, and on "|| true": this job runs under
-              # -eo pipefail, so a body without these fields would
-              # otherwise abort the step silently instead of retrying.
-              version="$(printf '%s' "$body" \
-                | grep -o '"version": *[0-9][0-9]*' | sed -n 1p \
-              | grep -o '[0-9][0-9]*' || true)"
-              status="$(printf '%s' "$body" \
-                | grep -o '"status": *"[^"]*"' | sed -n 1p | cut -d'"' -f4 || true)"
+              # PARSED WITH node, NOT grep, so that only the TOP-LEVEL
+              # fields of the newest release can be read. A grep for
+              # '"status"' takes the first match anywhere in the body,
+              # including inside a nested object, and Heroku's release
+              # object could gain one: today "app" is {id, name}, so
+              # there is nothing to trip over, but a schema addition
+              # would have this job reporting a nested value as the
+              # release status. Verified against a body carrying
+              # "app": {"status": "nonsense"}: grep returned "nonsense",
+              # node returned the real status.
+              #
+              # node is already required here; this job prints "node -v"
+              # and installs the Heroku CLI with npm, so a missing node
+              # breaks the job long before this line.
+              #
+              # readFileSync(0) reads stdin synchronously, which keeps
+              # this to two lines instead of node's async stream dance.
+              # An unparseable body makes node exit non-zero, so "|| true"
+              # still yields the empty string the guards below expect:
+              # this job runs under -eo pipefail, and without it a body
+              # without these fields would abort the step silently
+              # instead of retrying. An unknown status is passed straight
+              # through, so it still reaches the "unexpected release
+              # status" arm immediately rather than waiting out the loop.
+              release_field() {
+                printf '%s' "$body" | node -e '
+                  const r = JSON.parse(require("fs").readFileSync(0, "utf8"))
+                  process.stdout.write(String((r[0] || {})[process.argv[1]]
+                                              ?? ""))
+                ' "$1" 2>/dev/null || true
+              }
+              version="$(release_field version)"
+              status="$(release_field status)"
               # Insist on a bare integer: this also catches a
               # multi-line value, which is what a body holding more
               # than one release would produce, rather than letting it
@@ -1186,6 +1324,126 @@ jobs:
               echo 'Maintenance mode was never entered; leaving it alone.'
             fi
           no_output_timeout: 20m
+      - run:
+          name: Confirm the deployed stack is the tested one
+          command: |
+            export HEROKU_APP="$CIRCLE_BRANCH"-bestpractices
+            tested_stack="$(cat /tmp/workspace/tested-stack)"
+
+            # "stack", not "build_stack", now: the release has happened,
+            # so what the dynos actually run is the question. If these
+            # disagree, the application is live on an operating system
+            # the suite never ran on, which is the one thing this whole
+            # mechanism exists to prevent.
+            #
+            # Retried rather than judged on one read. "stack" follows the
+            # release rather than leading it, so on the very deploy that
+            # moves the stack it may briefly still report the old one.
+            # Failing immediately would be a false alarm at exactly the
+            # moment this check matters most.
+            for i in $(seq 1 6); do
+              live_stack="$(script/heroku_app_field stack.name \
+                "$HEROKU_APP" || true)"
+              if [ "$live_stack" = "$tested_stack" ]; then
+                echo "${HEROKU_APP} runs ${live_stack}, as tested."
+                exit 0
+              fi
+              echo "Attempt ${i}: reads '${live_stack}', waiting for" \
+                   "'${tested_stack}'."
+              sleep 5
+            done
+            echo "ERROR: ${HEROKU_APP} runs '${live_stack}' but the"
+            echo "tests ran on '${tested_stack}'."
+            echo 'The application is live on an operating system the'
+            echo 'suite never ran on. Check "heroku stack".'
+            exit 1
+      - run:
+          name: Smoke test the live site
+          command: |
+            export HEROKU_APP="$CIRCLE_BRANCH"-bestpractices
+
+            # The release phase already proved the application LOADS on
+            # this stack: it ran "rails db:migrate" on a one-off dyno
+            # using the run image, which loads every gem including the
+            # twenty with native extensions, and a failure there stops
+            # the release reaching the dyno formation. What it never did
+            # is start Puma. So this asks for one real page.
+            #
+            # THROUGH THE CDN, because there is no way round it and
+            # there should not be. ApplicationController's
+            # verify_origin_shielding answers 403 to any request whose
+            # last X-Forwarded-For hop is not a trusted Fastly edge, so
+            # https://<app>.herokuapp.com/... is forbidden by design.
+            # That is cloud-piercing protection working; a smoke test is
+            # no reason to want a hole in it.
+            #
+            # The hostname comes from the application itself rather than
+            # being written here, so staging and production each answer
+            # for themselves and nothing has to be kept in step.
+            # config:get names ONE variable: plain "heroku config"
+            # would print every secret the application holds into a log
+            # anyone can read.
+            host="$(heroku config:get PUBLIC_HOSTNAME --app "$HEROKU_APP")"
+            if [ -z "$host" ]; then
+              echo "ERROR: ${HEROKU_APP} has no PUBLIC_HOSTNAME set, so"
+              echo 'there is no address to smoke test. Refusing to guess.'
+              exit 1
+            fi
+
+            # An inert query parameter, different on EVERY ATTEMPT, so
+            # each request asks Fastly for an object it cannot already
+            # hold. The CDN varies on the query string, so this reaches
+            # the origin.
+            #
+            # Per attempt rather than per build, which matters: with one
+            # URL for the whole loop, an early 502 from a dyno still
+            # starting could itself be cached and then re-served to
+            # every retry, turning a passing state into a guaranteed
+            # failure. The value carries the build and attempt number so
+            # it can be found in the logs, plus $RANDOM so two runs
+            # cannot collide.
+            #
+            # The parameter is unused by the application. /projects/:id
+            # ignores query parameters it does not know; nothing here
+            # sets action_on_unpermitted_parameters to raise.
+            echo "Smoke testing https://${host}/projects/1.json"
+            for i in $(seq 1 12); do
+              # Four independent sources of variation, because this
+              # line has to keep working when something about it stops
+              # being true. CIRCLE_BUILD_NUM is empty off CircleCI; the
+              # attempt number repeats between runs; $RANDOM is not
+              # available in every shell. The clock changes every
+              # second, and attempts are five seconds apart.
+              buster="build${CIRCLE_BUILD_NUM:-none}-try${i}"
+              buster="${buster}-$(date +%s)-${RANDOM}"
+              url="https://${host}/projects/1.json?useless_parameter=${buster}"
+              body="$(curl -sfL --max-time 20 -D /tmp/smoke-headers \
+                "$url" || true)"
+              # Require the digit to END: '"id": *1' alone also
+              # matches "id":10, so a response about some other project
+              # would pass. Zero or more spaces after the colon because
+              # the answer may be compact or pretty-printed.
+              if printf '%s' "$body" | grep -q '"id": *1[,}]'; then
+                echo "Site answered with project 1 after ${i} attempts."
+                # Printed, not asserted. A MISS proves the answer came
+                # from the application; a HIT would mean the CDN served
+                # a query string it had somehow seen before, which is
+                # worth seeing but is no reason to fail a good deploy.
+                # From THIS request's headers, not a second one:
+                # asking again for the same URL would report a hit on
+                # the cache entry the request above had just created,
+                # which is a diagnostic that lies in the ordinary case.
+                grep -iE '^(x-cache|age):' /tmp/smoke-headers || true
+                exit 0
+              fi
+              echo "Attempt ${i}: no usable answer yet; dynos may still" \
+                   'be starting.'
+              sleep 5
+            done
+            echo "ERROR: ${url} never returned project 1."
+            echo 'The release is LIVE and may be serving badly. Look at'
+            echo '"heroku logs --app '"${HEROKU_APP}"'" first.'
+            exit 1
       # Not reliable enough:
       # - run:
           # name: Test Fastly

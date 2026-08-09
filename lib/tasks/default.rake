@@ -88,6 +88,8 @@ STATIC_CHECKS = %w[
   license_okay
   yaml_syntax_check
   circleci_config_check
+  codeql_version_check
+  ruby_version_matches_lock
   html_from_markdown
   eslint
   report_code_statistics
@@ -110,6 +112,7 @@ STATIC_CHECKS = %w[
 DYNAMIC_CHECKS = %w[
   bundle_audit
   percent_gems_up_to_date
+  ruby_version_deployable
   test:optimized
 ].freeze
 
@@ -519,6 +522,156 @@ task circleci_config_check: :no_rails do
   end
 end
 
+# The CodeQL action's "init" step writes the version of itself into the
+# config file it leaves in the work area, and the "analyze" step reloads
+# that file and compares the two. A difference is fatal, reported as
+# "Loaded a configuration file for version X, but running version Y", and
+# there is no fallback: every language in the matrix fails.
+#
+# Nothing in a workflow file expresses that constraint, and the two steps
+# are pinned by commit SHA on separate lines, which is precisely the shape
+# an automated dependency bump edits one line of. Dependabot did, three
+# times, because it keys actions by full path and so sees "init" and
+# "analyze" as unrelated dependencies. .github/dependabot.yml now groups
+# them, and this is the check that notices if they ever come apart
+# regardless: a hand edit, a bad merge, or a future tool with the same
+# blind spot.
+#
+# Only init and analyze are constrained. upload-sarif reads no config
+# from init and is deliberately not checked here, so scorecard.yml stays
+# free to move on its own schedule.
+desc 'Check github/codeql-action init and analyze are pinned alike'
+task codeql_version_check: :no_rails do
+  path = '.github/workflows/codeql.yml'
+  puts "Checking #{path} pins CodeQL init and analyze alike..."
+  raise StandardError, "Missing #{path}" unless File.exist?(path)
+
+  # Capture the SHA and the trailing "# vX.Y.Z" comment for each step, so
+  # a mismatch can be reported in the terms the file is written in.
+  pattern = %r{codeql-action/(init|analyze)@(\S+)\s*(?:\#\s*(\S+))?}
+  pins =
+    File.read(path).scan(pattern).to_h do |step, sha, tag|
+      [step, [sha, tag]]
+    end
+
+  missing = %w[init analyze] - pins.keys
+  if missing.any?
+    raise StandardError,
+          "No CodeQL #{missing.join(' or ')} step in #{path}"
+  end
+
+  if pins['init'].first == pins['analyze'].first
+    puts "CodeQL version check completed successfully (#{pins['init'].last})."
+  else
+    puts 'ERROR: CodeQL init and analyze are pinned to different releases.'
+    puts 'The analyze step reloads the config file init wrote and rejects'
+    puts 'any version difference, so every language in the matrix fails.'
+    puts 'Move both lines to the same commit SHA of github/codeql-action.'
+    %w[init analyze].each do |step|
+      sha, tag = pins[step]
+      puts "  #{step}: #{sha} #{tag}"
+    end
+    exit 1
+  end
+end
+
+# THE RUBY VERSION IS IN TWO FILES AND HEROKU READS THE OTHER ONE.
+# Gemfile says `ruby File.read('.ruby-version').strip`, so the two agree
+# whenever "bundle install" last ran and stop agreeing the moment
+# .ruby-version is edited alone. Heroku's support reference: "We install
+# the Ruby version specified in your Gemfile.lock".
+#
+# Nothing else catches this. CI runs a plain "bundle install", so
+# Bundler reconciles the lock in the working tree and the suite passes;
+# "bundle check" reports satisfied even with BUNDLE_FROZEN=true, since
+# frozen mode guards the gem set and not the recorded Ruby. Nothing is
+# red until a deploy installs the OLD Ruby and meets a Gemfile
+# demanding the new one.
+#
+# STATIC: both files are in the tree, so no commit, no change.
+desc 'Check .ruby-version and Gemfile.lock name the same Ruby'
+task ruby_version_matches_lock: :no_rails do
+  puts 'Checking .ruby-version against Gemfile.lock...'
+  wanted = File.read('.ruby-version').strip
+  # "RUBY VERSION\n   ruby 3.4.1p0"; the patchlevel suffix is Bundler's
+  # and is not part of what .ruby-version can say, so it is ignored.
+  locked = File.read('Gemfile.lock')[/^RUBY VERSION\s*\n\s*ruby ([\d.]+)/, 1]
+
+  if locked.nil?
+    puts 'ERROR: Gemfile.lock has no RUBY VERSION section.'
+    puts 'Gemfile names a Ruby, so the lock should record one. Run'
+    puts '"bundle install" and commit the result.'
+    exit 1
+  elsif locked == wanted
+    puts "Both name Ruby #{wanted}."
+  else
+    puts "ERROR: .ruby-version says #{wanted}, Gemfile.lock says #{locked}."
+    puts 'Heroku installs the version in Gemfile.lock, so this deploys'
+    puts 'the wrong Ruby, or fails when Bundler finds the Gemfile asking'
+    puts "for #{wanted}. Run \"bundle install\" and commit Gemfile.lock"
+    puts 'alongside the .ruby-version change.'
+    exit 1
+  end
+end
+
+# Only Rubies Heroku publishes for our stack will deploy, so a bumped
+# .ruby-version could pass every test and fail at deploy. This asks S3
+# the same question a deploy will.
+#
+# DYNAMIC, not static: Heroku can withdraw a Ruby under an unchanged
+# tree, and the moment to hear about that is the deploy we were about
+# to do. Same argument as bundle_audit.
+#
+# NOT A MINITEST TEST. test/test_helper.rb disables outbound
+# connections, and WebMock's refusal is not a network error, so any
+# "skip when offline" logic would read it as an offline developer and
+# skip for ever. A guard that never guards is worse than none, being
+# also reassuring.
+#
+# Offline is a SKIP: a developer on a train is not stopped, and CI has
+# a network, so CI is where this bites.
+desc 'Check .ruby-version is a Ruby Heroku can deploy on our stack'
+task ruby_version_deployable: :no_rails do
+  require_relative '../heroku_ruby_availability'
+  require_relative '../project_stack'
+
+  version = File.read('.ruby-version').strip
+  stack = ProjectStack.name
+  puts "Checking Heroku has Ruby #{version} for #{stack}..."
+
+  begin
+    deployable = HerokuRubyAvailability.available?(
+      version: version, stack: stack
+    )
+  rescue HerokuRubyAvailability::Unreachable => e
+    puts "SKIPPED: #{e.message}"
+    puts 'Offline, so this proves nothing either way. CI has a network.'
+    next
+  end
+
+  if deployable
+    puts "Heroku has ruby-#{version} for #{stack}."
+  else
+    puts "ERROR: Heroku has no ruby-#{version} for #{stack}."
+    puts 'This would pass every test here and then fail at deploy.'
+    puts "Asked for: #{HerokuRubyAvailability.url_for(
+      version: version, stack: stack
+    )}"
+    puts 'Pick a version from .github/heroku-ruby-versions.txt, or run'
+    puts '"rake heroku_ruby_versions" to see what Heroku has now.'
+    exit 1
+  end
+end
+
+# A convenience for humans. The weekly workflow runs the same script to
+# refresh .github/heroku-ruby-versions.txt, which Renovate reads as a
+# custom datasource; it lives in script/ because it must run on a bare
+# runner, and our Rakefile loads config/boot, i.e. Bundler.
+desc 'Print the Rubies Heroku can deploy on our stack'
+task heroku_ruby_versions: :no_rails do
+  sh 'script/heroku_ruby_versions'
+end
+
 # The following are invoked as needed.
 
 desc 'Create visualization of gem dependencies (requires graphviz)'
@@ -532,14 +685,164 @@ end
 # in the CircleCI deploy job on HEROKU_API_KEY, which never needs a
 # browser, and under maintenance mode rather than against a live site.
 # See .circleci/config.yml and docs/build-environment-staleness.md.
+# FETCHES ORIGIN'S main INTO LOCAL staging, THEN PUSHES THAT.
+#
+# The fetch source is origin's main, never your local main, so an
+# unpushed commit of yours cannot reach staging.
+#
+# WHAT IT UPDATES LOCALLY, deliberately: your local "staging" branch is
+# created if absent and fast-forwarded if present, so "git log staging"
+# and "git diff staging" tell the truth after a deploy instead of
+# describing wherever staging sat when you last looked. In a full clone
+# the push updates "origin/staging" too; in a --single-branch or --depth
+# clone it does not, because that clone's refspec never mapped it.
+# Nothing else is touched: no other branch moves, the working tree is
+# left alone, and a dirty tree is fine.
+#
+# WHAT YOU CANNOT BE ON: "staging" itself. Git refuses to fetch into a
+# checked-out branch and stops with "refusing to fetch into branch". That
+# is a fair limitation, since staging is a branch to read rather than
+# work on, and the refusal is a useful signal that something odd is
+# going on.
+#
+# THE SECOND REFSPEC KEEPS "git status" HONEST. "+main:refs/..." updates
+# origin/main, which the first refspec does not, because an explicit
+# src:dst overrides the clone's configured refspec and so no
+# remote-tracking ref would be touched otherwise. Without it origin/main
+# goes stale as deploys succeed and "git status" on main stops reporting
+# how far behind you are. It writes to a remote-tracking ref rather than
+# to refs/heads/main, so it works even while you are standing on main.
+# The leading "+" is deliberate and the asymmetry is the point: a
+# tracking ref is a mirror of the remote, where a forced update is
+# normal, while "main:staging" stays unforced so a divergence stops the
+# deploy.
+#
+# THE "&&" IS THE SAFETY, more than it looks. If your local staging has
+# diverged, the fetch is REJECTED as a non-fast-forward and exits 1,
+# leaving the divergent commit in place; an unguarded push would then
+# send that commit to the deploy branch. Not passing --force is the other
+# half: the push refuses a non-fast-forward on the far end too.
+#
+# The same two commands are documented for people without a development
+# environment in docs/INSTALL.md.
+#
+# AFTER THE DEPLOY, IT REPORTS ON YOUR LOCAL main, and only when there is
+# something to say. The deploy has already happened by then, so nothing
+# here can delay or fail it. origin/main was just refreshed above, so
+# both comparisons are free and need no network, so it makes sense to
+# add the checks specifically *here* since within this command we *can*
+# know for certain what difference there is (if any) between the
+# remote origin's main and our local main.
+#
+# Behind is the ordinary case and only needs the cure. AHEAD IS NOT: it
+# means commits exist here and nowhere else, which is what happens when
+# you forget to branch before starting work, so it names them and offers
+# the way out. "git reset --keep" rather than "--hard" because it refuses
+# rather than discarding uncommitted changes.
+#
+# "--ff-only" ON THE SUGGESTED PULL LOOKS REDUNDANT AND IS NOT. This
+# message appears only when main is behind and not ahead, where a plain
+# "git pull" fast-forwards anyway. The flag is there for the reader's
+# configuration rather than for the ordinary case: with pull.rebase=true,
+# a common setting, a plain pull silently rewrites their commits if main
+# has diverged since this ran, and with pull.rebase=false it puts a merge
+# commit on main. Git's own default refuses either way, so this guards
+# against configuration, not against git.
+#
+# The heredoc below is unquoted, so keep Ruby out of it: no "#{...}", and
+# no backslash escapes, which Ruby would consume before the shell saw
+# them. deploy_production quotes its delimiter for exactly that reason.
 desc 'Deploy current origin/main to staging'
 task deploy_staging: :no_rails do
-  sh 'git checkout staging && git pull && git merge --ff-only origin/main && git push && git checkout main'
+  # Shown as it runs, because these two commands ARE the deploy and are
+  # what someone without a development environment types instead.
+  sh 'git fetch origin main:staging +main:refs/remotes/origin/main && ' \
+     'git push origin staging'
+
+  # Reported quietly. "verbose(false)" keeps Rake from echoing this
+  # script, which is bookkeeping rather than anything anyone would run by
+  # hand, so the only thing that reaches the screen is a finding. It is a
+  # separate sh so a failed deploy above raises and this never runs,
+  # which is why nothing here needs "|| exit 1".
+  verbose(false) do
+    sh <<~SHELL
+      ahead=$(git rev-list --count origin/main..main 2>/dev/null || echo 0)
+      behind=$(git rev-list --count main..origin/main 2>/dev/null || echo 0)
+      if [ "$ahead" -gt 0 ]; then
+        echo
+        echo "WARNING: your local main has commits that are not on GitHub,"
+        echo 'so they are not reviewed, not tested and not deployed:'
+        git log --oneline origin/main..main
+        echo 'If you meant to work on a branch, move them onto one and put'
+        echo 'main back where GitHub has it:'
+        echo '  git branch SAVED-WORK main'
+        echo '  git switch main && git reset --keep origin/main'
+      elif [ "$behind" -gt 0 ]; then
+        echo
+        echo 'Your local main is out of date. To catch up:'
+        echo '  git switch main && git pull --ff-only'
+      fi
+    SHELL
+  end
 end
 
+# Same shape as deploy_staging, one branch further along, so the same
+# notes apply: it reads origin's staging rather than your local one,
+# updates your local "production" branch so it tells the truth
+# afterwards, refuses if you are standing on "production", and relies on
+# the "&&" and on not passing --force to keep every step a
+# fast-forward.
+#
+# The one difference that matters: PRODUCTION WAITS FOR EVIDENCE. A staging
+# deploy may legitimately start before main's checks finish, because
+# CircleCI tests the tree again on the staging branch and the two suites
+# then run in parallel. Production has no such excuse, so this refuses
+# unless everything on staging passed.
+#
+# BOTH ENDPOINTS ARE ASKED, and neither is redundant. CircleCI's
+# "ci/circleci: static" is reported as a commit STATUS and never appears
+# among the check runs, while CodeQL, brakeman and codespell are check
+# RUNS and never appear among the statuses. Asking only for statuses
+# once called a commit green whose three CodeQL analyses had failed.
+#
+# The grep pair is inverted on purpose: it reports anything that is not
+# "success" or "completed" rather than looking for known bad words, so a
+# conclusion GitHub invents later stops the deploy instead of slipping
+# past. A null conclusion, meaning still running, stops it too.
+#
+# "|| exit 1" after the curl is not decoration. curl exits 22 when -f
+# meets an error, and without that the empty reply would look like an
+# empty list of problems, which is to say like success.
 desc 'Deploy current origin/staging to production'
 task deploy_production: :no_rails do
-  sh 'git checkout production && git pull && git merge --ff-only origin/staging && git push && git checkout main'
+  # The check is quiet, because how we ask is bookkeeping; what it found
+  # is not. Both arms say something: one line when staging is clean, and
+  # the refusal with the offending lines when it is not. Its own sh, so a
+  # refusal raises here and the deploy below is never reached, which is
+  # why the "if" no longer has to fall through to it.
+  verbose(false) do
+    sh <<~'SHELL'
+      api=https://api.github.com/repos/ossf/best-practices-badge/commits/staging
+      checks=$(curl -sSf "$api/status" \
+        "$api/check-runs?per_page=100") || exit 1
+      not_green=$(printf '%s\n' "$checks" |
+        grep -E '"(state|status|conclusion)":' |
+        grep -vE '"(success|completed)"')
+      if [ -z "$not_green" ]; then
+        echo 'Staging has passed everything.'
+      else
+        echo 'Refusing to deploy: staging has not passed everything.'
+        printf '%s\n' "$not_green"
+        echo 'Open the staging commit on GitHub to see what.'
+        exit 1
+      fi
+    SHELL
+  end
+
+  # Shown as it runs, like the staging deploy: these are the commands.
+  sh 'git fetch origin staging:production ' \
+     '+staging:refs/remotes/origin/staging && ' \
+     'git push origin production'
 end
 
 rule '.html' => '.md' do |t|
