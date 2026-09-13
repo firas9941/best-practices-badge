@@ -88,10 +88,20 @@ class ProjectsController < ApplicationController
   before_action :set_project_for_limited_fields,
                 only: %i[delete_form destroy choose_edit choose_show]
   before_action :require_logged_in, only: :create
+  # Runs BEFORE can_edit_else_redirect: that before_action's logged-out
+  # PATCH branch reads project_params to diff against the current record
+  # and stash only the real changes (ApplicationController#stash_pending_
+  # resubmission), and needs status strings ('Met') and empty
+  # justifications already normalized to the integers/nils the model
+  # actually stores. Otherwise a resubmitted-but-UNCHANGED status like
+  # 'Met' casts to 0 ('?') against the integer column, which looks like a
+  # real change and gets wrongly stashed and restored, corrupting every
+  # other status field in the same form. See docs/login-session-
+  # simplify.md's "a real gap found" addendum.
+  before_action :cleanup_input_params, only: %i[create update]
   before_action :can_edit_else_redirect, only: %i[edit update choose_edit]
   before_action :can_control_else_redirect, only: %i[destroy delete_form]
   before_action :require_adequate_deletion_rationale, only: :destroy
-  before_action :cleanup_input_params, only: %i[create update]
 
   # Cache with CDN. We can only do this when we don't display the
   # header (which changes for logged-in users), use a flash, or

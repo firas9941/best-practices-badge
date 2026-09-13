@@ -117,6 +117,73 @@ class PendingResubmissionTest < ActionDispatch::IntegrationTest
     assert_equal 'updated elsewhere while logged out', @project.description
   end
 
+  test 'resubmitting an unchanged human-readable status never stashes or overwrites it' do
+    # Regression test for a real incident on staging (2026-09-13): a
+    # criterion status radio group submits its value as a human-readable
+    # string ('Met', 'Unmet', 'N/A', '?'), which ProjectsController#
+    # cleanup_input_params normalizes to the integer the column actually
+    # stores (CriterionStatus::STATUS_BY_NAME). That before_action used to
+    # run AFTER can_edit_else_redirect, so the logged-out stash path
+    # diffed the raw string straight against the integer column: a
+    # non-numeric string casts to 0 ('?'), which looked like a real change
+    # away from the fixture's actual value (3, 'Met') even though the user
+    # never touched it, and every such field in the form got wrongly
+    # stashed and then overlaid back onto the resumed page as blank.
+    # cleanup_input_params now runs first, so the diff compares the
+    # already-normalized integer against the model's current value, same
+    # as it would for any other field.
+    assert_equal 3, @project.static_analysis_status # fixture: 'Met'
+    assert_equal 3, @project.maintained_status # fixture: 'Met'
+
+    # name is the only real change; both statuses are resubmitted at their
+    # own current (unchanged) value, exactly what a real browser sends for
+    # every radio group in the form regardless of what the user touched.
+    new_name = "#{@project.name}_resubmitted"
+    patch @edit_path, params: {
+      project: { name: new_name, static_analysis_status: 'Met', maintained_status: 'Met' }
+    }
+    pending = PendingResubmission.find_by_token(pending_resubmission_token_from_redirect)
+    assert_equal({ 'name' => new_name }, JSON.parse(pending.params_json))
+
+    log_in_with_token(pending_resubmission_token_from_redirect)
+    follow_redirect!
+    assert_response :success
+    assert_select "input[name='project[static_analysis_status]'][value='Met']" do |elements|
+      assert(elements.any? { |el| el['checked'] })
+    end
+    assert_select "input[name='project[maintained_status]'][value='Met']" do |elements|
+      assert(elements.any? { |el| el['checked'] })
+    end
+  end
+
+  test 'a genuinely changed status is stashed as an integer and redisplays as the right radio' do
+    # Companion to the "unchanged" test above: that one checks the
+    # false-positive direction (a resubmitted-but-same status must not
+    # look like a change); this one checks the real conversion round
+    # trip an actual change relies on. stash_pending_resubmission stores
+    # CriterionStatus's integer form (not the human-readable string the
+    # form posts), and overlay_pending_resubmission! assigns that integer
+    # straight onto the model; status_radio_button (app/helpers/
+    # projects_helper.rb) then converts it back via status_to_string to
+    # decide which of the four radios is checked.
+    assert_equal 3, @project.static_analysis_status # fixture: 'Met'
+
+    patch @edit_path, params: { project: { static_analysis_status: 'Unmet' } }
+    pending = PendingResubmission.find_by_token(pending_resubmission_token_from_redirect)
+    # Stored as the integer 1 (CriterionStatus::UNMET), not the string
+    # 'Unmet': overlay_pending_resubmission! feeds this straight to
+    # assign_attributes, which needs the column's own type, not a string
+    # that would just get miscast again.
+    assert_equal({ 'static_analysis_status' => 1 }, JSON.parse(pending.params_json))
+
+    log_in_with_token(pending_resubmission_token_from_redirect)
+    follow_redirect!
+    assert_response :success
+    status_radios = css_select("input[name='project[static_analysis_status]']")
+    checked_values = status_radios.filter_map { |el| el['value'] if el['checked'] }
+    assert_equal ['Unmet'], checked_values
+  end
+
   test 'revisiting after a closed tab (a fresh GET) still shows the stash' do
     # docs/login-session-evaluation.md finding #4: the old design destroyed
     # the row and session key on the first GET, so a closed tab (before
