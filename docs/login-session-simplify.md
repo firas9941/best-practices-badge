@@ -21,7 +21,7 @@ redesign.
 
 Found during staging validation (2026-09-13): logging out in one tab
 calls `SessionsHelper#log_out`, which calls `reset_session`
-(sessions_helper.rb:301). That clears `session[:_csrf_token]`, the secret
+(sessions_helper.rb:300). That clears `session[:_csrf_token]`, the secret
 behind every CSRF token already embedded in any other tab's rendered
 forms. Submitting one of those other, now-stale tabs raises
 `ActionController::InvalidAuthenticityToken` (`protect_from_forgery with:
@@ -60,6 +60,13 @@ the right shape to match). No attempt to stash or preserve the submitted
 data; just replace the confusing generic 422 page with the same friendly
 "you were logged out, please log in again" message the other
 forced-logout cases already show.
+
+Implementation note to check: `protect_from_forgery` applies uniformly
+regardless of request format, so a blanket `rescue_from` that always
+`redirect_to`s would also fire for a `format.json` request. Check whether
+that matters for any current JSON-format action before assuming an HTML
+redirect is always the right response (`respond_to` on the format may be
+needed).
 
 ## Part 2: reuse the normal edit pages instead of a dedicated resume page (the main course)
 
@@ -124,7 +131,7 @@ Rather than special-casing controllers, let each form say what it is.
 #### 1. Let a form override `return_to`
 
 `ApplicationController#redirect_to_login_stashing` (application_
-controller.rb:933) currently does:
+controller.rb:945) currently does:
 
 ```ruby
 login_params = { return_to: request.original_fullpath }
@@ -136,11 +143,29 @@ Change to prefer an explicit value the form supplied:
 login_params = { return_to: params[:return_to].presence || request.original_fullpath }
 ```
 
-`return_to_path` is already validated (`valid_return_path?`) further down
-the login pipeline exactly as it is today, so this adds no new trust: the
-submitter already fully controls `request.original_fullpath` by choosing
-what URL to POST/PATCH to in the first place, so letting them also state
-it explicitly grants no new capability.
+`return_to_path` is already passed through `valid_return_path?`
+(sessions_helper.rb:420-424) further down the login pipeline exactly as
+it is today. That's an open-redirect guard, not an authorization check:
+it only confirms the path is server-relative (no protocol-relative `//`)
+and isn't a login/signup loop; it says nothing about whether the
+requester can do anything at that path. That's fine here because a
+redirect only sends the user's *own* browser somewhere; the page they
+land on enforces its own authorization exactly as it would for direct
+navigation. The submitter already fully controls `request.
+original_fullpath` by choosing what URL to POST/PATCH to in the first
+place, so letting them also state `return_to` explicitly grants no new
+capability.
+
+(Automation proposals, `docs/automation-proposals.md`, already rely on
+this exact same property for a *different* case: an unauthenticated GET
+to an edit URL carrying proposal query params stores the full URL as
+`return_to` and redirects to login, per that doc's "Authentication Flow"
+section; after login the user lands back on that URL, and *that* page's
+own authorization check decides whether they may actually edit it. This
+change doesn't touch that flow: it's a GET, never a PATCH, so it never
+reaches `stash_pending_resubmission` at all, and automation-proposal URLs
+never set their own `return_to` param, so the new `params[:return_to]`
+preference here never has anything to override for them.)
 
 #### 2. Add the hidden field only where the default is wrong
 
@@ -156,7 +181,7 @@ unless review finds a reason to want it.)
 
 #### 3. Simplify `redirect_after_login`
 
-`SessionsController#redirect_after_login` (sessions_controller.rb:163-177)
+`SessionsController#redirect_after_login` (sessions_controller.rb:164-177)
 currently special-cases the resubmission redirect:
 
 ```ruby
@@ -180,13 +205,42 @@ method goes back to what it was before section 15 added it.
 #### 4. Overlay the stash in the edit action, render the normal template
 
 In `ProjectsController#edit` and `UsersController#edit`: if
-`session[:pending_resubmission_token]` is present and its stashed
-`resubmit_path`/`resubmit_method` match what this edit page's form would
-itself submit to, apply the stashed (unprefixed) fields onto the
-in-memory model with `assign_attributes` (never save) before rendering
-the existing edit template unchanged. Add a flash explaining what
-happened (reusing the existing `sensitive_fields_dropped` warning text
-where applicable).
+`session[:pending_resubmission_token]` is present, look up the stash and
+compare `pending.resubmit_path` against the exact path *this resource's
+own form would submit to* (i.e. the same route-helper call the form
+partial already uses to build its `url:`), not against `request.path` or
+`request.method`. If they match, apply the stashed (unprefixed) fields
+onto the in-memory model with `assign_attributes` (never save) before
+rendering the existing edit template unchanged. Add a flash explaining
+what happened (reusing the existing `sensitive_fields_dropped` warning
+text where applicable).
+
+This is the same pattern automation proposals already use for a
+different reason (`docs/automation-proposals.md`: "loaded into the
+in-memory project object for display in the edit form... not saved to
+the database until the user explicitly submits the form"), which is
+reassuring prior art that "overlay unsaved values onto the model, render
+the normal template" is already a proven, idiomatic approach in this
+codebase.
+
+Comparing against `request.path` instead would be a real bug, not just
+imprecise: for Projects' main forms `request.path` (the GET edit page)
+happens to equal `edit_project_section_path(@project, @criteria_level)`,
+the same URL their form posts to, so it would work there by coincidence.
+It would silently never match for `UsersController#edit` (whose form
+posts to `user_path(@user)`, not `edit_user_path(@user)`) or for the
+permissions sub-form (whose stash's `resubmit_path` is
+`update_project_path(project, section: 'permissions')`, not
+`edit_project_section_path(project, 'permissions')`), exactly the two
+cases Part 2's "why a naive fix doesn't quite work" section above already
+flags. Comparing `resubmit_method` against the edit action's own request
+method is also meaningless (it's a GET showing the form; the stash's
+`resubmit_method` is always the PATCH/PUT the form itself will use), so
+drop that comparison rather than implement it. Each controller already
+knows its own form's target (`edit_project_section_path(@project,
+@criteria_level)` for Projects, `user_path(@user)` for Users), so this is
+a value each `#edit` action passes to the shared helper, not something
+derived from the current GET request.
 
 This needs a small shared helper (e.g. on `ApplicationController`, called
 from both `#edit` actions) so the match/overlay logic exists once, not
@@ -199,7 +253,7 @@ more conditional hidden field to the form at that point:
 `hidden_field_tag :pending_resubmission_token, @pending_resubmission_token
 if @pending_resubmission_token`. This is the same "provide the data now,
 while you have it" idea applied to the destroy side: `finalize_
-pending_resubmission` (application_controller.rb:897) stays exactly as it
+pending_resubmission` (application_controller.rb:909) stays exactly as it
 is today, still only reading an explicit `params[:pending_resubmission_
 token]`, still only called from the confirmed-success branches
 (`ProjectsController#successful_update`, `UsersController#update`'s
@@ -221,7 +275,7 @@ broadening considered earlier.
 
 ### What does NOT change
 
-- `PendingResubmission` the model/table: same three real columns
+- `PendingResubmission` the model/table: same five real columns
   (`resubmit_path`, `resubmit_method`, `params_json`,
   `sensitive_fields_dropped`, `hashed_random_id`). No migration, because
   the redisplay URL travels via `return_to` (already fully plumbed
