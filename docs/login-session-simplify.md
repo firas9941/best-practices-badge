@@ -4,18 +4,16 @@
 
 ## Status
 
-Not yet implemented. Staging validation of the underlying mechanism is
-done (2026-09-13): with a clean test (revoke the `LoginSession`
-server-side via `rake login_sessions:revoke[id]`, then submit the
-still-open tab with no reload in between, so the tab's CSRF token stays
-valid), the stash-and-resume round trip worked end to end: the PATCH was
-correctly stashed, the login redirect carried the token, and the resume
-page showed the stashed data. The foundation this plan simplifies is
-confirmed working.
-
-That same validation session also surfaced a real, separate problem,
-addressed first below since it's small and independent of the main
-redesign.
+**Both parts implemented** (2026-09-13). Staging validation of the
+underlying mechanism was done first: with a clean test (revoke the
+`LoginSession` server-side via `rake login_sessions:revoke[id]`, then
+submit the still-open tab with no reload in between, so the tab's CSRF
+token stays valid), the stash-and-resume round trip worked end to end.
+That same validation session surfaced a real, separate problem, addressed
+first below since it was small and independent of the main redesign.
+Local checks (rubocop, rails_best_practices, whitespace, YAML, mdl) and
+the full non-system test suite (1322 tests) pass; system tests still need
+the user to run and report, per this sandbox's known limitation.
 
 ## Part 1: a friendly message when a stale tab's CSRF token was invalidated by logging out elsewhere
 
@@ -108,6 +106,61 @@ redirect is always the right response (`respond_to` on the format may be
 needed).
 
 ## Part 2: reuse the normal edit pages instead of a dedicated resume page (the main course)
+
+**Status: implemented.** The plan below held up in outline; three real
+gaps only surfaced while actually writing the code and its tests, not
+during planning, and are recorded here rather than silently folded into
+the description as if they'd been foreseen:
+
+1. **The permissions sub-form's own inconsistency, fixed at the root
+   instead of worked around.** The plan (step 2 below) proposed adding a
+   `return_to` override to `_form_permissions.html.erb`, on the
+   assumption that only `UsersController#update` needed one. But that
+   form *also* posted to `update_project_path`, not
+   `edit_project_section_path` like every other project form, which
+   breaks step 4's overlay-matching the same way `return_to` needs
+   fixing for: the routes already accept PATCH at the `/edit` URL for any
+   section (routes.rb's shared GET/PATCH route isn't Projects'-main-forms-
+   specific, it's just under-used), so the smaller fix was changing that
+   one form's `url:` to match every other project form, not adding a
+   second override mechanism. This made the "why a naive fix doesn't
+   quite work" section's second bullet point moot; only Users needed the
+   override actually implemented.
+2. **`ProjectsController#edit`'s automation step reloads `@project` from
+   the database** (`run_first_edit_automation_if_needed`, to get every
+   column before running cross-section detectives), which silently threw
+   away an overlay applied any earlier in the method. Fixed by moving the
+   `overlay_pending_resubmission!` call to run last, which also gets a
+   real priority question right: a restored draft is what the user
+   actually typed, so it should override an automated proposal, not the
+   other way around.
+3. **`UsersController#edit`'s two "own path" values are different, unlike
+   Projects'.** The stash-matching path (what the failed PATCH posted to,
+   `user_path`) and the page to redirect back to (`edit_user_path`) are
+   the same URL for Projects (by construction, per the "why a naive fix"
+   section) but genuinely different for Users. The first draft used
+   `user_path` for both, which silently redirected a resumed edit to the
+   read-only show page instead of back to the edit form.
+
+Also simplified beyond the original plan, once the dedicated resume
+page's view was gone to require it: `stash_pending_resubmission` no
+longer prefixes stashed field names (e.g. `"name"`, not
+`"project[name]"`); the prefix existed only so that page's view could
+echo fields back as literal hidden field names, and
+`overlay_pending_resubmission!` needs no unprefixing step in exchange.
+And `pending_resubmission_token_field` (the hidden field carrying a
+restored stash's token forward, step 5) is a plain `ApplicationHelper`
+method, not a rendered partial, on a reviewer's observation that a
+partial's template-lookup overhead isn't worth it for one conditional
+tag, matching this codebase's stated performance priorities.
+
+Actual code-size impact, `git diff --stat` across `app/`, `config/`, and
+`test/`: 306 insertions, 405 deletions, net **99 fewer lines**: real, but
+less than the 120-150 estimated below, mainly because
+`test/integration/pending_resubmission_test.rb` grew (265 to 328 lines)
+rather than staying flat: simulating "the browser actually rendered and
+resubmitted the real form" without a real browser needs more setup code
+per test than the old design's dedicated, single-purpose test file did.
 
 ### Problem with the current design
 
@@ -333,11 +386,11 @@ broadening considered earlier.
 
 1. **Done** (2026-09-13): validated the stash-and-resume mechanism on
    staging via a clean revoke-then-submit-without-reloading test.
-2. Implement Part 1 (the CSRF-message fix). Small, independent, low-risk.
-3. Implement Part 2 (the main redesign, steps 1-6 above).
-4. Update `docs/login-session-implementation.md` section 15 to match (it
-   currently documents the dedicated resume-page design), and mention the
-   CSRF-invalidation edge case from Part 1 there too.
+2. **Done** (2026-09-13): implemented Part 1 (the CSRF-message fix).
+3. **Done** (2026-09-13): implemented Part 2 (the main redesign).
+4. **Done** (2026-09-13): added a pointer to this doc at the top of
+   `docs/login-session-implementation.md` section 15, which is kept as the
+   original design's historical rationale rather than rewritten in place.
 
 ## Background: pre-implementation review (2026-09-13)
 

@@ -245,7 +245,9 @@ class UsersController < ApplicationController
     # Force redirect if current_user cannot edit.  Otherwise, the process
     # of displaying the edit fields (with their defaults) could cause an
     # unauthorized exposure of an email address.
-    redirect_to @user unless current_user_can_edit?(@user)
+    return redirect_to @user unless current_user_can_edit?(@user)
+
+    overlay_pending_resubmission!(@user, user_path(@user))
   end
 
   # Create new user account (signup functionality).

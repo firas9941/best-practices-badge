@@ -71,9 +71,17 @@
           </div>
         </div>
       <% else %>
-        <%# Editable form %>
-        <%= bootstrap_form_for project, url: update_project_path(project, section: 'permissions') do |f| %>
+        <%# Editable form. Posts to the same URL as this page's own GET
+            route (edit_project_section_path), matching every other
+            project edit form, not update_project_path: a pending-
+            resubmission stash is matched back up by comparing its
+            resubmit_path against this page's own edit path (see
+            ApplicationController#overlay_pending_resubmission!), which
+            only works when a form posts to the page it was rendered
+            from. %>
+        <%= bootstrap_form_for project, url: edit_project_section_path(project, 'permissions') do |f| %>
         <%= render 'shared/error_messages', object: f.object %>
+        <%= pending_resubmission_token_field %>
         <%= f.hidden_field :lock_version %>
 
         <br>

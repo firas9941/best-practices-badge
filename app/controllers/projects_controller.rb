@@ -636,27 +636,36 @@ class ProjectsController < ApplicationController
   def edit
     # Only check static analysis notification for criteria sections (not permissions)
     # Permissions section doesn't load criteria fields
-    return if @criteria_level == 'permissions'
+    unless @criteria_level == 'permissions'
+      init_automation_fields
 
-    init_automation_fields
+      # Run first-edit automation if this level hasn't been edited yet
+      # (`SECTION_saved` is false). Only do this on "first edit of this section"
+      # because automation *can* take a while or the remote system could
+      # crash; we don't want to slow down simple edits from users.
+      run_first_edit_automation_if_needed
 
-    # Run first-edit automation if this level hasn't been edited yet
-    # (`SECTION_saved` is false). Only do this on "first edit of this section"
-    # because automation *can* take a while or the remote system could
-    # crash; we don't want to slow down simple edits from users.
-    run_first_edit_automation_if_needed
+      # Always consume query string proposals, even on revisits, so we
+      # will use information from any external automation.
+      # Runs AFTER first-edit automation so query strings can override Chief
+      # (Chief implements the built-in automation).
+      # Results merge into @automated_fields for highlighting.
+      apply_query_string_automation
 
-    # Always consume query string proposals, even on revisits, so we
-    # will use information from any external automation.
-    # Runs AFTER first-edit automation so query strings can override Chief
-    # (Chief implements the built-in automation).
-    # Results merge into @automated_fields for highlighting.
-    apply_query_string_automation
+      if @project.notify_for_static_analysis?('0')
+        flash.now[:danger] = t('.static_analysis_updated_html')
+      end
+    end
 
-    return unless @project.notify_for_static_analysis?('0')
-
-    message = t('.static_analysis_updated_html')
-    flash.now[:danger] = message
+    # Applied last, deliberately: run_first_edit_automation_if_needed above
+    # can reload @project from the database (Project.find(@project.id), to
+    # get every column before running cross-section automation), which
+    # would silently discard an overlay applied any earlier in this
+    # method. Applying it last also gets the priority right: a restored
+    # draft is what the user actually typed before being logged out, so it
+    # should override whatever Chief or query-string automation just
+    # proposed, not the other way around.
+    overlay_pending_resubmission!(@project, edit_project_section_path(@project, @criteria_level))
   end
 
   # Create a new project with automatic URL cleanup and duplicate detection.

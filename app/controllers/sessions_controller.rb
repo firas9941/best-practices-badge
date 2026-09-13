@@ -161,16 +161,18 @@ class SessionsController < ApplicationController
     true
   end
 
-  # Picks where to send the user right after login: a stashed pending
-  # resubmission (docs/login-session-implementation.md section 15) takes
-  # priority over an explicit validated return_to, which takes priority
-  # over the ordinary forwarding_url-or-root fallback.
+  # Picks where to send the user right after login: an explicit validated
+  # return_to takes priority over the ordinary forwarding_url-or-root
+  # fallback. A stashed pending resubmission (docs/login-session-
+  # implementation.md section 15) needs no special case here any more:
+  # redirect_to_login_stashing already set return_to to the resource's own
+  # edit page in that case, so it's handled by the ordinary branch below,
+  # which lands the user back on that page with their stash overlaid (see
+  # ApplicationController#overlay_pending_resubmission!).
   # @param return_to_path [String, nil] A pre-validated server-relative path
   # @return [void]
   def redirect_after_login(return_to_path)
-    if session[:pending_resubmission_token].present?
-      redirect_to pending_resubmission_path
-    elsif return_to_path.present? && valid_return_path?(return_to_path)
+    if return_to_path.present? && valid_return_path?(return_to_path)
       redirect_to return_to_path, allow_other_host: false
     else
       redirect_back_or root_url

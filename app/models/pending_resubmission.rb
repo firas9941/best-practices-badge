@@ -68,17 +68,17 @@ class PendingResubmission < ApplicationRecord
   end
 
   # How long an unconsumed stash is kept around before the daily purge task
-  # (lib/tasks/default.rake's `daily` task) deletes it. Nothing else destroys
-  # a row anymore (docs/login-session-evaluation.md finding #4: destroying it as soon as
-  # PendingResubmissionsController#show renders lost the stash for good if
+  # (lib/tasks/default.rake's `daily` task) deletes it. Nothing else
+  # destroys a row anymore (docs/login-session-evaluation.md finding #4:
+  # destroying it as soon as it was displayed lost the stash for good if
   # the browser never actually completed the resubmission, e.g. a closed
-  # tab); ApplicationController#finalize_pending_resubmission only destroys
-  # a row once the browser actually resubmits it and that resubmission's
-  # save succeeds. Kept at the original 3
-  # days (not shortened to 1, despite there no longer being an earlier
-  # natural cleanup point) so a brief outage of the daily task itself, or
-  # of the site, doesn't purge someone's still-unresumed edit out from
-  # under them.
+  # tab); ApplicationController#finalize_pending_resubmission only
+  # destroys a row once the browser actually resubmits it and that
+  # resubmission's save succeeds. Kept at the original 3 days (not
+  # shortened to 1, despite there no longer being an earlier natural
+  # cleanup point) so a brief outage of the daily task itself, or of the
+  # site, doesn't purge someone's still-unresumed edit out from under
+  # them.
   STALE_LIFETIME = 3.days
 
   # @return [Integer] the number of stale rows deleted

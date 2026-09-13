@@ -35,6 +35,7 @@
       the CDN can share one cached object. See docs/cdn-cache-not-logged-in.md. %>
   <%= bootstrap_form_for project, url: edit_project_section_path(project, criteria_level), authenticity_token: (false if view_only) do |f| %>
     <%= render 'shared/error_messages', object: f.object %>
+    <%= pending_resubmission_token_field %>
     <%= f.hidden_field :lock_version %>
 
   <br>

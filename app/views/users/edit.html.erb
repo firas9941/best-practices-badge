@@ -7,6 +7,14 @@
  <div class="row">
    <div class="col-md-6 col-md-offset-3">
      <%= form_for(@user) do |f| %>
+       <%# return_to must be this page's own GET URL (edit_user_path), not
+           user_path (what form_for(@user) posts to, and what request.
+           original_fullpath would default return_to to on a failed
+           PATCH): the default would otherwise send a forced-login-mid-
+           edit back to the read-only show page instead of back to this
+           form. See docs/login-session-simplify.md Part 2 step 1. %>
+       <%= hidden_field_tag :return_to, edit_user_path(@user) %>
+       <%= pending_resubmission_token_field %>
        <%= render 'shared/error_messages', object: f.object %>
        <%= f.label :name, t('users.new.name') %>
        <%= f.text_field :name, class:"form-control" %>

@@ -313,8 +313,8 @@ class UsersControllerTest < ActionDispatch::IntegrationTest
     assert_equal 'PATCH', pending.resubmit_method
     assert pending.sensitive_fields_dropped?
     fields = JSON.parse(pending.params_json)
-    assert_equal new_name, fields['user[name]']
-    assert_not_includes fields.keys, 'user[email]'
+    assert_equal new_name, fields['name']
+    assert_not_includes fields.keys, 'email'
   end
 
   test 'update when not logged in with no user param falls through to plain flash' do
