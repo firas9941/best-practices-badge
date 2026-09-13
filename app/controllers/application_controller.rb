@@ -992,10 +992,27 @@ class ApplicationController < ActionController::Base
     pending = PendingResubmission.find_by_token(token)
     return if pending.nil? || pending.resubmit_path != own_resubmit_path
 
-    model.assign_attributes(JSON.parse(pending.params_json))
+    model.assign_attributes(stashed_attributes_for(model, pending))
     @pending_resubmission_token = token
     flash.now[:warning] = t('sessions.resubmission_sensitive_dropped') if pending.sensitive_fields_dropped?
     flash.now[:info] = t('sessions.resubmission_restored')
+  end
+
+  # Drops any stashed key that isn't a real attribute setter on model:
+  # assign_attributes raises ActiveModel::UnknownAttributeError rather
+  # than ignoring one. Needed because a permitted-params allowlist can
+  # include a submission-only field that's never actually a model
+  # attribute (e.g. Project's user_id_repeat, the permissions form's
+  # ownership-transfer confirmation field: ProjectsController#update's
+  # own mass-assign loop excludes it explicitly first for the same
+  # reason). Filtering by respond_to? here, once, generically, covers
+  # that case and any other permitted-but-not-a-real-attribute field
+  # without having to name it.
+  # @param model [ActiveRecord::Base] the record overlay_pending_resubmission! is restoring onto
+  # @param pending [PendingResubmission] the stash being restored
+  # @return [Hash] only the stashed fields model has a setter for
+  def stashed_attributes_for(model, pending)
+    JSON.parse(pending.params_json).select { |key, _| model.respond_to?("#{key}=") }
   end
 
   # Shared shape for can_edit_else_redirect and redir_unless_logged_in: a

@@ -391,6 +391,49 @@ broadening considered earlier.
 4. **Done** (2026-09-13): added a pointer to this doc at the top of
    `docs/login-session-implementation.md` section 15, which is kept as the
    original design's historical rationale rather than rewritten in place.
+5. **Done** (2026-09-13): fixed a real bug found in post-implementation
+   review, below ("Post-implementation review: a real gap found").
+
+## Post-implementation review: a real gap found (2026-09-13)
+
+Reviewing the finished diff against main (not just re-reading the plan)
+turned up one real functional bug the pre-implementation review below
+didn't anticipate, since it only reasoned about the design, not every
+field either permitted-params list actually carries.
+
+`overlay_pending_resubmission!` called `model.assign_attributes(JSON.
+parse(pending.params_json))` directly. `Project::PROJECT_PERMITTED_FIELDS`
+includes `user_id_repeat` (the permissions form's ownership-transfer
+confirmation field, `_form_permissions.html.erb`), which is not a real
+`Project` attribute; `ProjectsController#update`'s own mass-assign loop
+already knows this and excludes it explicitly before ever touching the
+model. The overlay path had no equivalent exclusion, so
+`assign_attributes` raised `ActiveModel::UnknownAttributeError` instead of
+restoring the draft.
+
+Confirmed by reproduction, not just inspection: a scratch integration
+test (PATCH the permissions edit page with `project[user_id_repeat]` set
+while logged out, then log back in carrying the token) hit this exception
+on the very next `GET` to that page. Since `#edit` applies the overlay
+unconditionally whenever the session holds a token, every subsequent
+visit to that project's permissions page crashed the same way, until the
+stash's `STALE_LIFETIME` (3 days) passed or the user logged out and back
+in without resubmitting the token. This is a real-world path, not a
+contrived one: an owner or admin filling in the ownership-transfer fields
+who gets auto-logged-out mid-edit (idle timeout, absolute-cap expiry,
+password change elsewhere) hits it on their next page load.
+
+**Fix**: `overlay_pending_resubmission!` now filters the stashed fields
+through a new `stashed_attributes_for(model, pending)` helper
+(application_controller.rb), keeping only keys `model.respond_to?
+("#{key}=")` before calling `assign_attributes`. Generic, not a
+hardcoded `except('user_id_repeat')`, so any other permitted-but-not-a-
+real-attribute field added later is covered the same way, without having
+to remember to name it. Added a regression test (`test/integration/
+pending_resubmission_test.rb`, "a stashed ownership-transfer field on the
+permissions form does not crash the overlay") that stashes
+`user_id_repeat` on the permissions form and confirms the edit page
+renders normally afterward.
 
 ## Background: pre-implementation review (2026-09-13)
 
@@ -439,13 +482,16 @@ correctly. Not an issue.
 
 ### Functionality
 
-The one real gap found was the step-4 matching logic (already corrected
-above): comparing against `request.path`/`request.method` instead of each
-form's own known submission target would have silently broken resume for
-`UsersController#edit` and the permissions sub-form. With that fix, no
-remaining functional hole was identified. The automation-proposals
-cross-check in step 1 above confirms this plan doesn't touch that
-separate, already-working feature at all.
+The one real gap found *before* implementation was the step-4 matching
+logic (already corrected above): comparing against `request.path`/
+`request.method` instead of each form's own known submission target would
+have silently broken resume for `UsersController#edit` and the
+permissions sub-form. The automation-proposals cross-check in step 1
+above confirms this plan doesn't touch that separate, already-working
+feature at all. A second, real gap surfaced only in post-implementation
+review, after the code existed to check against every field the
+permitted-params lists actually carry: see "Post-implementation review: a
+real gap found" above.
 
 ### Estimated code-size impact
 

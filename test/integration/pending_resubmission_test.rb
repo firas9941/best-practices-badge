@@ -280,6 +280,24 @@ class PendingResubmissionTest < ActionDispatch::IntegrationTest
     assert_not_includes @response.body, 'We filled in what you typed below'
   end
 
+  test 'a stashed ownership-transfer field on the permissions form does not crash the overlay' do
+    # Regression test: user_id_repeat (the permissions form's ownership-
+    # transfer confirmation field, _form_permissions.html.erb) is in
+    # Project::PROJECT_PERMITTED_FIELDS but isn't a real Project
+    # attribute. ProjectsController#update's own mass-assign loop
+    # excludes it explicitly before ever touching the model;
+    # overlay_pending_resubmission! must tolerate it the same way (it
+    # used to raise ActiveModel::UnknownAttributeError instead, since
+    # Project has no user_id_repeat= setter for assign_attributes to
+    # call).
+    permissions_path = "/en/projects/#{@project.id}/permissions/edit"
+    patch permissions_path, params: { project: { user_id_repeat: @user.id.to_s } }
+    log_in_with_token(pending_resubmission_token_from_redirect)
+    follow_redirect!
+    assert_response :success
+    assert_includes @response.body, 'We filled in what you typed below'
+  end
+
   test 'a login without its own pending_resubmission_token never resumes a leftover one' do
     # Regression guard for the cross-user disclosure docs/login-session-18.md
     # "Step 21" closes: on a shared browser, an earlier abandoned stash must
