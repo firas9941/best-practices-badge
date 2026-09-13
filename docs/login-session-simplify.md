@@ -1,0 +1,247 @@
+# Simplifying the pending-resubmission resume UX
+
+<!-- SPDX-License-Identifier: (MIT OR CC-BY-3.0+) -->
+
+## Status
+
+Not yet implemented. Staging validation of the underlying mechanism is
+done (2026-09-13): with a clean test (revoke the `LoginSession`
+server-side via `rake login_sessions:revoke[id]`, then submit the
+still-open tab with no reload in between, so the tab's CSRF token stays
+valid), the stash-and-resume round trip worked end to end: the PATCH was
+correctly stashed, the login redirect carried the token, and the resume
+page showed the stashed data. The foundation this plan simplifies is
+confirmed working.
+
+That same validation session also surfaced a real, separate problem,
+addressed first below since it's small and independent of the main
+redesign.
+
+## Part 1: a friendly message when a stale tab's CSRF token was invalidated by logging out elsewhere
+
+Found during staging validation (2026-09-13): logging out in one tab
+calls `SessionsHelper#log_out`, which calls `reset_session`
+(sessions_helper.rb:301). That clears `session[:_csrf_token]`, the secret
+behind every CSRF token already embedded in any other tab's rendered
+forms. Submitting one of those other, now-stale tabs raises
+`ActionController::InvalidAuthenticityToken` (`protect_from_forgery with:
+:exception`, application_controller.rb:77) before any of our own
+before_actions run, so `redirect_unauthenticated_edit_attempt?` never gets
+a chance to stash anything. The user just sees Rails' generic
+`public/422.html`, "The change you wanted was rejected."
+
+This is unrelated to (and unaffected by) both the already-shipped
+`finalize_pending_resubmission` fix and Part 2 below: none of the other
+forced-logout triggers this feature already handles (idle timeout,
+absolute-cap expiry, admin revocation, password change elsewhere, the
+one-time deploy-triggered mass logout) touch this browser's session
+cookie or CSRF secret at all. An explicit `log_out` is the only one of
+these that calls `reset_session` in the *same* browser, which is exactly
+why it behaves differently. Our test suite never caught this either:
+`config/environments/test.rb:49` sets `allow_forgery_protection = false`,
+so no test (including the ones added for the `finalize_
+pending_resubmission` fix) ever exercises a real CSRF check.
+
+**Decision**: don't weaken CSRF protection to try to preserve the stale
+tab's data. `stash_pending_resubmission` only requires being logged out,
+so a code path that accepted a CSRF-failed submission and stashed it
+anyway would just as readily accept a genuine cross-site-forged request
+(which raises the identical exception, since an attacker can't know the
+real secret either) and hand it back to the victim as a click-to-resume
+page on their next login. That tradeoff isn't worth the UX gain for what
+is, after all, a case the user's own explicit action caused.
+
+Instead: add `rescue_from ActionController::InvalidAuthenticityToken` (or
+a narrower, PATCH/POST-only check via a `before_action` wrapper) to
+`ApplicationController`, and redirect to login with a clear explanatory
+flash, reusing the existing `@auto_logged_out`-style messaging
+(`redirect_to_login_stashing`'s `t('sessions.auto_logged_out')` flash is
+the right shape to match). No attempt to stash or preserve the submitted
+data; just replace the confusing generic 422 page with the same friendly
+"you were logged out, please log in again" message the other
+forced-logout cases already show.
+
+## Part 2: reuse the normal edit pages instead of a dedicated resume page (the main course)
+
+### Problem with the current design
+
+When a forced re-login stashes an in-progress edit
+(`docs/login-session-implementation.md` section 15), the user is sent to
+a dedicated `GET /pending_resubmissions` page: a generic, hand-built form
+that echoes the stashed fields back as opaque hidden inputs and a single
+"Resume" button. It works, but:
+
+- It's a second UI the user has never seen before, with no context: they
+  can't review what they're about to submit in the actual form, minus
+  whatever sensitive fields got dropped.
+- It's a whole extra controller, view, and route to maintain
+  (`PendingResubmissionsController`, `pending_resubmissions/show.html.erb`,
+  its route) for something we already have controllers and views for: the
+  ordinary edit pages (`ProjectsController#edit`, `UsersController#edit`).
+
+Goal: after a forced re-login, land the user back on the real edit page,
+pre-filled with their attempted (unsaved) changes, so they review them in
+context and hit the normal Save button. Do this with the least possible
+code, not by adding a parallel mechanism.
+
+### Guiding principle
+
+Prefer "a form provides the data it already has, so a later step can just
+read it" over "a later step re-derives or looks up the data it needs."
+Concretely: an override value from the request, falling back to a
+computed default, rather than a new lookup table or a new column that has
+to be populated, stored, and kept in sync.
+
+This is the same shape `return_to` already uses today
+(`request.original_fullpath` as the default, an explicit
+`params[:return_to]` if the request supplies one): extend that existing
+mechanism instead of building a second one.
+
+### Why a naive fix doesn't quite work
+
+The "page to redisplay" can't always be derived from the failed PATCH's
+own URL:
+
+- Projects' main edit forms (`_form_1`, `_form_0`, `_form_2`,
+  `_form_baseline`) post to `edit_project_section_path(project,
+  criteria_level)`, the same URL Rails routes for both GET and PATCH
+  (`config/routes.rb:172-180`, deliberately shared "so forms can submit
+  here and the address bar stays at /edit"). For these, `request.
+  original_fullpath` at stash time already is the right redisplay URL.
+- `users/edit.html.erb` uses `form_for(@user)`, which posts to the plain
+  RESTful `/en/users/:id`, not `/en/users/:id/edit`. Wrong page if we just
+  reuse the request path.
+- `_form_permissions.html.erb` posts to `update_project_path(project,
+  section: 'permissions')`, not `edit_project_section_path(project,
+  'permissions')`. Also wrong if reused as-is.
+
+So the fallback default (today's `request.original_fullpath`) is right
+for most Project edits and wrong for Users and the permissions sub-form.
+Rather than special-casing controllers, let each form say what it is.
+
+### The plan
+
+#### 1. Let a form override `return_to`
+
+`ApplicationController#redirect_to_login_stashing` (application_
+controller.rb:933) currently does:
+
+```ruby
+login_params = { return_to: request.original_fullpath }
+```
+
+Change to prefer an explicit value the form supplied:
+
+```ruby
+login_params = { return_to: params[:return_to].presence || request.original_fullpath }
+```
+
+`return_to_path` is already validated (`valid_return_path?`) further down
+the login pipeline exactly as it is today, so this adds no new trust: the
+submitter already fully controls `request.original_fullpath` by choosing
+what URL to POST/PATCH to in the first place, so letting them also state
+it explicitly grants no new capability.
+
+#### 2. Add the hidden field only where the default is wrong
+
+- `app/views/users/edit.html.erb`: add
+  `hidden_field_tag :return_to, edit_user_path(@user)` inside the form.
+- `app/views/projects/_form_permissions.html.erb`: add
+  `hidden_field_tag :return_to, edit_project_section_path(project, 'permissions')`.
+
+Leave `_form_1`/`_form_0`/`_form_2`/`_form_baseline` alone: their default
+is already correct. (Adding it there too would be harmless
+belt-and-braces, but isn't required; skip it to keep the diff minimal
+unless review finds a reason to want it.)
+
+#### 3. Simplify `redirect_after_login`
+
+`SessionsController#redirect_after_login` (sessions_controller.rb:163-177)
+currently special-cases the resubmission redirect:
+
+```ruby
+def redirect_after_login(return_to_path)
+  if session[:pending_resubmission_token].present?
+    redirect_to pending_resubmission_path
+  elsif return_to_path.present? && valid_return_path?(return_to_path)
+    redirect_to return_to_path, allow_other_host: false
+  else
+    redirect_back_or root_url
+  end
+end
+```
+
+Once `return_to` always carries the right page (edit or otherwise), the
+first branch is redundant: a stashed resubmission's `return_to` already
+points at the right edit page, so it falls straight into the second
+branch. Delete the `pending_resubmission_token` branch entirely; this
+method goes back to what it was before section 15 added it.
+
+#### 4. Overlay the stash in the edit action, render the normal template
+
+In `ProjectsController#edit` and `UsersController#edit`: if
+`session[:pending_resubmission_token]` is present and its stashed
+`resubmit_path`/`resubmit_method` match what this edit page's form would
+itself submit to, apply the stashed (unprefixed) fields onto the
+in-memory model with `assign_attributes` (never save) before rendering
+the existing edit template unchanged. Add a flash explaining what
+happened (reusing the existing `sensitive_fields_dropped` warning text
+where applicable).
+
+This needs a small shared helper (e.g. on `ApplicationController`, called
+from both `#edit` actions) so the match/overlay logic exists once, not
+twice.
+
+#### 5. Let the edit action hand the token back to the same form
+
+While overlaying (step 4), the controller already has the token. Add one
+more conditional hidden field to the form at that point:
+`hidden_field_tag :pending_resubmission_token, @pending_resubmission_token
+if @pending_resubmission_token`. This is the same "provide the data now,
+while you have it" idea applied to the destroy side: `finalize_
+pending_resubmission` (application_controller.rb:897) stays exactly as it
+is today, still only reading an explicit `params[:pending_resubmission_
+token]`, still only called from the confirmed-success branches
+(`ProjectsController#successful_update`, `UsersController#update`'s
+`if @user.save`) per the already-shipped fix. No behavior change there,
+and no need for the "session-driven, destroys on any successful save"
+broadening considered earlier.
+
+#### 6. Delete the now-unused resume page
+
+- `app/controllers/pending_resubmissions_controller.rb`
+- `app/views/pending_resubmissions/show.html.erb`
+- Its route in `config/routes.rb`
+- `pending_resubmission_path`/`pending_resubmission_url` references
+- Most of `test/controllers/pending_resubmissions_controller_test.rb`
+  (the security-regression test about never reading an identifier from
+  params has no equivalent surface left to test once the controller is
+  gone; confirm nothing else in that file still applies before deleting
+  it outright)
+
+### What does NOT change
+
+- `PendingResubmission` the model/table: same three real columns
+  (`resubmit_path`, `resubmit_method`, `params_json`,
+  `sensitive_fields_dropped`, `hashed_random_id`). No migration, because
+  the redisplay URL travels via `return_to` (already fully plumbed
+  through the login flow), not via a new stored column.
+- `PendingResubmission.stash_for` / `#find_by_token` / `.digest` /
+  `.purge_stale`: unchanged.
+- `ApplicationController#stash_pending_resubmission`: unchanged.
+- `ApplicationController#finalize_pending_resubmission`: unchanged (still
+  explicit-param-driven, still only called from a confirmed-success
+  branch).
+- The HMAC-token-keyed lookup design (docs/login-session-18.md step 18):
+  unchanged; this plan is only about UI/redirect plumbing, not the
+  anti-guessing property.
+
+## Sequencing
+
+1. **Done** (2026-09-13): validated the stash-and-resume mechanism on
+   staging via a clean revoke-then-submit-without-reloading test.
+2. Implement Part 1 (the CSRF-message fix). Small, independent, low-risk.
+3. Implement Part 2 (the main redesign, steps 1-6 above).
+4. Update `docs/login-session-implementation.md` section 15 to match (it
+   currently documents the dedicated resume-page design), and mention the
+   CSRF-invalidation edge case from Part 1 there too.
