@@ -299,3 +299,80 @@ broadening considered earlier.
 4. Update `docs/login-session-implementation.md` section 15 to match (it
    currently documents the dedicated resume-page design), and mention the
    CSRF-invalidation edge case from Part 1 there too.
+
+## Background: pre-implementation review (2026-09-13)
+
+Recorded here, after the steps to execute, since it's background reasoning
+to fall back on if a question comes up later, not something to act on
+directly.
+
+### Security
+
+Neither part weakens an existing security property:
+
+- **Part 1**: `rescue_from ActionController::InvalidAuthenticityToken`
+  only runs *after* `protect_from_forgery` has already raised and blocked
+  the request; the controller action never executes either way. This is a
+  presentation change (a redirect and a flash instead of the generic 422
+  page), not a change to what gets rejected.
+- **Part 2 step 1** (`return_to` override): still passes through
+  `valid_return_path?` exactly as today, which only forbids off-site or
+  protocol-relative targets. Whoever submits the PATCH already fully
+  controls `request.original_fullpath` (today's default), so letting them
+  state `return_to` explicitly grants no new capability. The real
+  authorization check happens when the target page loads, same as always.
+- **Part 2 step 4** (overlay): uses the same unguessable, HMAC-digested
+  token that already exists (docs/login-session-18.md step 18, untouched
+  by this plan), written to a browser's session only by that browser's
+  own successful login (never resumable by an unrelated login on a shared
+  browser, per docs/login-session-18.md "Step 21", also untouched). The
+  path-matching fixed in step 4 above means a stash can only overlay onto
+  the exact resource it was stashed from (the resource's own id is
+  embedded in the compared path string), so there's no cross-project or
+  cross-user leak surface.
+- **Step 6** (deleting the dedicated controller): a net reduction in
+  attack surface, not an increase: one fewer action that reads anything
+  from params at all.
+
+One thing specifically investigated and ruled out: whether a locale
+mismatch could break the step-4 path comparison, since routes here are
+locale-prefixed (`/en/...`, `/fr/...`) and login can switch `I18n.locale`
+to the user's stored preference (`sessions_helper.rb:82`). Checked
+`set_locale_to_best_available` (application_controller.rb:566-578):
+"Locale in URL always takes precedent." Since `return_to` carries the
+literal stash-time URL, including its locale segment, the post-login GET
+is served under that same locale, so the edit action's own
+freshly-computed comparison path uses the identical locale and matches
+correctly. Not an issue.
+
+### Functionality
+
+The one real gap found was the step-4 matching logic (already corrected
+above): comparing against `request.path`/`request.method` instead of each
+form's own known submission target would have silently broken resume for
+`UsersController#edit` and the permissions sub-form. With that fix, no
+remaining functional hole was identified. The automation-proposals
+cross-check in step 1 above confirms this plan doesn't touch that
+separate, already-working feature at all.
+
+### Estimated code-size impact
+
+Rough, pre-implementation numbers from `wc -l` on the affected files
+(actual numbers to be confirmed via `git diff --stat` once implemented):
+
+| Change | Lines |
+|---|---|
+| Delete `pending_resubmissions_controller.rb` | -58 |
+| Delete `pending_resubmissions/show.html.erb` | -15 |
+| Delete its route (plus its comment) | -4 |
+| Shrink/remove most of `pending_resubmissions_controller_test.rb` (178 lines today) | ~-150 |
+| New shared overlay helper (`ApplicationController`, with YARD comments matching this codebase's style) | ~+30-35 |
+| CSRF `rescue_from` plus handler | ~+12-15 |
+| `redirect_after_login` simplification | ~-4 |
+| `ProjectsController#edit` / `UsersController#edit` call sites | ~+8 |
+| `return_to` plus token hidden fields across ~6 view partials | ~+10-12 |
+| Test additions/rewrites for the new overlay behavior | ~+20-30 |
+
+Net: roughly **120-150 fewer lines**, most of it from deleting the
+dedicated controller/view and shrinking its test file, offset by a more
+modest amount of small, targeted additions.
