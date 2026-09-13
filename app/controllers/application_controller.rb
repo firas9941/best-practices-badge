@@ -76,6 +76,12 @@ class ApplicationController < ActionController::Base
   # For APIs, you may want to use :null_session instead.
   protect_from_forgery with: :exception
 
+  # Replace Rails' generic 422 page for a failed CSRF check with the same
+  # friendly explanation and login redirect the other forced-logout cases
+  # already show. See #handle_invalid_authenticity_token.
+  rescue_from ActionController::InvalidAuthenticityToken,
+              with: :handle_invalid_authenticity_token
+
   # If locale is not provided in the URL, redirect to best option.
   # Special URLs which do not have locales, such as "/robots.txt",
   # must "skip_before_action :redir_missing_locale".
@@ -425,6 +431,55 @@ class ApplicationController < ActionController::Base
   EMPTY_PARAMS = ActionController::Parameters.new.freeze
 
   private
+
+  # Handles a failed CSRF check (rescue_from ActionController::
+  # InvalidAuthenticityToken, declared near protect_from_forgery above).
+  # Rails only raises this for state-changing (non-GET/HEAD) requests, so
+  # no method check is needed here.
+  #
+  # The most common real-world cause: SessionsHelper#log_out calls
+  # reset_session, which clears session[:_csrf_token]. That invalidates
+  # the CSRF token already embedded in any *other* tab's still-open forms,
+  # so submitting one of those stale tabs after logging out elsewhere hits
+  # this. But logging out isn't the only way a sibling tab's token goes
+  # stale: logging BACK IN elsewhere also calls reset_session (via
+  # counter_fixation), and that leaves the submitter still fully logged
+  # in, just under a different LoginSession than the stale tab remembers.
+  # setup_authentication_state normally runs as an earlier before_action
+  # and never got the chance to here (the CSRF check that raised this is
+  # itself an earlier before_action, so this exception skips every
+  # before_action after it, including that one); call it explicitly so
+  # logged_in? below reflects this request's actual cookies rather than
+  # assuming the worse (and false) case.
+  #
+  # Redirecting a still-logged-in submitter to the login page specifically
+  # would be actively wrong, not just imprecise: SessionsController#new
+  # redirects an already-logged-in visitor straight back out with its own
+  # "already logged in" flash, silently discarding whatever this method
+  # set and confusing the user with two contradictory messages. Root is
+  # always a safe landing spot regardless of login state, unlike
+  # request.referer, which is client-supplied and would need its own
+  # open-redirect validation to use safely; not worth it here.
+  #
+  # Deliberately does NOT try to stash or preserve the submitted data the
+  # way redirect_to_login_stashing does for an ordinary forced logout: a
+  # genuine cross-site-forged request raises this identical exception (an
+  # attacker can't know the real secret either), and
+  # stash_pending_resubmission only requires being logged out, so a
+  # handler that stashed a CSRF-failed submission would just as readily
+  # hand a forged request back to its victim as a click-to-resume page on
+  # their next login. See docs/login-session-simplify.md Part 1.
+  # @return [void]
+  def handle_invalid_authenticity_token
+    setup_authentication_state
+    if logged_in?
+      flash[:warning] = t('sessions.csrf_failed_retry')
+      redirect_to root_url
+    else
+      flash[:warning] = t('sessions.auto_logged_out')
+      redirect_to login_path(return_to: request.original_fullpath)
+    end
+  end
 
   # Safely read a scalar (String) request parameter.
   # Rails parses `k[]=v` into an Array and `k[x]=v` into a Hash, so a crafted
@@ -837,29 +892,23 @@ class ApplicationController < ActionController::Base
   # second, unrelated login on the same browser could otherwise inherit
   # the first person's stash.
   #
-  # Field names are stored pre-bracketed (e.g. "project[name]"), not the
-  # bare field name (e.g. "name"): PendingResubmissionsController's view
-  # resubmits them as literal hidden field names, and the receiving
-  # action's project_params/compute_user_params both call
-  # params.expect(param_key: ...), which requires that wrapper key on the
-  # resubmitted request too. Prefixing here, once, means the view can stay
-  # fully agnostic and just echo back opaque key/value pairs, rather than
-  # needing to know it's rebuilding a "project" or "user" submission.
+  # Field names are stored bare (e.g. "name", not "project[name]"):
+  # overlay_pending_resubmission! feeds params_json straight to
+  # assign_attributes, which takes plain attribute names. (An earlier
+  # version of this design prefixed them for a dedicated resume page's
+  # view to echo back as literal hidden field names; that page is gone,
+  # see docs/login-session-simplify.md Part 2, and so is the reason to
+  # prefix.)
   # @param resubmit_path [String] path to resubmit the stashed fields to
-  # @param param_key [Symbol] top-level params key the fields must be
-  #   wrapped back under on resubmission (e.g. :project, :user)
   # @param permitted_params [ActionController::Parameters] params to stash
   # @return [String] the stashed row's raw random token
-  def stash_pending_resubmission(resubmit_path, param_key, permitted_params)
+  def stash_pending_resubmission(resubmit_path, permitted_params)
     fields = permitted_params.to_h
     dropped = SENSITIVE_STASH_KEYS.any? { |key| fields[key].present? }
-    prefixed_fields =
-      fields.except(*SENSITIVE_STASH_KEYS)
-            .transform_keys { |key| "#{param_key}[#{key}]" }
     pending = PendingResubmission.stash_for(
       resubmit_path: resubmit_path,
       resubmit_method: request.request_method,
-      params_json: prefixed_fields.to_json,
+      params_json: fields.except(*SENSITIVE_STASH_KEYS).to_json,
       sensitive_fields_dropped: dropped
     )
     pending.raw_token
@@ -871,10 +920,11 @@ class ApplicationController < ActionController::Base
   # (ProjectsController#successful_update, UsersController#update's
   # `if @user.save` branch), never as a blanket before_action keyed only on
   # param presence. This is the ONLY place a row is destroyed in pending
-  # resubmissions in the normal application run; #show deliberately leaves
-  # it alone so revisiting the resume page after a closed tab or dropped
-  # connection still works, and an abandoned stash is instead swept up
-  # later by PendingResubmission.purge_stale.
+  # resubmissions in the normal application run; overlay_pending_
+  # resubmission! deliberately leaves it alone so revisiting the edit page
+  # after a closed tab or dropped connection still works, and an
+  # abandoned stash is instead swept up later by
+  # PendingResubmission.purge_stale.
   #
   # This used to be a before_action, firing on any request carrying a
   # pending_resubmission_token param regardless of outcome. That destroyed
@@ -893,14 +943,14 @@ class ApplicationController < ActionController::Base
   # response redirect" doesn't mean "did this save succeed."
   #
   # Reading the token from params here (rather than only from session, as
-  # PendingResubmissionsController's own comment insists on for *display*)
-  # is safe from a malicious replay: this only destroys a row, never shows
-  # its contents, and the token a request carries here is never one the
-  # requester merely guessed (it's 128 bits of SecureRandom that only ever
-  # reached a browser by that browser first passing the session-gated
-  # check in PendingResubmissionsController#show). Whoever can present it
-  # here could already have replayed the stash's own params directly. That
-  # property was never the problem; premature destruction on an innocent,
+  # overlay_pending_resubmission! insists on for *display*) is safe from a
+  # malicious replay: this only destroys a row, never shows its contents,
+  # and the token a request carries here is never one the requester
+  # merely guessed (it's 128 bits of SecureRandom that only ever reached a
+  # browser by that browser first passing the session-gated check in
+  # overlay_pending_resubmission!). Whoever can present it here could
+  # already have replayed the stash's own params directly. That property
+  # was never the problem; premature destruction on an innocent,
   # non-malicious request was.
   #
   # A blank param is the overwhelmingly common case (an ordinary successful
@@ -912,6 +962,57 @@ class ApplicationController < ActionController::Base
 
     PendingResubmission.find_by_token(token)&.destroy
     session.delete(:pending_resubmission_token) if session[:pending_resubmission_token] == token
+  end
+
+  # Restores a stashed pending resubmission onto an edit page, if this
+  # browser has one and it belongs to this exact page. Called from
+  # ProjectsController#edit and UsersController#edit (the only two
+  # stash_pending_resubmission callers), replacing the dedicated
+  # PendingResubmissionsController page this design used to need: model's
+  # own edit template just renders whatever's now in model, the same way
+  # it already renders model's persisted values. Never saves.
+  #
+  # own_resubmit_path must be the exact path this page's own edit form
+  # submits to (e.g. edit_project_section_path(@project, @criteria_level)
+  # for Projects, user_path(@user) for Users), not request.path: the
+  # stash's resubmit_path is what the ORIGINAL failed PATCH posted to,
+  # which for UsersController#update (form_for(@user) posts to user_path,
+  # not edit_user_path) differs from its own GET edit page's path (see
+  # docs/login-session-simplify.md's "why a naive fix doesn't quite
+  # work"). resubmit_method isn't compared: this is always a GET
+  # rendering the form, while resubmit_method is always the PATCH/PUT the
+  # form itself will use.
+  # @param model [ActiveRecord::Base] the record this edit page is showing
+  # @param own_resubmit_path [String] what this page's own form submits to
+  # @return [void]
+  def overlay_pending_resubmission!(model, own_resubmit_path)
+    token = session[:pending_resubmission_token]
+    return if token.blank?
+
+    pending = PendingResubmission.find_by_token(token)
+    return if pending.nil? || pending.resubmit_path != own_resubmit_path
+
+    model.assign_attributes(stashed_attributes_for(model, pending))
+    @pending_resubmission_token = token
+    flash.now[:warning] = t('sessions.resubmission_sensitive_dropped') if pending.sensitive_fields_dropped?
+    flash.now[:info] = t('sessions.resubmission_restored')
+  end
+
+  # Drops any stashed key that isn't a real attribute setter on model:
+  # assign_attributes raises ActiveModel::UnknownAttributeError rather
+  # than ignoring one. Needed because a permitted-params allowlist can
+  # include a submission-only field that's never actually a model
+  # attribute (e.g. Project's user_id_repeat, the permissions form's
+  # ownership-transfer confirmation field: ProjectsController#update's
+  # own mass-assign loop excludes it explicitly first for the same
+  # reason). Filtering by respond_to? here, once, generically, covers
+  # that case and any other permitted-but-not-a-real-attribute field
+  # without having to name it.
+  # @param model [ActiveRecord::Base] the record overlay_pending_resubmission! is restoring onto
+  # @param pending [PendingResubmission] the stash being restored
+  # @return [Hash] only the stashed fields model has a setter for
+  def stashed_attributes_for(model, pending)
+    JSON.parse(pending.params_json).select { |key, _| model.respond_to?("#{key}=") }
   end
 
   # Shared shape for can_edit_else_redirect and redir_unless_logged_in: a
@@ -939,14 +1040,25 @@ class ApplicationController < ActionController::Base
   # #create (both local and GitHub) thread it through from there, and only
   # a successful login carrying it writes it to session. See
   # docs/login-session-18.md's "Step 21".
+  #
+  # return_to defaults to this request's own path, but a form may override
+  # it with its own params[:return_to] (docs/login-session-simplify.md
+  # Part 2 step 1). That matters for UsersController#update (form_for(@user)
+  # posts to user_path, not edit_user_path) and the Projects permissions
+  # sub-form (posts to update_project_path, not edit_project_section_path):
+  # for both, the page to resume editing on isn't the same URL the failed
+  # PATCH landed on. Grants no new capability: the submitter already fully
+  # controls request.original_fullpath by choosing what URL to PATCH in
+  # the first place, and return_to still goes through valid_return_path?
+  # (an open-redirect guard, not an authorization check) exactly as today.
   # @param param_key [Symbol] top-level params key that must be present to
   #   stash (e.g. :project, :user)
   # @return [void]
   def redirect_to_login_stashing(param_key)
-    login_params = { return_to: request.original_fullpath }
+    login_params = { return_to: scalar_param(:return_to).presence || request.original_fullpath }
     if request.patch? && params[param_key].present?
       login_params[:pending_resubmission_token] =
-        stash_pending_resubmission(request.path, param_key, yield)
+        stash_pending_resubmission(request.path, yield)
     end
     flash[:warning] = t('sessions.auto_logged_out') if @auto_logged_out
     redirect_to login_path(**login_params)

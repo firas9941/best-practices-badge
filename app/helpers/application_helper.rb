@@ -143,6 +143,20 @@ module ApplicationHelper
     "#{token[0..8]}..."
   end
 
+  # Hidden field carrying a restored pending resubmission's token forward
+  # so a successful save finalizes it
+  # (ApplicationController#finalize_pending_resubmission). A plain helper
+  # method, not a partial: a partial's template lookup/render overhead
+  # isn't worth it for one conditional tag, and this app's performance
+  # budget matters (AGENTS.md). Called from every project edit form
+  # partial and users/edit.html.erb, the resubmit targets
+  # ApplicationController#overlay_pending_resubmission! can restore onto.
+  # @return [String, nil] the hidden field tag, or nil if no resubmission
+  #   was restored onto this page
+  def pending_resubmission_token_field
+    hidden_field_tag(:pending_resubmission_token, @pending_resubmission_token) if @pending_resubmission_token
+  end
+
   private
 
   def cache_frozen_perform(name, options, &)

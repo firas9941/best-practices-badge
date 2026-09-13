@@ -138,7 +138,11 @@ class SessionsControllerTest < ActionDispatch::IntegrationTest
     # successful_login actually writes it to session once this specific
     # login succeeds. Value doesn't need to be a real PendingResubmission
     # row for this: that check happens later, in
-    # PendingResubmissionsController#show.
+    # ApplicationController#overlay_pending_resubmission!, when the edit
+    # page it belongs to is actually visited. This login carries no
+    # return_to of its own, so it falls through to the ordinary
+    # redirect_back_or root_url fallback (docs/login-session-simplify.md
+    # Part 2 step 3 removed the special-cased redirect this used to need).
     token = 'a-test-token-value'
     post '/en/login', params: {
       session: {
@@ -147,7 +151,7 @@ class SessionsControllerTest < ActionDispatch::IntegrationTest
       }
     }
     assert_response :redirect
-    assert_redirected_to pending_resubmission_path
+    assert_redirected_to root_url
     assert_equal token, session[:pending_resubmission_token]
   end
 
@@ -425,7 +429,7 @@ class SessionsControllerTest < ActionDispatch::IntegrationTest
     post "/auth/github?pending_resubmission_token=#{token}"
     assert_response :redirect
     follow_redirect!
-    assert_redirected_to pending_resubmission_path
+    assert_redirected_to root_url
     assert_equal token, session[:pending_resubmission_token]
   ensure
     OmniAuth.config.test_mode = false

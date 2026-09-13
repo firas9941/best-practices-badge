@@ -116,6 +116,15 @@ en:
     no_custom: No custom account? Sign up now!
     already_logged_in: You are already logged in.
     auto_logged_out: You were automatically logged out, please log in to continue.
+    csrf_failed_retry: >-
+      That didn't go through because your session changed. Please try
+      again.
+    resubmission_restored: >-
+      You were logged out before this could be saved. We filled in what
+      you typed below; review it and save again.
+    resubmission_sensitive_dropped: >-
+      Your email and/or password change couldn't be restored here;
+      please re-enter it separately if needed.
     login_disabled: All logins temporarily disabled
     incorrect_login_info: Incorrect login information
     login_failed: >-
@@ -137,19 +146,6 @@ en:
     github_nickname_changed: >-
       Your GitHub username changed from %{old_nickname} to
       %{new_nickname}.
-  pending_resubmissions:
-    show:
-      header: Resume your changes
-      explanation: >-
-        You were logged out before this could be saved. We kept what you
-        typed below so you don't have to retype it.
-      sensitive_fields_dropped: >-
-        Your email and/or password change couldn't be restored here;
-        please re-enter it separately if needed.
-      resume_button: Resume saving your changes
-      expired: >-
-        We couldn't find what you were saving; it may have expired.
-        Please try again.
   unsubscribe:
     header: Unsubscribe
     description: >-

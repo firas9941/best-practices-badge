@@ -46,14 +46,6 @@ class DropSessionCookieTest < ActionDispatch::IntegrationTest
     session_cookie_lines.any? { |line| deletion_line?(line) }
   end
 
-  def with_forgery_protection
-    original = ActionController::Base.allow_forgery_protection
-    ActionController::Base.allow_forgery_protection = true
-    yield
-  ensure
-    ActionController::Base.allow_forgery_protection = original
-  end
-
   # --- tests ---
 
   # Anonymous, carrying a spent/empty session cookie: it is deleted, so the

@@ -943,6 +943,17 @@ step involves adding new conditional branches to existing methods.
 
 ## 15. Preserve in-progress form submissions across a forced re-login
 
+**Updated by `docs/login-session-simplify.md` Part 2**: the dedicated
+`PendingResubmissionsController`/resume page this section describes has
+been replaced by overlaying the stash directly onto the resource's own
+edit page, so a forced re-login lands the user back in the real form
+instead of a separate confirm-and-resubmit page. The stash-creation and
+finalization mechanics below (the table, the HMAC-keyed lookup added
+later by `docs/login-session-18.md` step 18, `stash_pending_resubmission`,
+`finalize_pending_resubmission`) are unchanged; this section is kept as
+the original design rationale for those, not as a description of the
+current resume UI.
+
 Added after review. This is a general fix for a "login loss" case, not a
 rollout-specific one: `logged_in?` (sessions_helper.rb:82) is a plain
 `@session_user_id.present?` check with no branching on *why* it's

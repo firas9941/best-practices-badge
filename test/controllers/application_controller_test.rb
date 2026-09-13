@@ -219,6 +219,67 @@ class ApplicationControllerTest < ActionDispatch::IntegrationTest
                     'You were automatically logged out, please log in to continue.'
   end
 
+  # Regression test for a real gap found while validating the pending-
+  # resubmission fix on staging (2026-09-13): SessionsHelper#log_out calls
+  # reset_session, which clears session[:_csrf_token], the secret behind
+  # every CSRF token already embedded in any *other* tab's rendered forms.
+  # Submitting one of those now-stale tabs used to hit Rails' generic 422
+  # "The change you wanted was rejected" page instead of a friendly
+  # explanation. See docs/login-session-simplify.md Part 1.
+  #
+  # allow_forgery_protection is off by default in the test env
+  # (config/environments/test.rb), so this must opt back in via
+  # with_forgery_protection to exercise the real check; a plain PATCH with
+  # no authenticity_token at all raises the identical
+  # ActionController::InvalidAuthenticityToken a genuinely stale token
+  # would, which is all this handler cares about.
+  #
+  # destroy_all on the LoginSession, not log_out or a second log_in_as:
+  # this needs to reproduce "genuinely logged out, but this tab's own
+  # session cookie and CSRF secret are untouched," the same distinction
+  # the staging investigation that found this bug had to work out (see
+  # docs/login-session-simplify.md's background section). Actually logging
+  # out in this same test session would reset_session, which would also
+  # invalidate the very CSRF token this test needs to remain stale-but-
+  # present for the PATCH below to reach the check at all in a realistic
+  # way.
+  test 'a failed CSRF check while genuinely logged out shows the auto_logged_out flash' do
+    user = users(:test_user_melissa)
+    log_in_as(user, password: 'password1', remember_me: '0')
+    user.login_sessions.destroy_all
+
+    with_forgery_protection do
+      patch user_path(user), params: { user: { name: user.name } }
+    end
+    assert_redirected_to login_path(return_to: user_path(user))
+    follow_redirect!
+    assert_includes @response.body,
+                    'You were automatically logged out, please log in to continue.'
+  end
+
+  # The other real case this handler must get right: a sibling tab's token
+  # can also go stale because the user logged BACK IN elsewhere (that also
+  # calls reset_session, via counter_fixation), leaving them still fully
+  # logged in, just under a different LoginSession than this stale tab
+  # remembers. Redirecting to the login page here would be actively wrong:
+  # SessionsController#new redirects an already-logged-in visitor straight
+  # back out with its own "already logged in" flash, so the user would see
+  # two contradictory messages instead of one accurate one.
+  test 'a failed CSRF check while still logged in redirects to root without claiming logout' do
+    user = users(:test_user_melissa)
+    log_in_as(user, password: 'password1', remember_me: '0')
+
+    with_forgery_protection do
+      patch user_path(user), params: { user: { name: user.name } }
+    end
+    assert_redirected_to root_url
+    follow_redirect!
+    # Not "didn't": t() output is HTML-escaped by ERB, so the rendered
+    # apostrophe is "&#39;", not "'". Assert on a stretch without one.
+    assert_includes @response.body, 'because your session changed'
+    assert_not_includes @response.body, 'You were automatically logged out'
+  end
+
   # docs/login-session-evaluation.md finding #3: a client that resends remember-me cookies on
   # every request while discarding Set-Cookie re-triggers a fresh
   # LoginSession INSERT each time; this bounds that per user_id, the same

@@ -1020,7 +1020,7 @@ class ProjectsControllerTest < ActionDispatch::IntegrationTest
     assert_equal 'PATCH', pending.resubmit_method
     assert_not pending.sensitive_fields_dropped?
     fields = JSON.parse(pending.params_json)
-    assert_equal new_name, fields['project[name]']
+    assert_equal new_name, fields['name']
   end
 
   test 'update when not logged in with no project param falls through to not_authorized flash' do
