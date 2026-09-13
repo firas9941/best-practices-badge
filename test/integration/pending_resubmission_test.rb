@@ -82,6 +82,41 @@ class PendingResubmissionTest < ActionDispatch::IntegrationTest
     assert_nil session[:pending_resubmission_token]
   end
 
+  test 'resubmitting a stash never reverts a field that changed elsewhere, even in the same form' do
+    # A real browser resubmits every field a form displays, changed or
+    # not; description here is unchanged from @project's own current
+    # value, exactly what an ordinary "I only meant to change the name"
+    # submission looks like on the wire. stash_pending_resubmission must
+    # record only the real diff (name), not this whole snapshot, or else
+    # restoring it later would revert description too.
+    new_name = "#{@project.name}_resubmitted"
+    patch @edit_path, params: {
+      project: { name: new_name, description: @project.description }
+    }
+    token = pending_resubmission_token_from_redirect
+    assert_not_nil token
+
+    # Something else legitimately updates description while this user is
+    # logged out (e.g. another editor, or automation). A stash holding the
+    # stale full-form snapshot would silently overwrite this on resume.
+    @project.update_columns(description: 'updated elsewhere while logged out')
+
+    log_in_with_token(token)
+    follow_redirect!
+    assert_response :success
+    assert_select 'textarea#project_description', text: 'updated elsewhere while logged out'
+
+    # Resubmitting the resumed form (all its fields, as a real browser
+    # would) must keep the intervening description, not revert it.
+    patch @edit_path, params: {
+      project: { name: new_name, description: 'updated elsewhere while logged out' },
+      pending_resubmission_token: token
+    }
+    @project.reload
+    assert_equal new_name, @project.name
+    assert_equal 'updated elsewhere while logged out', @project.description
+  end
+
   test 'revisiting after a closed tab (a fresh GET) still shows the stash' do
     # docs/login-session-evaluation.md finding #4: the old design destroyed
     # the row and session key on the first GET, so a closed tab (before
@@ -254,8 +289,11 @@ class PendingResubmissionTest < ActionDispatch::IntegrationTest
   end
 
   test 'shows the sensitive-fields-dropped warning when email or password was stripped' do
+    # name must actually change: email alone never stashes anything (it's
+    # always dropped, changed or not), so a submission that changes
+    # nothing but email would have no real diff to stash at all.
     patch @user_path, params: {
-      user: { name: @user.name, email: @user.email }, return_to: @user_edit_path
+      user: { name: "#{@user.name}_changed", email: @user.email }, return_to: @user_edit_path
     }
     log_in_with_token(pending_resubmission_token_from_redirect)
     follow_redirect!
@@ -280,18 +318,29 @@ class PendingResubmissionTest < ActionDispatch::IntegrationTest
     assert_not_includes @response.body, 'We filled in what you typed below'
   end
 
-  test 'a stashed ownership-transfer field on the permissions form does not crash the overlay' do
+  test 'a stashed ownership-transfer field does not crash the overlay' do
     # Regression test: user_id_repeat (the permissions form's ownership-
     # transfer confirmation field, _form_permissions.html.erb) is in
-    # Project::PROJECT_PERMITTED_FIELDS but isn't a real Project
-    # attribute. ProjectsController#update's own mass-assign loop
-    # excludes it explicitly before ever touching the model;
-    # overlay_pending_resubmission! must tolerate it the same way (it
-    # used to raise ActiveModel::UnknownAttributeError instead, since
-    # Project has no user_id_repeat= setter for assign_attributes to
-    # call).
+    # Project::PROJECT_PERMITTED_FIELDS but isn't a real Project column,
+    # so it's never part of model.attribute_names and gets dropped
+    # before stash_pending_resubmission's own assign_attributes call
+    # (which would otherwise raise ActiveModel::UnknownAttributeError).
+    # Paired here with a real change (user_id) so there's still something
+    # to stash and restore. Checked against the stash row directly, not
+    # the rendered form: overlaying a *new* user_id onto @project makes
+    # the permissions view's own "is this viewer the owner?" check false,
+    # which hides the ownership fields entirely -- a real, separate view
+    # quirk, not something this test is about.
+    other_user = users(:test_user_melissa)
     permissions_path = "/en/projects/#{@project.id}/permissions/edit"
-    patch permissions_path, params: { project: { user_id_repeat: @user.id.to_s } }
+    patch permissions_path, params: {
+      project: { user_id: other_user.id.to_s, user_id_repeat: other_user.id.to_s }
+    }
+    pending = PendingResubmission.last
+    fields = JSON.parse(pending.params_json)
+    assert_equal other_user.id, fields['user_id']
+    assert_not_includes fields.keys, 'user_id_repeat'
+
     log_in_with_token(pending_resubmission_token_from_redirect)
     follow_redirect!
     assert_response :success

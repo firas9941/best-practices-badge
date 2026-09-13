@@ -900,19 +900,46 @@ class ApplicationController < ActionController::Base
   # see docs/login-session-simplify.md Part 2, and so is the reason to
   # prefix.)
   # @param resubmit_path [String] path to resubmit the stashed fields to
+  # @param model [ActiveRecord::Base, nil] the EXISTING record being
+  #   edited, freshly loaded and not yet touched by this request's own
+  #   params, to diff against. This is never "a new record with nothing
+  #   set yet" -- edit/update only ever runs against an existing row. nil
+  #   means the caller couldn't find that row at all (e.g. UsersController
+  #   #redir_unless_logged_in's own User.find_by(id: params[:id]) came up
+  #   empty, a bogus or stale id): there's nothing to diff against, and
+  #   also nothing to ever overlay a stash onto later (edit/update for a
+  #   nonexistent id never reaches overlay_pending_resubmission! either),
+  #   so stashing anything at all would produce a stash that could never
+  #   legitimately be resumed. Skipping it isn't a data loss; there was
+  #   nowhere for that data to go.
   # @param permitted_params [ActionController::Parameters] params to stash
-  # @return [String] the stashed row's raw random token
-  def stash_pending_resubmission(resubmit_path, permitted_params)
+  # @return [String, nil] the stashed row's raw random token, or nil if
+  #   there was no record to diff against or nothing actually changed
+  # rubocop:disable Metrics/MethodLength
+  def stash_pending_resubmission(resubmit_path, model, permitted_params)
+    return if model.nil?
+
     fields = permitted_params.to_h
     dropped = SENSITIVE_STASH_KEYS.any? { |key| fields[key].present? }
+    # Only stash what actually differs from model's current persisted
+    # values, via Rails' own dirty tracking, not the full submitted hash: a
+    # real form resubmits every field it displays, changed or not, so "the
+    # full hash" is mostly a stale snapshot that would silently overwrite
+    # anything else (even in this same form) that changed some other way
+    # by the time this gets resubmitted after the forced re-login.
+    model.assign_attributes(fields.except(*SENSITIVE_STASH_KEYS).slice(*model.attribute_names))
+    changed = model.changes.transform_values(&:last)
+    return if changed.empty?
+
     pending = PendingResubmission.stash_for(
       resubmit_path: resubmit_path,
       resubmit_method: request.request_method,
-      params_json: fields.except(*SENSITIVE_STASH_KEYS).to_json,
+      params_json: changed.to_json,
       sensitive_fields_dropped: dropped
     )
     pending.raw_token
   end
+  # rubocop:enable Metrics/MethodLength
 
   # Destroys a stashed pending resubmission once its resubmit form has
   # actually been resubmitted AND the resulting change was accepted.
@@ -1053,16 +1080,20 @@ class ApplicationController < ActionController::Base
   # (an open-redirect guard, not an authorization check) exactly as today.
   # @param param_key [Symbol] top-level params key that must be present to
   #   stash (e.g. :project, :user)
+  # @param model [ActiveRecord::Base, nil] passed through to
+  #   stash_pending_resubmission to diff against
   # @return [void]
-  def redirect_to_login_stashing(param_key)
+  # rubocop:disable Metrics/AbcSize
+  def redirect_to_login_stashing(param_key, model)
     login_params = { return_to: scalar_param(:return_to).presence || request.original_fullpath }
     if request.patch? && params[param_key].present?
-      login_params[:pending_resubmission_token] =
-        stash_pending_resubmission(request.path, yield)
+      token = stash_pending_resubmission(request.path, model, yield)
+      login_params[:pending_resubmission_token] = token if token
     end
     flash[:warning] = t('sessions.auto_logged_out') if @auto_logged_out
     redirect_to login_path(**login_params)
   end
+  # rubocop:enable Metrics/AbcSize
 
   include SessionsHelper
 end

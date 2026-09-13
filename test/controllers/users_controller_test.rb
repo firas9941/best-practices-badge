@@ -288,12 +288,14 @@ class UsersControllerTest < ActionDispatch::IntegrationTest
 
   test 'should redirect update when not logged in' do
     # This becomes an 'update' on the users controller. Since it carries a
-    # real user param, step 15 stashes it instead of discarding it, then
-    # sends the submitter to log in with a return_to (rather than the old
-    # flash-and-redirect-with-no-return_to).
+    # user param that actually changes @user's name, step 15 stashes it
+    # instead of discarding it, then sends the submitter to log in with a
+    # return_to (rather than the old flash-and-redirect-with-no-return_to).
+    # Name must actually differ: stash_pending_resubmission only stashes a
+    # real diff now, not a resubmitted-but-unchanged value.
     assert_difference 'PendingResubmission.count', 1 do
       patch "/en/users/#{@user.id}", params: {
-        user: { name: @user.name, email: @user.email }
+        user: { name: "#{@user.name}_changed", email: @user.email }
       }
     end
     assert_response :redirect
