@@ -441,9 +441,10 @@ class UsersController < ApplicationController
   # when that applies). Anything else (destroy, or a malformed PATCH with
   # no user param) has nothing sensible to return to here, so it falls
   # through to the plain flash-and-redirect below.
+  # rubocop:disable Metrics/AbcSize
   def redir_unless_logged_in
     return if logged_in?
-    return redirect_to_login_stashing(:user) { compute_user_params } if
+    return redirect_to_login_stashing(:user, User.find_by(id: params[:id])) { compute_user_params } if
       request.get? || (request.patch? && params[:user].present?)
 
     if @auto_logged_out
@@ -453,6 +454,7 @@ class UsersController < ApplicationController
     end
     redirect_to login_path
   end
+  # rubocop:enable Metrics/AbcSize
 
   # Return true if current_user can edit account 'user'
   def current_user_can_edit?(user)

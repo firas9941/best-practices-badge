@@ -1139,7 +1139,7 @@ class ProjectsController < ApplicationController
     return false unless request.get? || request.patch?
     return false if request.patch? && params[:project].blank?
 
-    redirect_to_login_stashing(:project) { project_params }
+    redirect_to_login_stashing(:project, @project) { project_params }
     true
   end
 
