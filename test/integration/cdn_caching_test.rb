@@ -317,13 +317,5 @@ class CdnCachingTest < ActionDispatch::IntegrationTest
     assert_equal 'private, no-store', response.headers['Cache-Control']
     assert_nil response.headers['Surrogate-Control']
   end
-
-  def with_forgery_protection
-    original = ActionController::Base.allow_forgery_protection
-    ActionController::Base.allow_forgery_protection = true
-    yield
-  ensure
-    ActionController::Base.allow_forgery_protection = original
-  end
 end
 # rubocop:enable Metrics/ClassLength

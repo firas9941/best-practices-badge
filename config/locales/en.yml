@@ -116,6 +116,9 @@ en:
     no_custom: No custom account? Sign up now!
     already_logged_in: You are already logged in.
     auto_logged_out: You were automatically logged out, please log in to continue.
+    csrf_failed_retry: >-
+      That didn't go through because your session changed. Please try
+      again.
     login_disabled: All logins temporarily disabled
     incorrect_login_info: Incorrect login information
     login_failed: >-

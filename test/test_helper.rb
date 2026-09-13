@@ -188,6 +188,19 @@ module ActiveSupport
       OmniAuth.config.add_mock(:github, omniauth_hash(cassette))
     end
 
+    # Temporarily enables real CSRF checking for the duration of the block.
+    # config/environments/test.rb turns it off by default (allow_forgery_
+    # protection = false), so a test that needs to exercise an actual CSRF
+    # failure (ActionController::InvalidAuthenticityToken) must opt back in
+    # explicitly, and only for that one block.
+    def with_forgery_protection
+      original = ActionController::Base.allow_forgery_protection
+      ActionController::Base.allow_forgery_protection = true
+      yield
+    ensure
+      ActionController::Base.allow_forgery_protection = original
+    end
+
     def contents(file_name)
       File.read "test/fixtures/files/#{file_name}"
     end

@@ -51,15 +51,54 @@ real secret either) and hand it back to the victim as a click-to-resume
 page on their next login. That tradeoff isn't worth the UX gain for what
 is, after all, a case the user's own explicit action caused.
 
-Instead: add `rescue_from ActionController::InvalidAuthenticityToken` (or
-a narrower, PATCH/POST-only check via a `before_action` wrapper) to
-`ApplicationController`, and redirect to login with a clear explanatory
-flash, reusing the existing `@auto_logged_out`-style messaging
-(`redirect_to_login_stashing`'s `t('sessions.auto_logged_out')` flash is
-the right shape to match). No attempt to stash or preserve the submitted
-data; just replace the confusing generic 422 page with the same friendly
-"you were logged out, please log in again" message the other
-forced-logout cases already show.
+**Status: implemented** (`rescue_from ActionController::InvalidAuthenticityToken`
+in `ApplicationController`; the handler itself is
+`#handle_invalid_authenticity_token`, application_controller.rb:473-482).
+Turned out
+to need one more distinction than first planned, found by actually writing
+the test rather than just reasoning about it: a sibling tab's token can go
+stale for two different reasons, and they need different responses.
+
+Logging out is one cause. But logging BACK IN elsewhere also calls
+`reset_session` (via `counter_fixation`), and that leaves the submitter
+still fully logged in, just under a different `LoginSession` than the
+stale tab remembers. Redirecting *that* case to the login page would be
+actively wrong, not just imprecise: `SessionsController#new` redirects an
+already-logged-in visitor straight back out with its own "already logged
+in" flash, silently discarding whatever this handler set and leaving the
+user looking at two contradictory messages.
+
+The handler can't just check `logged_in?` naively, either: `protect_from_
+forgery` is declared before `setup_authentication_state` in
+`ApplicationController`, so the exception it raises skips every
+before_action after it, including the one that would normally populate
+`@session_user_id`/`current_user` for this request. The handler calls
+`setup_authentication_state` itself first, then branches:
+
+- **Not logged in**: redirect to login with the existing `sessions.
+  auto_logged_out` flash, exactly as first planned.
+- **Still logged in**: redirect to `root_url` with a new, accurate flash
+  (`sessions.csrf_failed_retry`: "That didn't go through because your
+  session changed. Please try again.") that doesn't claim a logout that
+  didn't happen. Root, not `request.referer`: the referer is
+  client-supplied and would need its own open-redirect validation to use
+  safely, and root is always a safe landing spot regardless of login
+  state.
+
+No attempt to stash or preserve the submitted data in either branch, per
+the decision above.
+
+Tests: `test/controllers/application_controller_test.rb`, two new tests
+covering both branches. Both need `with_forgery_protection` (a test
+helper, now shared in `test_helper.rb` after deduplicating it out of two
+test files that each already had their own copy) to opt back into real
+CSRF checking for one block, since the test env disables it by default.
+The "genuinely logged out" test destroys the user's `LoginSession` row
+directly (`user.login_sessions.destroy_all`) rather than calling `log_out`
+or logging in again within the same test session: either of those would
+also reset *this* test's own session and CSRF secret, which would prevent
+the test from reaching a stale-but-present CSRF check in a way that
+actually resembles the real scenario.
 
 Implementation note to check: `protect_from_forgery` applies uniformly
 regardless of request format, so a blanket `rescue_from` that always

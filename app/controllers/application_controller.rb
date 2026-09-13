@@ -76,6 +76,12 @@ class ApplicationController < ActionController::Base
   # For APIs, you may want to use :null_session instead.
   protect_from_forgery with: :exception
 
+  # Replace Rails' generic 422 page for a failed CSRF check with the same
+  # friendly explanation and login redirect the other forced-logout cases
+  # already show. See #handle_invalid_authenticity_token.
+  rescue_from ActionController::InvalidAuthenticityToken,
+              with: :handle_invalid_authenticity_token
+
   # If locale is not provided in the URL, redirect to best option.
   # Special URLs which do not have locales, such as "/robots.txt",
   # must "skip_before_action :redir_missing_locale".
@@ -425,6 +431,55 @@ class ApplicationController < ActionController::Base
   EMPTY_PARAMS = ActionController::Parameters.new.freeze
 
   private
+
+  # Handles a failed CSRF check (rescue_from ActionController::
+  # InvalidAuthenticityToken, declared near protect_from_forgery above).
+  # Rails only raises this for state-changing (non-GET/HEAD) requests, so
+  # no method check is needed here.
+  #
+  # The most common real-world cause: SessionsHelper#log_out calls
+  # reset_session, which clears session[:_csrf_token]. That invalidates
+  # the CSRF token already embedded in any *other* tab's still-open forms,
+  # so submitting one of those stale tabs after logging out elsewhere hits
+  # this. But logging out isn't the only way a sibling tab's token goes
+  # stale: logging BACK IN elsewhere also calls reset_session (via
+  # counter_fixation), and that leaves the submitter still fully logged
+  # in, just under a different LoginSession than the stale tab remembers.
+  # setup_authentication_state normally runs as an earlier before_action
+  # and never got the chance to here (the CSRF check that raised this is
+  # itself an earlier before_action, so this exception skips every
+  # before_action after it, including that one); call it explicitly so
+  # logged_in? below reflects this request's actual cookies rather than
+  # assuming the worse (and false) case.
+  #
+  # Redirecting a still-logged-in submitter to the login page specifically
+  # would be actively wrong, not just imprecise: SessionsController#new
+  # redirects an already-logged-in visitor straight back out with its own
+  # "already logged in" flash, silently discarding whatever this method
+  # set and confusing the user with two contradictory messages. Root is
+  # always a safe landing spot regardless of login state, unlike
+  # request.referer, which is client-supplied and would need its own
+  # open-redirect validation to use safely; not worth it here.
+  #
+  # Deliberately does NOT try to stash or preserve the submitted data the
+  # way redirect_to_login_stashing does for an ordinary forced logout: a
+  # genuine cross-site-forged request raises this identical exception (an
+  # attacker can't know the real secret either), and
+  # stash_pending_resubmission only requires being logged out, so a
+  # handler that stashed a CSRF-failed submission would just as readily
+  # hand a forged request back to its victim as a click-to-resume page on
+  # their next login. See docs/login-session-simplify.md Part 1.
+  # @return [void]
+  def handle_invalid_authenticity_token
+    setup_authentication_state
+    if logged_in?
+      flash[:warning] = t('sessions.csrf_failed_retry')
+      redirect_to root_url
+    else
+      flash[:warning] = t('sessions.auto_logged_out')
+      redirect_to login_path(return_to: request.original_fullpath)
+    end
+  end
 
   # Safely read a scalar (String) request parameter.
   # Rails parses `k[]=v` into an Array and `k[x]=v` into a Hash, so a crafted
