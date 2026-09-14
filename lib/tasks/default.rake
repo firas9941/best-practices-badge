@@ -1139,25 +1139,22 @@ task drop_database: :no_rails do
 end
 
 desc 'Copy database from production into development (requires access privs)'
-task pull_production: :environment do
+task pull_production: :no_rails do
   puts 'Getting production database'
-  Rake::Task['drop_database'].reenable
-  Rake::Task['drop_database'].invoke
-  sh 'heroku pg:pull DATABASE_URL development --app production-bestpractices'
-  Rake::Task['db:migrate'].reenable
-  Rake::Task['db:migrate'].invoke
-end
-
-# Don't use this one unless you need to
-desc 'Copy active production database into development (if normal one fails)'
-task pull_production_alternative: :no_rails do
-  puts 'Getting production database (alternative)'
+  # Uses a Heroku backup (captured fresh here), downloaded over HTTPS and
+  # restored locally, rather than "heroku pg:pull" (a live pg_dump
+  # streamed over a raw TCP connection straight to the database on port
+  # 5432). That direct approach is unreliable from some networks: e.g. a
+  # VM's virtual NAT can block or mishandle port 5432 specifically while
+  # HTTPS works fine. Backups go over HTTPS end to end, so this works
+  # regardless of what's between here and Heroku's database host.
   sh 'heroku pg:backups:capture --app production-bestpractices && ' \
      'curl -o db/latest.dump `heroku pg:backups:url ' \
      '     --app production-bestpractices` && ' \
      'rake db:reset && ' \
      'pg_restore --verbose --clean --no-acl --no-owner -U `whoami` ' \
-     '           -d development db/latest.dump'
+     '           -d development db/latest.dump && ' \
+     'rake db:migrate'
 end
 
 # This just copies the most recent backup of production; in almost
