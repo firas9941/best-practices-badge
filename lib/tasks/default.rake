@@ -1149,9 +1149,9 @@ task pull_production: :no_rails do
   # HTTPS works fine. Backups go over HTTPS end to end, so this works
   # regardless of what's between here and Heroku's database host.
   sh 'heroku pg:backups:capture --app production-bestpractices && ' \
-     'curl -o db/latest.dump `heroku pg:backups:url ' \
+     'curl -fo db/latest.dump `heroku pg:backups:url ' \
      '     --app production-bestpractices` && ' \
-     'rake db:reset && ' \
+     'rake drop_database && rake db:setup && ' \
      'pg_restore --verbose --clean --no-acl --no-owner -U `whoami` ' \
      '           -d development db/latest.dump && ' \
      'rake db:migrate'
