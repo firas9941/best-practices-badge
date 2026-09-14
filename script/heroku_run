@@ -3,45 +3,31 @@
 # contributors
 # SPDX-License-Identifier: MIT
 
-# Runs COMMAND on APP's dyno with its config vars set. Works around
-# "heroku run"'s rendezvous connection (port 5000) being blocked on
-# some networks: uses "heroku ps:exec" instead, which doesn't inherit
-# config vars the way a dyno's own boot does, so this passes them
-# explicitly via "env". Prints "Errorcode: N" at the end so a human can
-# see it, but this script's own exit status doesn't reflect it:
-# "ps:exec" doesn't propagate one, and reconstructing it reliably
-# wasn't worth the complexity.
-#
-# No interactive use: piping a command in immediately races the remote
-# shell's own startup (shows up as needing to press Enter twice), not
-# worth fixing for a debug tool. For an interactive shell, run
-# "heroku ps:exec --app APP" directly; you won't have config vars
-# preloaded there.
-#
-# CEDAR ONLY. Fir drops "ps:exec" for "run:inside". Switch the call
-# below when this project's apps move to Fir, and recheck whether the
-# config-var gap this works around still applies there.
-#
-# USAGE: script/heroku_run APP COMMAND [ARG...]
+# USAGE: script/heroku_run APP [COMMAND [ARG...]]
+# Run command on heroku, working around block of port 5000 on some nets
+# by using "heroku ps:exec" instead. The ps:exec doesn't get config vars,
+# so we compensate. "ps:exec" only works on Cedar; on Fir, use "run:inside".
+
+# With a COMMAND: runs it on APP's dyno with its config vars set, and
+# prints "Errorcode: N" at the end so errorcode is visible.
+# script's own exit status doesn't reflect it: "heroku ps:exec"
+
+# With no COMMAND: an interactive shell. Piping a setup script in was
 
 set -euo pipefail
 
-app="${1:?usage: $0 APP COMMAND [ARG...]}"
+app="${1:?usage: $0 APP [COMMAND [ARG...]]}"
 shift
 heroku apps:info --app "$app" >/dev/null
 
-cmd="$(printf '%q ' "$@")"
 kv="$(heroku config --shell --app "$app" | tr '\n' ' ')"
-# "stty -echo" and "PS1=" each have to be sent, and take effect, on
-# their own line before the "env ..." line: the pty echoes each line
-# back as it arrives, not after the command on it runs, so a line
-# can't hide itself or suppress its own prompt, only what comes after.
-# "PS1=" just kills the "~ $" prompt noise around the real output.
-#
-# The 2 setup lines above each echo back as their own output line
-# before taking effect, and bash prints "logout" as its last line on
-# EOF; "sed '1,2d;$d'" strips exactly those by position (always 2
-# lines of setup junk, always a real last line), not by matching text
-# that may or may not be the plain "~ $" your terminal renders it as.
+
+if [ "$#" -eq 0 ]; then
+  echo "Paste this if you want config vars loaded: env $kv bash"
+  exec heroku ps:exec --app "$app"
+fi
+
+# Run non-interactive command, hiding irrelevant info where we can
+cmd="$(printf '%q ' "$@")"
 { echo 'stty -echo'; echo 'PS1='; echo "env $kv $cmd; echo Errorcode: \$?"; } | \
   heroku ps:exec --app "$app" | sed '1,2d;$d'
