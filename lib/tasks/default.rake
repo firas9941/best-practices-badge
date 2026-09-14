@@ -1169,20 +1169,14 @@ task pull_production: :no_rails do
      'rake db:migrate'
 end
 
-# This just copies the most recent backup of production; in almost
-# all cases this is adequate, and this way we don't disturb production
-# unnecessarily.  If you want the current active database, you can
-# force a backup with:
+# Copy the most recent backup of production to staging.
+# This way we don't disturb production unnecessarily.
+# If you want the current active database, you can # force a backup with:
 # heroku pg:backups:capture --app production-bestpractices
 # NOTE: deploying to staging no longer calls this.  The CircleCI deploy
 # job does the same refresh itself, under maintenance mode, whenever the
 # branch is exactly "staging".  This task remains for refreshing staging
-# out of band, without a deploy.
-#
-# The migration here is blocking, not "run:detached".  It used to be
-# detached because CI migrated again straight afterwards, so nobody
-# needed this one's result; run on its own, a migration whose outcome is
-# never reported is not worth running.
+# out of band, without a deploy. Watch to ensure it worked with no errors.
 desc 'Copy production database backup to staging (not part of deploying)'
 task production_to_staging: :no_rails do
   sh 'heroku pg:backups:restore $(heroku pg:backups:url ' \
