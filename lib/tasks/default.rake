@@ -1148,11 +1148,23 @@ task pull_production: :no_rails do
   # VM's virtual NAT can block or mishandle port 5432 specifically while
   # HTTPS works fine. Backups go over HTTPS end to end, so this works
   # regardless of what's between here and Heroku's database host.
+  #
+  # Restore into an EMPTY database (db:create, not db:setup) rather than
+  # one already carrying our current schema. If local migrations are
+  # ahead of production (e.g. a new table with a foreign key into
+  # "users"), pg_restore --clean only knows how to drop what's in the
+  # dump's own table of contents; it can't see that local-only
+  # dependent object, so dropping "users" to make way for the restored
+  # copy fails, which then cascades into missing-row foreign key errors
+  # later in the restore. Restoring into an empty database sidesteps
+  # this: pg_restore builds the schema fresh from the dump, so there's
+  # nothing to clean up first. db:migrate afterward brings that
+  # production-shaped schema forward to match local migrations.
   sh 'heroku pg:backups:capture --app production-bestpractices && ' \
      'curl -fo db/latest.dump `heroku pg:backups:url ' \
      '     --app production-bestpractices` && ' \
-     'rake drop_database && rake db:setup && ' \
-     'pg_restore --verbose --clean --no-acl --no-owner -U `whoami` ' \
+     'rake drop_database && rake db:create && ' \
+     'pg_restore --verbose --no-acl --no-owner -U `whoami` ' \
      '           -d development db/latest.dump && ' \
      'rake db:migrate'
 end
