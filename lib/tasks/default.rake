@@ -1068,7 +1068,7 @@ end
 # Tasks for Fastly including purging and testing the cache.
 namespace :fastly do
   # Implement purge_all (full purge) of Fastly CDN cache.  Invoke using:
-  #   heroku run --app HEROKU_APP_HERE -- rake fastly:purge
+  #   script/heroku_run HEROKU_APP_HERE rake fastly:purge
   # Run this if code changes will cause a change in badge level, since otherwise
   # the old badge levels will keep being displayed until the cache times out.
   # See: https://robots.thoughtbot.com/
@@ -1097,7 +1097,7 @@ namespace :fastly do
   # docs/baseline_update.md and the *_SURROGATE_KEY constants in
   # app/controllers/application_controller.rb for the current key names).
   # Invoke using:
-  #   heroku run --app HEROKU_APP_HERE -- \
+  #   script/heroku_run HEROKU_APP_HERE \
   #     bundle exec rake "fastly:purge_key[key_one,key_two]"
   # Unlike purge_all, this touches only the given key(s), leaving every
   # other cached surrogate key (including the untouched badge series)
@@ -1188,7 +1188,7 @@ task production_to_staging: :no_rails do
   sh 'heroku pg:backups:restore $(heroku pg:backups:url ' \
      '--app production-bestpractices) DATABASE_URL ' \
      '--app staging-bestpractices --confirm staging-bestpractices'
-  sh 'heroku run --app staging-bestpractices -- ' \
+  sh 'script/heroku_run staging-bestpractices ' \
      'bundle exec rake db:migrate'
 end
 
@@ -1496,7 +1496,7 @@ task create_project_insertion_command: :no_rails do
 end
 
 # Change owner of PROJECT to USER. Both must be numbers. To use:
-# heroku run --app production-bestpractices rake change_owner -- PROJECT OWNER
+# script/heroku_run production-bestpractices rake change_owner -- PROJECT OWNER
 # You can run a SQL command to do this instead, but an error such as
 # forgetting the WHERE clause can cause a big mistake. The statement would be:
 # echo "UPDATE projects SET user_id = {OWNER_NUM} WHERE id = {PROJECT_NUM}" | \
@@ -2147,11 +2147,11 @@ task search_remote_users_tsv: :environment do
     name = shell_escape_if_known(fields[name_col]&.strip)
     email = shell_escape_if_known(fields[email_col]&.strip&.delete_prefix('email: '))
 
-    system("heroku run --app production-bestpractices rake search_user -- #{name} #{email}")
+    system("script/heroku_run production-bestpractices rake search_user -- #{name} #{email}")
     if email2_col
       email2 = shell_escape_if_known(fields[email2_col]&.strip)
       if email2 != 'UNKNOWN'
-        system("heroku run --app production-bestpractices rake search_email -- #{email2}")
+        system("script/heroku_run production-bestpractices rake search_email -- #{email2}")
       end
     end
     puts '---'
